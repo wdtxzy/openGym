@@ -2272,4 +2272,10 @@ export default {
   "Cheer {0}": "为 {0} 加油",
   "Remove your cheer for {0}": "取消为 {0} 加油",
   "{0} cheers": "{0} 次加油",
+  "Your public name": "公开展示的名称",
+  "This is what others see next to your totals.": "这是其他人在你的成绩旁看到的名称。",
+  "Pick your emoji": "选择你的表情",
+  "Participating": "已参与",
+  "Not participating": "未参与",
+  "Open the leaderboard": "打开排行榜",
 }

@@ -553,6 +553,58 @@ paths:
         '409': { description: window-expired. }
         '429': { description: Rate; Retry-After header. }
 
+  /api/leaderboard/profile:
+    put:
+      tags: [leaderboard]
+      operationId: putLeaderboardProfile
+      summary: The caller's public identity
+      description: >-
+        The display name (empty = the anonymous fallback text) and one emoji from the
+        controlled set the board offers. Kept in the shared file, so every device shows the
+        same identity. Only a participating member has one to set.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                displayName: { type: string, maxLength: 40, description: Trimmed; empty shows the anonymous text. }
+                emoji: { type: string, enum: ['💪', '🏋️', '🔥', '⚡', '🏃', '🚴', '🏅', '🧘'] }
+      responses:
+        '200': { description: The stored identity. }
+        '400': { description: emoji not in the set, or a name over 40 code points. }
+        '403': { description: Not participating. }
+
+  /api/admin/leaderboard/members:
+    get:
+      tags: [leaderboard, admin]
+      operationId: getLeaderboardMembers
+      summary: The joined members, for the admin card
+      description: >-
+        Identity and participation status per member — the uid ↔ publicMemberId mapping an
+        operator needs to act on a report, with the suspension flag and its reason. No day
+        buckets, no totals: the operator moderates, they do not browse training.
+      responses:
+        '200':
+          description: The member list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  members:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        uid: { type: string }
+                        publicMemberId: { type: string }
+                        displayName: { type: string }
+                        emoji: { type: string }
+                        enabled: { type: boolean }
+                        suspended: { type: boolean }
+                        suspendedReason: { type: string }
+
   /api/admin/leaderboard/member-status:
     put:
       tags: [leaderboard, admin]

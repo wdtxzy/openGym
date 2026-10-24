@@ -28,6 +28,9 @@ export const REPORT_SCHEMA_VERSION = 1;
 export const REPORT_ALGORITHM_VERSION = 1;
 export const REPORT_CALENDAR_VERSION = CALENDAR_VERSION;
 export const RETAINED_DAYS = 93;
+/** The emoji a member may show beside their name — a controlled set, so the board cannot
+ *  become an image board (PRD §17: no external images, no tracking pixels). */
+export const EMOJIS = ['💪', '🏋️', '🔥', '⚡', '🏃', '🚴', '🏅', '🧘'];
 
 const DAY = 86400000;
 const TOTALS_FIELDS = ['gymMs', 'syncedMs', 'gymSessions', 'syncedSessions'];
@@ -320,6 +323,42 @@ export function createLeaderboard({ store, now = Date.now }) {
         data.adminActions = [...(data.adminActions || []), action].slice(-500); // bounded, newest last
         return { ok: true, applied: true, at: action.at };
       }).then(({ out }) => out);
+    },
+
+    /** The member's own public identity (S01/S02): a display name (empty = the anonymous
+     *  fallback text) and one of the controlled emoji. Same identity on every device — it
+     *  lives in the shared file, not the client. */
+    profile(uid, { displayName, emoji } = {}) {
+      return store.txn(data => {
+        const m = requireMember(data, uid);
+        if (!m.enabled) throw new LeaderboardError(403, 'not-participating');
+        if (displayName !== undefined) {
+          if (typeof displayName !== 'string' || [...displayName.trim()].length > 40) throw new LeaderboardError(400, 'display-name');
+          m.displayName = displayName.trim();
+        }
+        if (emoji !== undefined) {
+          if (!EMOJIS.includes(emoji)) throw new LeaderboardError(400, 'emoji');
+          m.emoji = emoji;
+        }
+        return { displayName: m.displayName, emoji: m.emoji };
+      }).then(({ out }) => out);
+    },
+
+    /** The admin card's member list (S05): identity and status per joined member — no day
+     *  buckets, no totals; the operator suspends and restores, they do not browse training. */
+    adminMembers() {
+      const data = store.read();
+      return Object.entries(data.members)
+        .map(([uid, m]) => ({
+          uid,
+          publicMemberId: m.publicMemberId,
+          displayName: m.displayName || '',
+          emoji: m.emoji,
+          enabled: !!m.enabled,
+          suspended: !!m.suspended,
+          suspendedReason: m.suspended ? (m.suspendedReason || '') : ''
+        }))
+        .sort((a, b) => (a.displayName < b.displayName ? -1 : a.displayName > b.displayName ? 1 : 0));
     },
 
     /** Account deletion (PRD §17): the shared file keeps nothing of a deleted account — not

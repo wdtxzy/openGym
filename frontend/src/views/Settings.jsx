@@ -44,6 +44,7 @@ import { passwordOn, PasswordRow, openPasswordSignIn, openPasswordRegister } fro
 import { usePasskeys, PasskeysRow, DeviceLinkRow, openDeviceLinkRedeem } from '../components/Passkeys.jsx'
 import { Section, Row, SelectRow, Switch, Segmented, Button, TextField, SearchField } from '../components/ui.jsx'
 import { PAGES, ROOT_GROUPS, pageVisible, searchSettings, pageTrail } from './settings-pages.js'
+import { LeaderboardSettings } from './Leaderboard.jsx'
 
 /* Settings (v1.3.11). The root is one screen: an account card, eleven rows that each open a page
    (/settings/<page>), and a search over every row. Rare things live one level further down
@@ -62,7 +63,7 @@ let lastQuery = { q: '', key: null }
 export function SettingsRoute() {
   const { page } = useParams()
   const loc = useLocation()
-  const ctx = { user: useStore(s => s.user), mobile: MOBILE }
+  const ctx = { user: useStore(s => s.user), mobile: MOBILE, config: useStore(s => s.config) }
   if (page && (!PAGES[page] || !pageVisible(PAGES[page].parent || page, ctx))) return <Navigate to="/settings" replace />
   if (page === 'coach') return <Navigate to="/coach/setup" replace />
   return <Settings key={page || 'root'} page={page || null} find={loc.state?.find || null} via={loc.state?.via || null} />
@@ -391,6 +392,7 @@ export default function Settings({ page = null, find = null, via = null }) {
   const canVibrate = vibrateSupported()
   const ctx = {
     user, mobile: MOBILE, android, demo: DEMO, wakeOK, hasMedia, pwOn, webauthn: webauthnOK(),
+    config: useStore(s => s.config),
     sound: !!S.sound, playOnSilent: playOnSilentSupported(), canVibrate, vibrate: S.vibrate !== false,
     profiles: (S.equipProfiles || []).length > 0, nameLang: EXERCISE_NAME_LANGS.includes(baseLang(lang)),
     pushOK: !MOBILE && pushSupported(), reminderOn: !!S.reminder?.on, nudge: !!S.reminder?.nudge,
@@ -411,6 +413,7 @@ export default function Settings({ page = null, find = null, via = null }) {
     equipment: () => (S.equipFilterOn && activeProfile ? activeProfile.name : t('Everything')),
     look: () => themeLabel + ' · ' + accentLabel(S),
     coach: () => (coachLocal?.mode === 'server' ? t('Your server') : coachLocal?.mode === 'byok' ? t('Your API key') : t('Off')),
+    leaderboard: () => '',
     data: () => '',
     about: () => 'v' + __APP_VERSION__,
   }
@@ -446,6 +449,9 @@ export default function Settings({ page = null, find = null, via = null }) {
     })} />
 
   const pages = {
+    // The community page is self-contained (views/Leaderboard.jsx): its own server calls for
+    // the participation status, so Settings only decides that it exists at all.
+    leaderboard: () => <LeaderboardSettings />,
     workout: () => <>
       <Section title={t('Rest')} footer={t('Each exercise can have its own rest too. Set it in the exercise settings of a routine.')}>
         {restRow}

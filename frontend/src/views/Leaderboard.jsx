@@ -21,11 +21,11 @@ import { t } from '../lib/i18n.js'
 import { fmtDur } from '../lib/format.js'
 import { Button } from '../components/ui.jsx'
 import Icon from '../components/Icon.jsx'
-import { fetchBoard, fetchMe, joinLeaderboard, setCheer } from '../lib/leaderboard-client.js'
+import { fetchBoard, fetchMe, joinLeaderboard, saveProfile, setCheer } from '../lib/leaderboard-client.js'
 import { invalidateMe, onPublishStatus, publishStatus, requestLeave, retryNow } from '../lib/leaderboard-publish.js'
-
 const toast = m => useUI.getState().toast(m)
 const WINDOWS = [['week', 'Week'], ['month', 'Month'], ['all', 'All']]
+const EMOJIS = ['💪', '🏋️', '🔥', '⚡', '🏃', '🚴', '🏅', '🧘']
 const fmtWhen = ms => (ms ? new Date(ms).toLocaleTimeString() : '')
 
 export default function Leaderboard() {
@@ -42,6 +42,7 @@ export default function Leaderboard() {
   const [reagreed, setReagreed] = useState(false)
   const [busy, setBusy] = useState(false)
   const [pub, setPub] = useState(publishStatus())
+  const [alias, setAlias] = useState(null)     // the identity editor: null = closed
   const lastOkAt = useRef(null)
 
   const on = !!config?.leaderboard
@@ -113,6 +114,17 @@ export default function Leaderboard() {
     const r = await requestLeave(me)
     if (r.ok) await reload()
     else toast(t('Saved. We will finish leaving the leaderboard when you are online.'))
+    setBusy(false)
+  }
+
+  async function saveIdentity() {
+    setBusy(true)
+    try {
+      await saveProfile(alias)
+      setAlias(null)
+      invalidateMe()
+      await reload()
+    } catch (e) { toast(e.message) }
     setBusy(false)
   }
 
@@ -208,8 +220,71 @@ export default function Leaderboard() {
       </div>
     )) : <div className="card"><div className="muted">{t('No one has joined yet')}</div></div>)}
 
+    {user && me?.enabled && !me.suspended && !disclosureStale && (alias === null
+      ? <div className="card row between" style={{ alignItems: 'center', gap: 10 }}>
+        <div className="row" style={{ gap: 8, alignItems: 'center' }}>
+          <span style={{ fontSize: 20 }}>{me.emoji}</span>
+          <span>{me.displayName || t('Anonymous lifter')}</span>
+        </div>
+        <Button size="sm" variant="ghost" onClick={() => setAlias({ displayName: me.displayName || '', emoji: me.emoji || '💪' })}>{t('Edit')}</Button>
+      </div>
+      : <div className="card">
+        <h2>{t('Your public name')}</h2>
+        <div className="muted small" style={{ marginBottom: 8 }}>{t('This is what others see next to your totals.')}</div>
+        <input value={alias.displayName} maxLength={40} style={{ width: '100%', marginBottom: 10 }}
+          aria-label={t('Your public name')} onChange={e => setAlias({ ...alias, displayName: e.target.value })} />
+        <div className="muted small" style={{ marginBottom: 6 }}>{t('Pick your emoji')}</div>
+        <div className="row" style={{ gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
+          {EMOJIS.map(e => (
+            <button key={e} className="chip" aria-label={e} aria-pressed={alias.emoji === e}
+              style={{ fontSize: 18, borderColor: alias.emoji === e ? 'var(--accent, #888)' : undefined }}
+              onClick={() => setAlias({ ...alias, emoji: e })}>{e}</button>
+          ))}
+        </div>
+        <div className="row" style={{ gap: 8 }}>
+          <Button disabled={busy} onClick={saveIdentity}>{t('Save')}</Button>
+          <Button variant="ghost" disabled={busy} onClick={() => setAlias(null)}>{t('Cancel')}</Button>
+        </div>
+      </div>)}
+
     {user && me?.enabled && !me.suspended && !disclosureStale && <div className="card">
       <Button size="sm" variant="ghost" onClick={leave}>{t('Leave the leaderboard')}</Button>
     </div>}
   </div>
+}
+
+/** The Settings page's leaderboard section (S03): participation status straight from the
+ *  server, the public identity as it stands, and the way in. Lives here so the status and the
+ *  board it describes are one screen's worth of code, not two sources of truth. */
+export function LeaderboardSettings() {
+  const nav = useNavigate()
+  const user = useStore(s => s.user)
+  const [me, setMe] = useState(undefined) // undefined = asking, null = feature off
+  useEffect(() => {
+    if (!user) { setMe(null); return }
+    let live = true
+    fetchMe().then(m => { if (live) setMe(m) }).catch(() => { if (live) setMe(null) })
+    return () => { live = false }
+  }, [user?.id])
+
+  const status = me?.suspended ? t('Paused by an administrator')
+    : me?.enabled ? (me.disclosureVersion != null && me.disclosureVersion !== me.currentDisclosureVersion
+        ? t('The leaderboard terms changed — confirm to stay listed') : t('Participating'))
+    : t('Not participating')
+
+  return <>
+    <div className="card">
+      <h2 style={{ margin: 0 }}>{t('Leaderboard')}</h2>
+      <div className="muted small" style={{ marginTop: 4 }}>
+        {t('Anyone who joins this instance sees your weekly, monthly and all-time training totals here. The administrator can also open the leaderboard to visitors — if they do, your results become visible to them too.')}
+      </div>
+      <div className="row" style={{ gap: 8, marginTop: 10, alignItems: 'center' }}>
+        {me?.enabled && <span style={{ fontSize: 20 }}>{me.emoji || '💪'}</span>}
+        <span>{status}</span>
+      </div>
+    </div>
+    <div className="card">
+      <Button onClick={() => nav('/leaderboard')}>{t('Open the leaderboard')}</Button>
+    </div>
+  </>
 }

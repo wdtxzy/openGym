@@ -113,6 +113,21 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
       } catch (e) { return fail(res, e); }
     },
 
+    'PUT /api/leaderboard/profile': async (req, res) => {
+      const user = signedIn(req, res); if (!user) return;
+      const body = await readBody(req);
+      try {
+        return json(res, 200, await domain.profile(user.id, { displayName: body.displayName, emoji: body.emoji }));
+      } catch (e) { return fail(res, e); }
+    },
+
+    'GET /api/admin/leaderboard/members': async (req, res) => {
+      if (!requireAdmin(req, res)) return;
+      try {
+        return json(res, 200, { members: domain.adminMembers() });
+      } catch (e) { return fail(res, e); }
+    },
+
     'PUT /api/admin/leaderboard/member-status': async (req, res) => {
       const admin = requireAdmin(req, res); if (!admin) return;
       const body = await readBody(req);

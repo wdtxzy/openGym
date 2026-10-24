@@ -446,3 +446,34 @@ test('R06: 500 members and 100k cheers answer a board read in well under a secon
   assert.equal(board.rows[0].likeCount, 200);
   assert.ok(ms < 500, `board read took ${ms}ms — the per-member scan is back`);
 });
+
+/* ------------------------- S01/S02/S05: identity and admin list ------------------------- */
+
+test('profile: the member sets their own public name and a controlled emoji', async () => {
+  const { lb } = domainFixture();
+  await join(lb, 'u1');
+  const out = await lb.profile('u1', { displayName: '  Night Owl  ', emoji: '🔥' });
+  assert.deepEqual(out, { displayName: 'Night Owl', emoji: '🔥' });
+  assert.equal(lb.board('week', null).rows[0].displayName, 'Night Owl');
+  assert.equal(lb.board('week', null).rows[0].emoji, '🔥');
+  await rejects(lb.profile('u1', { emoji: '🙋' }), 400, 'emoji');       // not in the controlled set
+  await rejects(lb.profile('u1', { displayName: 'x'.repeat(41) }), 400, 'display-name');
+  // An empty name is the anonymous fallback, not an error.
+  assert.equal((await lb.profile('u1', { displayName: '' })).displayName, '');
+  // Someone who never joined has nothing to style.
+  await rejects(lb.profile('ghost', { emoji: '🔥' }), 403, 'not-participating');
+});
+
+test('adminMembers: identity and status per joined member, nothing else', async () => {
+  const { lb } = domainFixture();
+  await join(lb, 'u1');
+  await lb.report('u1', reportBody({}));
+  await join(lb, 'u2');
+  await lb.adminStatus({ actorUid: 'admin', targetUid: 'u2', suspended: true, reason: 'check', actionId: 'x1' });
+  const members = lb.adminMembers();
+  assert.equal(members.length, 2);
+  const u2 = members.find(m => m.uid === 'u2');
+  assert.deepEqual(Object.keys(u2).sort(), ['displayName', 'emoji', 'enabled', 'publicMemberId', 'suspended', 'suspendedReason', 'uid']);
+  assert.equal(u2.suspended, true);
+  assert.equal(u2.suspendedReason, 'check');
+});

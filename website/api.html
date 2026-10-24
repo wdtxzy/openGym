@@ -246,7 +246,7 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   <p class="api-facts">
     <span>OpenAPI 3.1.0</span>
     <span>openGym v1.4.1</span>
-    <span>76 endpoints</span>
+    <span>78 endpoints</span>
     <span>AGPL-3.0-or-later</span>
   </p>
 
@@ -2818,6 +2818,69 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   <div class="prow rrow">
     <span class="r-code s4">429</span>
     <span class="p-desc">Rate; Retry-After header.</span>
+  </div>
+    </div>
+  </div>
+</details>
+
+<details class="ep" id="op-putLeaderboardProfile">
+  <summary>
+    <span class="m put">PUT</span>
+    <span class="ep-path"><code>/api/leaderboard/profile</code></span>
+    <span class="ep-chev" aria-hidden="true"></span>
+    <span class="ep-sum">The caller's public identity</span>
+  </summary>
+  <div class="ep-body">
+<p>The display name (empty = the anonymous fallback text) and one emoji from the controlled set the board offers. Kept in the shared file, so every device shows the same identity. Only a participating member has one to set.</p>
+    <p class="ep-auth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Requires a session: the cookie set at sign-in, or <code>Authorization: Bearer &lt;token&gt;</code> from mobile-app pairing.</span></p>
+
+<p class="ep-h">Request body <span class="p-hint">(JSON)</span></p><div class="ptab">
+  <div class="prow">
+    <span class="p-name">displayName</span>
+    <span class="p-type">string <span class="p-hint">(&le; 40 chars)</span></span>
+    <span class="p-desc">Trimmed; empty shows the anonymous text.</span>
+  </div>
+  <div class="prow">
+    <span class="p-name">emoji</span>
+    <span class="p-type">&quot;💪&quot; | &quot;🏋️&quot; | &quot;🔥&quot; | &quot;⚡&quot; | &quot;🏃&quot; | &quot;🚴&quot; | &quot;🏅&quot; | &quot;🧘&quot;</span>
+    <span class="p-desc"></span>
+  </div>
+</div>
+    <p class="ep-h">Responses</p>
+    <div class="ptab">
+  <div class="prow rrow">
+    <span class="r-code s2">200</span>
+    <span class="p-desc">The stored identity.</span>
+  </div>
+  <div class="prow rrow">
+    <span class="r-code s4">400</span>
+    <span class="p-desc">emoji not in the set</span>
+  </div>
+  <div class="prow rrow">
+    <span class="r-code s4">403</span>
+    <span class="p-desc">Not participating.</span>
+  </div>
+    </div>
+  </div>
+</details>
+
+<details class="ep" id="op-getLeaderboardMembers">
+  <summary>
+    <span class="m get">GET</span>
+    <span class="ep-path"><code>/api/admin/leaderboard/members</code></span>
+    <span class="ep-chev" aria-hidden="true"></span>
+    <span class="ep-sum">The joined members, for the admin card</span>
+  </summary>
+  <div class="ep-body">
+<p>Identity and participation status per member — the uid ↔ publicMemberId mapping an operator needs to act on a report, with the suspension flag and its reason. No day buckets, no totals: the operator moderates, they do not browse training.</p>
+    <p class="ep-auth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span>Requires a session: the cookie set at sign-in, or <code>Authorization: Bearer &lt;token&gt;</code> from mobile-app pairing.</span></p>
+
+
+    <p class="ep-h">Responses</p>
+    <div class="ptab">
+  <div class="prow rrow">
+    <span class="r-code s2">200</span>
+    <span class="p-desc">The member list.<span class="r-sig">{ members: object[] }</span></span>
   </div>
     </div>
   </div>

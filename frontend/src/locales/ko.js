@@ -2272,4 +2272,10 @@ export default {
   "Cheer {0}": "Cheer {0}",
   "Remove your cheer for {0}": "Remove your cheer for {0}",
   "{0} cheers": "{0} cheers",
+  "Your public name": "Your public name",
+  "This is what others see next to your totals.": "This is what others see next to your totals.",
+  "Pick your emoji": "Pick your emoji",
+  "Participating": "Participating",
+  "Not participating": "Not participating",
+  "Open the leaderboard": "Open the leaderboard",
 }

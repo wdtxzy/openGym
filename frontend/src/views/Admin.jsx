@@ -251,6 +251,60 @@ function AuditCard({ tick }) {
   </div>
 }
 
+// The leaderboard card (S05): who joined, and the one governance act the PRD gives the
+// operator over it — a reasoned, audited suspension that survives withdraw/rejoin. Like the
+// rest of this dashboard it is English-only, and like every admin route it is guarded again
+// server-side. Shown only where the instance switched the feature on.
+function LeaderboardAdmin() {
+  const config = useStore(s => s.config)
+  const toast = useUI(s => s.toast)
+  const [members, setMembers] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const load = () => api('/api/admin/leaderboard/members')
+    .then(d => setMembers(d.members || []))
+    .catch(e => toast(e.message || 'could not load the leaderboard members'))
+  useEffect(() => { if (config?.leaderboard) load() }, [!!config?.leaderboard])
+  if (!config?.leaderboard) return null
+
+  const setStatus = async (m, suspended) => {
+    const reason = suspended ? (window.prompt('Reason (shown to the member and kept in the audit log):') || '').trim() : ''
+    if (suspended && !reason) return
+    setBusy(true)
+    try {
+      await api('/api/admin/leaderboard/member-status', {
+        method: 'PUT',
+        body: JSON.stringify({ targetUid: m.uid, targetName: m.displayName || m.publicMemberId, suspended, reason, actionId: 'adm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) })
+      })
+      await load()
+    } catch (e) { toast(e.message) }
+    setBusy(false)
+  }
+
+  return <div className="card">
+    <div className="row between" style={{ alignItems: 'center' }}>
+      <h2 style={{ margin: 0 }}>Leaderboard</h2>
+      <Button size="sm" variant="ghost" disabled={busy} onClick={load}>Refresh</Button>
+    </div>
+    <div className="adm-lead">
+      Everyone who joined the opt-in leaderboard. Suspending hides a member from every board and blocks their publishing, with a reason they can see; it never touches their training data.
+    </div>
+    {members === null ? <div className="muted">Loading…</div> : members.length === 0 ? <div className="muted">Nobody has joined yet.</div> : <div>
+      {members.map(m => <div key={m.uid} className="row between" style={{ alignItems: 'center', gap: 10, padding: '6px 0' }}>
+        <div style={{ minWidth: 0 }}>
+          <div>{m.emoji} {m.displayName || <span className="muted">anonymous ({m.publicMemberId})</span>}
+            {m.suspended ? <span style={{ color: 'var(--red)' }}> · suspended</span> : null}
+            {!m.enabled ? <span className="muted"> · left</span> : null}
+          </div>
+          {m.suspended && m.suspendedReason ? <div className="muted" style={{ fontSize: 11 }}>“{m.suspendedReason}”</div> : null}
+        </div>
+        {m.suspended
+          ? <Button size="sm" disabled={busy} onClick={() => setStatus(m, false)}>Restore</Button>
+          : <Button size="sm" variant="ghost" disabled={busy || !m.enabled} onClick={() => setStatus(m, true)}>Suspend</Button>}
+      </div>)}
+    </div>}
+  </div>
+}
+
 export default function Admin() {
   const nav = useNavigate()
   const user = useStore(s => s.user)
@@ -291,6 +345,8 @@ export default function Admin() {
     <div className="adm-intro">
       Everything about running this instance: who uses it, how they get in, the AI Coach, and what has happened on it. Nothing here shows anyone's training data beyond counts.
     </div>
+
+    <LeaderboardAdmin />
 
     {usersErr && <div className="card" role="alert" style={{ borderColor: 'var(--red)' }}>
       <div className="row between"><h2 style={{ margin: 0 }}>{users ? 'The last update failed' : 'Could not load the users'}</h2>

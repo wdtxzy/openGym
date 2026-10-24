@@ -2265,4 +2265,10 @@ export default {
   "Cheer {0}": "為 {0} 加油",
   "Remove your cheer for {0}": "取消為 {0} 加油",
   "{0} cheers": "{0} 次加油",
+  "Your public name": "公開展示的名稱",
+  "This is what others see next to your totals.": "這是其他人在你的成績旁看到的名稱。",
+  "Pick your emoji": "選擇你的表情",
+  "Participating": "已參與",
+  "Not participating": "未參與",
+  "Open the leaderboard": "打開排行榜",
 }

@@ -38,6 +38,19 @@ export async function leaveLeaderboard(me) {
   });
 }
 
+/** The member's public identity (S01/S02): display name and one of the server's emoji. */
+export async function saveProfile({ displayName, emoji }) {
+  return api('/api/leaderboard/profile', {
+    method: 'PUT',
+    body: JSON.stringify({ displayName, emoji })
+  });
+}
+
+/** The admin card's member list (S05). */
+export async function adminMembers() {
+  return api('/api/admin/leaderboard/members');
+}
+
 export async function fetchBoard(windowType) {
   return api('/api/leaderboard?window=' + encodeURIComponent(windowType))
 }
