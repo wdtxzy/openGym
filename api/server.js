@@ -35,6 +35,7 @@ import { effectiveRoutineId } from './queue.js';
 import { stampPut } from './sync-stamps.js';
 import { atomicWrite as durableWrite } from './durable.js';
 import { createSharedStore, StoreError } from './community/store.js';
+import { leaderboardRoutes } from './community/leaderboard-routes.js';
 import { excusedOn, nudgeFor, nudgeWindowOpen, toneOf } from './nudge.js';
 
 const PORT = +(process.env.PORT || 3000);
@@ -2600,6 +2601,12 @@ const routes = {
   // them: they are closures over db and SECRET, and passing them in keeps that module free of
   // a cycle. Every one of them is inert while the feature is unconfigured.
   ...coachRoutes({ json, readBody, readSession, requireAdmin }),
+  // Only when the instance switched the leaderboard on: an off instance has none of these
+  // routes, and unanswered is a plain 404 — no entry point, no information leak (LB-01).
+  ...(LEADERBOARD ? leaderboardRoutes({
+    store: leaderboardStore, json, readBody, readSession, requireAdmin, audit,
+    publicRead: LEADERBOARD_PUBLIC_READ
+  }) : {}),
 
   /* ---------- photos & videos ---------- */
   // Absent, not refusing, when MEDIA_UPLOADS=0: a 404 is what a server from before the feature
