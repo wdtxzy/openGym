@@ -34,7 +34,8 @@ import { createMediaStore, mediaLimits, mediaConfig, MediaError, HASH_RE } from 
 import { effectiveRoutineId } from './queue.js';
 import { stampPut } from './sync-stamps.js';
 import { atomicWrite as durableWrite } from './durable.js';
-import { createSharedStore, StoreError } from './community/store.js';
+import { createSharedStore } from './community/store.js';
+import { createLeaderboard } from './community/leaderboard.js';
 import { leaderboardRoutes } from './community/leaderboard-routes.js';
 import { excusedOn, nudgeFor, nudgeWindowOpen, toneOf } from './nudge.js';
 
@@ -89,6 +90,9 @@ const leaderboardStore = createSharedStore({
   schemaVersion: 1,
   init: () => ({ members: {}, likes: {}, adminActions: [] })
 });
+// One domain instance for the whole process: the routes and the account-deletion cleanup
+// below go through the same serialized store, so they can never interleave badly.
+const leaderboardDomain = createLeaderboard({ store: leaderboardStore });
 if (LEADERBOARD) {
   const probe = leaderboardStore.warmup();
   if (!probe.ok) console.error(`leaderboard store unavailable (${probe.code}): ${probe.detail}`);
@@ -2506,6 +2510,18 @@ const routes = {
     if (!u) return json(res, 404, { error: 'no such user' });
     if (u.id === admin.id) return json(res, 400, { error: 'you cannot delete your own account' });
     if (isAdmin(u) && db.users.filter(isAdmin).length <= 1) return json(res, 400, { error: 'cannot delete the last admin' });
+    // The leaderboard's shared copy of this person (PRD §17 账号删除) goes first: a failure
+    // here aborts the delete so the admin can retry, instead of finishing it and leaving a
+    // deleted account's name and totals public. Only when the feature is on — on an off
+    // instance there is no shared file to clean, and touching it would create one.
+    if (LEADERBOARD) {
+      try { leaderboardDomain.forget(u.id); }
+      catch (e) {
+        console.error('leaderboard cleanup for account delete failed', e.message);
+        audit(req, 'admin.user.delete', { ok: false, user: admin, msg: 'leaderboard cleanup failed' });
+        return json(res, 503, { error: 'leaderboard cleanup failed, try again', code: 'store' });
+      }
+    }
     const name = u.name;
     db.users = db.users.filter(x => x.id !== u.id);
     db.creds = (db.creds || []).filter(c => c.userId !== u.id);
@@ -2604,7 +2620,7 @@ const routes = {
   // Only when the instance switched the leaderboard on: an off instance has none of these
   // routes, and unanswered is a plain 404 — no entry point, no information leak (LB-01).
   ...(LEADERBOARD ? leaderboardRoutes({
-    store: leaderboardStore, json, readBody, readSession, requireAdmin, audit,
+    domain: leaderboardDomain, json, readBody, readSession, requireAdmin, audit,
     publicRead: LEADERBOARD_PUBLIC_READ
   }) : {}),
 

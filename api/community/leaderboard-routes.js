@@ -9,15 +9,21 @@
  * consent version, the current window key) — and never an internal uid or another member's
  * raw buckets. */
 import { createWindow } from '../rate-limit.js';
-import { createLeaderboard, LeaderboardError } from './leaderboard.js';
+import { LeaderboardError } from './leaderboard.js';
+import { StoreError } from './store.js';
 
 const LIKE_BUDGET = 30; // per account per minute (PRD §15 governance numbers)
 
-export function leaderboardRoutes({ store, json, readBody, readSession, requireAdmin, audit, publicRead }) {
-  const domain = createLeaderboard({ store });
+export function leaderboardRoutes({ domain, json, readBody, readSession, requireAdmin, audit, publicRead }) {
   const likeBudget = createWindow({ max: LIKE_BUDGET, windowMs: 60000 });
 
-  const fail = (res, e) => json(res, e.status, { error: e.code, ...e.extra });
+  // One error shape for both module families: product refusals carry their own status, a
+  // refused store is always 503 "unavailable" (PRD §7) — never a generic 500.
+  const fail = (res, e) => {
+    if (e instanceof LeaderboardError) return json(res, e.status, { error: e.code, ...e.extra });
+    if (e instanceof StoreError) return json(res, 503, { error: 'store unavailable', code: e.code });
+    throw e;
+  };
 
   const signedIn = (req, res) => {
     const user = readSession(req);
@@ -38,10 +44,7 @@ export function leaderboardRoutes({ store, json, readBody, readSession, requireA
         // confuse for a member's answer (PRD §7: no member-perspective cache for guests).
         if (!viewer) for (const row of board.rows) delete row.viewerLiked;
         return json(res, 200, board);
-      } catch (e) {
-        if (e instanceof LeaderboardError) return fail(res, e);
-        throw e;
-      }
+      } catch (e) { return fail(res, e); }
     },
 
     'GET /api/leaderboard/me': async (req, res) => {
@@ -61,10 +64,7 @@ export function leaderboardRoutes({ store, json, readBody, readSession, requireA
         });
         audit(req, body.enabled ? 'leaderboard.join' : 'leaderboard.withdraw', { user, enabled: !!body.enabled });
         return json(res, 200, out);
-      } catch (e) {
-        if (e instanceof LeaderboardError) return fail(res, e);
-        throw e;
-      }
+      } catch (e) { return fail(res, e); }
     },
 
     'PUT /api/leaderboard/report': async (req, res) => {
@@ -72,10 +72,7 @@ export function leaderboardRoutes({ store, json, readBody, readSession, requireA
       const body = await readBody(req);
       try {
         return json(res, 200, await domain.report(user.id, body));
-      } catch (e) {
-        if (e instanceof LeaderboardError) return fail(res, e);
-        throw e;
-      }
+      } catch (e) { return fail(res, e); }
     },
 
     'PUT /api/leaderboard/like': async (req, res) => {
@@ -88,10 +85,7 @@ export function leaderboardRoutes({ store, json, readBody, readSession, requireA
           actorUid: user.id, targetPublicId: body.targetPublicId,
           windowType: body.windowType, windowKey: body.windowKey, on: true
         }));
-      } catch (e) {
-        if (e instanceof LeaderboardError) return fail(res, e);
-        throw e;
-      }
+      } catch (e) { return fail(res, e); }
     },
 
     'DELETE /api/leaderboard/like': async (req, res) => {
@@ -104,10 +98,7 @@ export function leaderboardRoutes({ store, json, readBody, readSession, requireA
           actorUid: user.id, targetPublicId: p.get('targetPublicId'),
           windowType: p.get('windowType'), windowKey: p.get('windowKey'), on: false
         }));
-      } catch (e) {
-        if (e instanceof LeaderboardError) return fail(res, e);
-        throw e;
-      }
+      } catch (e) { return fail(res, e); }
     },
 
     'PUT /api/admin/leaderboard/member-status': async (req, res) => {
@@ -118,13 +109,20 @@ export function leaderboardRoutes({ store, json, readBody, readSession, requireA
           actorUid: admin.id, targetUid: body.targetUid,
           suspended: !!body.suspended, reason: body.reason, actionId: body.actionId
         });
+        // audit() keeps the fields it knows: operator (user), target ({id,name}), act, msg.
+        // Everything an operator reading audit.log back needs to know who suspended whom,
+        // why, and whether this was the action or a replay of one already applied.
         audit(req, 'leaderboard.admin.status', {
-          ok: true, user: admin, targetUid: body.targetUid,
-          suspended: !!body.suspended, actionId: body.actionId, applied: out.applied
+          ok: true,
+          user: admin,
+          target: { id: String(body.targetUid || ''), name: String(body.targetName || '') },
+          act: (body.suspended ? 'suspend' : 'restore') + (out.applied ? '' : ' (replay)'),
+          msg: String(body.reason || '')
         });
         return json(res, 200, out);
       } catch (e) {
         if (e instanceof LeaderboardError) return fail(res, e);
+        if (e instanceof StoreError) return fail(res, e);
         throw e;
       }
     }

@@ -125,11 +125,81 @@ test('a foreign live PID in the lock is refused; a dead one is taken over', asyn
   fs.writeFileSync(file + '.lock', String(child.pid));
   const first = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   assert.equal(first.warmup().code, 'second-writer');
+  // The refusal left the live owner's lock exactly as it was — never trampled.
+  assert.equal(fs.readFileSync(file + '.lock', 'utf8'), String(child.pid));
 
   child.kill('SIGKILL');
   await new Promise(r => child.on('exit', r));
   const second = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   assert.equal(second.warmup().ok, true, 'a stale lock from a crash does not wedge the feature');
+});
+
+test('a lock that is not a PID at all is stale garbage, taken over', () => {
+  const file = path.join(dir(), 'shared.json');
+  fs.writeFileSync(file + '.lock', 'not-a-pid');
+  const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  assert.equal(s.warmup().ok, true);
+  assert.equal(fs.readFileSync(file + '.lock', 'utf8'), String(process.pid));
+});
+
+test('R07: a file that corrupts after warmup refuses both reads and writes, and survives byte for byte', async () => {
+  const file = path.join(dir(), 'shared.json');
+  const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  await s.txn(d => { d.members.a = 1; });
+  const damaged = '{ this is not json';
+  fs.writeFileSync(file, damaged);
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(file, future, future); // mtime must move, or the change is invisible
+  assert.throws(() => s.read(), e => e.code === 'corrupt');
+  await assert.rejects(s.txn(d => { d.members.b = 2; }), e => e.code === 'corrupt');
+  assert.equal(fs.readFileSync(file, 'utf8'), damaged, 'the damaged original is never overwritten from cache');
+  assert.equal(s.warmup().ok, false, 'the refusal is sticky, not a one-shot');
+  assert.equal(s.warmup().code, 'corrupt');
+});
+
+test('R08: an async callback is awaited — mutations after an await reach the disk', async () => {
+  const file = path.join(dir(), 'shared.json');
+  const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  await s.txn(async d => {
+    d.members.before = 1;
+    await new Promise(r => setTimeout(r, 5));
+    d.members.afterAwait = 1; // before this fix, the disk was already written without it
+  });
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(onDisk.members.afterAwait, 1);
+  assert.equal(s.read().members.afterAwait, 1);
+});
+
+test('R08: an async rejection writes nothing and does not wedge the queue', async () => {
+  const file = path.join(dir(), 'shared.json');
+  const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  await s.txn(d => { d.members.a = 1; });
+  await assert.rejects(s.txn(async d => {
+    d.members.b = 2;
+    await new Promise(r => setTimeout(r, 5));
+    throw new Error('async validation failed');
+  }));
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).members.b, undefined);
+  const { revision } = await s.txn(d => { d.members.c = 3; });
+  assert.equal(revision, 2);
+});
+
+test('R09: a failed first initialization is retried honestly, never cached as ok', () => {
+  const file = path.join(dir(), 'shared.json');
+  let diskFull = true;
+  const mk = () => createSharedStore({
+    file, schemaVersion: 1, init: () => ({ members: {} }),
+    writer: (f, content) => {
+      if (diskFull) throw new Error('disk full (injected)');
+      fs.writeFileSync(f, content);
+    }
+  });
+  assert.equal(mk().warmup().ok, false);
+  assert.equal(mk().warmup().ok, false, 'the second warmup does not report an in-memory success');
+  assert.equal(fs.existsSync(file), false);
+  diskFull = false;
+  assert.equal(mk().warmup().ok, true);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).schemaVersion, 1);
 });
 
 test('an external rewrite of the file (operator edit) is picked up by read()', async () => {

@@ -45,20 +45,32 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   let locked = false;
   let queue = Promise.resolve();
 
-  /* Best-effort single-writer guard (see header). Refuses, never repairs another live owner. */
+  /* Best-effort single-writer guard (see header). The acquire is atomic — 'wx' fails if
+   * anyone created the lock first — so the winner is decided by the filesystem, never by a
+   * read-then-write that can trample a lock another process placed between the two steps.
+   * Taking over a stale lock goes unlink → wx: if a contender wins that race instead, we
+   * refuse. A lock is never written over blindly. */
   function lock() {
     if (locked) return;
-    let pid = 0;
-    try { pid = Number(fs.readFileSync(lockFile, 'utf8')) || 0; } catch { /* no lock yet */ }
-    if (pid && pid !== process.pid && pidAlive(pid))
-      throw new StoreError('second-writer', `pid ${pid} already owns ${file}`);
-    try { fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' }); }
-    catch (e) {
+    try {
+      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
+      locked = true;
+      return;
+    } catch (e) {
       if (e.code !== 'EEXIST') throw new StoreError('lock', e.message);
-      // Ours already, or a stale one judged dead above: replace the content, keep the file.
-      fs.writeFileSync(lockFile, String(process.pid));
     }
-    locked = true;
+    let pid = 0;
+    try { pid = Number(fs.readFileSync(lockFile, 'utf8')) || 0; } catch { /* vanished: fall through to the retry */ }
+    if (pid === process.pid) { locked = true; return; } // ours from an earlier store in this process
+    if (pid && pidAlive(pid)) throw new StoreError('second-writer', `pid ${pid} already owns ${file}`);
+    try { fs.unlinkSync(lockFile); } catch { /* already gone */ }
+    try {
+      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
+      locked = true;
+    } catch (e) {
+      if (e.code === 'EEXIST') throw new StoreError('second-writer', `lost the takeover race for ${file}`);
+      throw new StoreError('lock', e.message);
+    }
   }
 
   function persist(draft) {
@@ -75,15 +87,23 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   function load() {
     if (refused) throw refused;
     if (data) {
-      // Edits while the service runs are not supported; this only keeps a restarted-over
-      // replica from answering from a snapshot the operator already replaced by hand.
+      // Edits while the service runs are not supported. An external change we can still
+      // validate is adopted; one we cannot (unparseable, wrong schema, file gone) refuses the
+      // store — sticky, until restart — rather than serving or overwriting from a cache the
+      // operator has already moved past: the damaged original has to survive for a person.
       let mtime = 0;
-      try { mtime = fs.statSync(file).mtimeMs; } catch { /* gone: keep the cache */ }
-      if (mtime && mtime !== knownMtime) {
+      try { mtime = fs.statSync(file).mtimeMs; } catch { mtime = -1; }
+      if (mtime !== 0 && mtime !== knownMtime) {
+        if (mtime === -1) { refused = new StoreError('missing', `${file} disappeared underneath us`); throw refused; }
         try {
           const reparsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-          if (reparsed && reparsed.schemaVersion === schemaVersion) { data = reparsed; knownMtime = mtime; }
-        } catch { /* an operator mid-edit; the last good cache keeps serving */ }
+          if (!reparsed || reparsed.schemaVersion !== schemaVersion) throw new Error('schema');
+          data = reparsed;
+          knownMtime = mtime;
+        } catch (e) {
+          refused = new StoreError('corrupt', `external change is not readable (${e.message})`);
+          throw refused;
+        }
       }
       return data;
     }
@@ -93,8 +113,11 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
       knownMtime = fs.statSync(file).mtimeMs;
     } catch (e) {
       if (e.code !== 'ENOENT') { refused = new StoreError('unreadable', e.message); throw refused; }
-      data = { schemaVersion, revision: 0, updatedAt: now(), ...init() };
-      persist(data);
+      // Initialize disk-first: a failed initial write leaves no cache, so the next warmup
+      // retries honestly instead of reporting an ok that exists only in memory.
+      const fresh = { schemaVersion, revision: 0, updatedAt: now(), ...init() };
+      persist(fresh);
+      data = fresh;
       return data;
     }
     let parsed;
@@ -115,20 +138,23 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
       return structuredClone(load());
     },
 
-    /** Run `fn(draft)` against a private draft and persist the result. `fn`'s return value is
-     *  passed back; a throw from `fn` or a failed write leaves file and cache untouched. The
-     *  next transaction runs after a failure — the queue never wedges on one bad write. */
+    /** Run `fn(draft)` against a private draft and persist the result. `fn` may be async:
+     *  the queue awaits it before anything is written, so a mutation made after an await
+     *  lands on disk too, and the next transaction still starts only after this one settles.
+     *  `fn`'s return value is passed back; a throw from `fn` or a failed write leaves file
+     *  and cache untouched, and the next transaction runs after a failure — never wedged. */
     txn(fn) {
       lock();
-      const run = () => {
+      const run = async () => {
         const current = load();
         const draft = structuredClone(current);
         const out = fn(draft);
+        const value = (out && typeof out.then === 'function') ? await out : out;
         draft.revision = (current.revision || 0) + 1;
         draft.updatedAt = now();
         persist(draft);
         data = draft;
-        return { revision: draft.revision, out };
+        return { revision: draft.revision, out: value };
       };
       const p = queue.then(run, run);
       queue = p.catch(() => {});

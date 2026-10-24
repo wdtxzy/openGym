@@ -218,6 +218,26 @@ test('admin suspension: reasoned, idempotent, survives rejoin, touches nothing p
   assert.equal(lb.board('week', null).rows.length, 1);
 });
 
+test('forget: account deletion removes the member and every like relationship, both directions', async () => {
+  const { lb } = domainFixture(bj(2026, 10, 22, 10));
+  await join(lb, 'u1');
+  await lb.report('u1', reportBody({}));
+  await join(lb, 'u2');
+  await join(lb, 'u3');
+  const target = lb.me('u1').publicMemberId;
+  const key = '2026-10-19';
+  await lb.like({ actorUid: 'u2', targetPublicId: target, windowType: 'week', windowKey: key, on: true });
+  await lb.like({ actorUid: 'u1', targetPublicId: lb.me('u3').publicMemberId, windowType: 'week', windowKey: key, on: true });
+  const r = await lb.forget('u1');
+  assert.deepEqual(r, { removed: true });
+  assert.equal(lb.board('week', null).rows.some(x => x.publicMemberId === target), false);
+  assert.equal(lb.me('u1').enabled, false);
+  assert.equal((await lb.forget('u1')).removed, false); // idempotent
+  // u3's row lost u1's cheer; u2's own cheer to u1 is gone with the member.
+  const u3row = lb.board('week', null).rows.find(x => x.publicMemberId === lb.me('u3').publicMemberId);
+  assert.equal(u3row.likeCount, 0);
+});
+
 test('concurrent reports and likes serialize through the store queue', async () => {
   const { lb } = domainFixture();
   await join(lb, 'u1');
@@ -242,10 +262,11 @@ test('concurrent reports and likes serialize through the store queue', async () 
 function routeFixture({ publicRead = true } = {}) {
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lb-routes-')), 'leaderboard.json');
   const store = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {}, likes: {}, adminActions: [] }) });
+  const domain = createLeaderboard({ store });
   const audited = [];
   const users = { alice: { id: 'alice', name: 'Alice' }, bob: { id: 'bob', name: 'Bob' } };
   const routes = leaderboardRoutes({
-    store,
+    domain,
     json: (res, code, obj, headers) => { res.status = code; res.body = obj; res.headers = headers; },
     readBody: async req => req._body || {},
     readSession: req => req._user || null,

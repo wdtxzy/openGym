@@ -284,6 +284,22 @@ export function createLeaderboard({ store, now = Date.now }) {
       }).then(({ out }) => out);
     },
 
+    /** Account deletion (PRD §17): the shared file keeps nothing of a deleted account — not
+     *  their member row (name, totals, identity) nor any like relationship they were part
+     *  of, in either direction. Unlike a withdrawal this is a real removal: there is no
+     *  account left to rejoin. Admin action records stay (audit trail, bounded). */
+    forget(uid) {
+      return store.txn(data => {
+        const had = !!data.members[uid];
+        delete data.members[uid];
+        for (const key of Object.keys(data.likes)) {
+          const [actor, target] = key.split('|');
+          if (actor === uid || target === uid) delete data.likes[key];
+        }
+        return { removed: had };
+      }).then(({ out }) => out);
+    },
+
     /** Which uid a public id maps to — the admin card's view, never a client API. */
     uidOfPublicId(publicMemberId) {
       const data = store.read();
