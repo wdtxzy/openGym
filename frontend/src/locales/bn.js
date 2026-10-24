@@ -2343,4 +2343,12 @@ export default {
   "Leave the leaderboard": "Leave the leaderboard",
   "Month": "Month",
   "Total training time across the instance, this week and beyond.": "Total training time across the instance, this week and beyond.",
+  "Publishing your totals failed. We will retry automatically.": "Publishing your totals failed. We will retry automatically.",
+  "Retry": "Retry",
+  "Saved. We will finish leaving the leaderboard when you are online.": "Saved. We will finish leaving the leaderboard when you are online.",
+  "The leaderboard terms changed — confirm to stay listed": "The leaderboard terms changed — confirm to stay listed",
+  "Rank #{0}": "Rank #{0}",
+  "Cheer {0}": "Cheer {0}",
+  "Remove your cheer for {0}": "Remove your cheer for {0}",
+  "{0} cheers": "{0} cheers",
 }

@@ -2257,4 +2257,12 @@ export default {
   "Leave the leaderboard": "退出排行榜",
   "Month": "本月",
   "Total training time across the instance, this week and beyond.": "全實例的總訓練時長，本週以及更久。",
+  "Publishing your totals failed. We will retry automatically.": "發布你的總時長失敗，我們會自動重試。",
+  "Retry": "重試",
+  "Saved. We will finish leaving the leaderboard when you are online.": "已保存。連線後會自動完成退出排行榜。",
+  "The leaderboard terms changed — confirm to stay listed": "排行榜條款已更新——請確認以繼續展示",
+  "Rank #{0}": "第 {0} 名",
+  "Cheer {0}": "為 {0} 加油",
+  "Remove your cheer for {0}": "取消為 {0} 加油",
+  "{0} cheers": "{0} 次加油",
 }

@@ -10,6 +10,7 @@ import { effectiveLang } from './lib/default-lang.js'
 import { setPlayOnSilent, setVibrate, setAlarmBuzzer } from './lib/sound.js'
 import { buzzAsAlarm } from './lib/rest-alert.js'
 import { setNav } from './lib/nav.js'
+import { startPublishing } from './lib/leaderboard-publish.js'
 import { setSystemBarsLight } from './lib/system-bars.js'
 import { initBackButton } from './lib/back.js'
 import { useWakeLock } from './lib/wakelock.js'
@@ -72,6 +73,10 @@ function Shell() {
   const loc = useLocation()
   const navType = useNavigationType()
   const { S, user, ready } = useStore()
+  // The leaderboard's global publisher: reacts to the personal facts wherever they change —
+  // with no leaderboard page open (the review's R05). Started once, idempotent, inert unless
+  // this account joined and the instance switched the feature on.
+  useEffect(() => { startPublishing() }, [])
   // iOS: whether timer sounds get past the ring/silent switch (Settings → Sounds). Page-level,
   // so it is applied here on load and on change rather than at each beep.
   useEffect(() => { setPlayOnSilent(!!S.soundOnSilent) }, [S.soundOnSilent])
@@ -203,7 +208,12 @@ function Shell() {
           re-mounts the boundary, so the tab bar is always a way out */}
       <div id="app" className="vfade" key={loc.pathname}>
         <ErrorBoundary>
-          {!authed ? <Login /> : needsMobileOnboarding ? <MobileOnboarding /> : (
+          {/* An instance that opened the leaderboard to visitors does not get to force a login
+              on the one public page it promised (R14): ALLOW_GUEST=0 keeps the whole app behind
+              the door, and the public board stays reachable at its own address. */}
+          {!authed ? (
+            config?.leaderboard?.public_read && loc.pathname === '/leaderboard' ? <Leaderboard /> : <Login />
+          ) : needsMobileOnboarding ? <MobileOnboarding /> : (
             <Routes>
               <Route path="/home" element={<Home />} />
               {/* Gym check-in — switched off in Settings, the route falls through to the

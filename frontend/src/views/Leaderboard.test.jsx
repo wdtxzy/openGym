@@ -1,14 +1,15 @@
 // @vitest-environment happy-dom
-// The leaderboard screen. What is worth pinning is not markup but the contract with the client
-// library and the server's answers: a first publish rides the view when joined (LB-07's client
-// half — the report is the device's own facts), the join card cannot be pressed without the
-// disclosure checkbox, a suspended member sees the banner and never publishes, a guest without
-// public read sees the sign-in line, and a cheer carries the window the board was loaded with.
+// The leaderboard screen. What is worth pinning is the contract with the client library and
+// the global coordinator: the join card cannot be pressed without the disclosure checkbox, a
+// disclosure-version change shows the re-confirm card (R12), a publish failure surfaces with a
+// retry (R10), a guest without public read sees the sign-in line, and a cheer carries the
+// window the board was loaded with. Publishing itself is the coordinator's job and is NOT
+// triggered from here — that inversion was the review's R05.
 import React, { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import Leaderboard from './Leaderboard.jsx'
-import { fetchBoard, fetchMe, joinLeaderboard, publishReport, setCheer } from '../lib/leaderboard-client.js'
+import { fetchBoard, fetchMe, joinLeaderboard, setCheer } from '../lib/leaderboard-client.js'
 
 vi.mock('../lib/leaderboard-client.js', () => ({
   fetchBoard: vi.fn(),
@@ -17,6 +18,23 @@ vi.mock('../lib/leaderboard-client.js', () => ({
   leaveLeaderboard: vi.fn(),
   publishReport: vi.fn(),
   setCheer: vi.fn()
+}))
+
+const pub = vi.hoisted(() => {
+  const state = { pending: false, lastOkAt: null, lastError: null, withdrawPending: false }
+  const subs = new Set()
+  return {
+    state, subs,
+    push: patch => { Object.assign(state, patch); for (const l of subs) l(state) },
+    retryNow: vi.fn(), requestLeave: vi.fn(), invalidateMe: vi.fn()
+  }
+})
+vi.mock('../lib/leaderboard-publish.js', () => ({
+  publishStatus: () => pub.state,
+  onPublishStatus: l => { pub.subs.add(l); return () => pub.subs.delete(l) },
+  retryNow: (...a) => pub.retryNow(...a),
+  requestLeave: (...a) => pub.requestLeave(...a),
+  invalidateMe: (...a) => pub.invalidateMe(...a)
 }))
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
@@ -45,6 +63,8 @@ beforeEach(() => {
   mocks.S = { workouts: [], activities: [] }
   mocks.user = null
   mocks.config = { leaderboard: { public_read: false } }
+  Object.assign(pub.state, { pending: false, lastOkAt: null, lastError: null, withdrawPending: false })
+  pub.subs.clear()
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host)
 })
 const mount = () => act(() => root.render(<Leaderboard />))
@@ -59,7 +79,7 @@ const BOARD = {
     { publicMemberId: 'pubB', displayName: 'Bo', emoji: '🏋️', rank: 2, gymMs: 1800000, syncedMs: 0, totalMs: 1800000, gymSessions: 1, syncedSessions: 0, likeCount: 0, viewerLiked: false, dataAsOf: 1792000000000 }
   ]
 }
-const ME_JOINED = { enabled: true, suspended: false, consentVersion: 1, reportRev: 3, publicMemberId: 'pubA', displayName: 'Ana', currentDisclosureVersion: 1 }
+const ME_JOINED = { enabled: true, suspended: false, consentVersion: 1, reportRev: 3, publicMemberId: 'pubA', displayName: 'Ana', disclosureVersion: 1, currentDisclosureVersion: 1 }
 
 describe('Leaderboard view', () => {
   it('a switched-off instance explains instead of bouncing, and fetches nothing', async () => {
@@ -69,19 +89,59 @@ describe('Leaderboard view', () => {
     expect(fetchBoard).not.toHaveBeenCalled()
   })
 
-  it('a joined member sees the board, their own mark, and publishes their facts once', async () => {
+  it('a joined member sees the board and their own mark; the view itself publishes nothing (R05)', async () => {
     mocks.user = { id: 'u1', name: 'Ana' }
     fetchBoard.mockResolvedValue(BOARD)
     fetchMe.mockResolvedValue(ME_JOINED)
-    publishReport.mockResolvedValue({ ok: true, reportRev: 4 })
     await mount(); await settle()
-
     expect(textOf()).toContain('Ana')
-    expect(textOf()).toContain('You')            // the own row is marked, and has no cheer button
+    expect(textOf()).toContain('You')
     expect(fetchBoard).toHaveBeenCalledWith('week')
-    expect(publishReport).toHaveBeenCalledTimes(1)
-    expect(publishReport.mock.calls[0][0]).toBe(mocks.S)
-    expect(publishReport.mock.calls[0][1].consentVersion).toBe(1)
+    const { publishReport } = await import('../lib/leaderboard-client.js')
+    expect(publishReport).not.toHaveBeenCalled()
+  })
+
+  it('a publish failure is shown with a retry that reaches the coordinator (R10)', async () => {
+    mocks.user = { id: 'u1', name: 'Ana' }
+    fetchBoard.mockResolvedValue(BOARD)
+    fetchMe.mockResolvedValue(ME_JOINED)
+    await mount(); await settle()
+    act(() => pub.push({ lastError: 'network is down' }))
+    expect(textOf()).toContain('failed')
+    const retry = button('Retry')
+    expect(retry).toBeTruthy()
+    await act(async () => { retry.click() })
+    expect(pub.retryNow).toHaveBeenCalled()
+  })
+
+  it('an accepted publish refreshes the board (R10)', async () => {
+    mocks.user = { id: 'u1', name: 'Ana' }
+    fetchBoard.mockResolvedValue(BOARD)
+    fetchMe.mockResolvedValue(ME_JOINED)
+    await mount(); await settle()
+    fetchBoard.mockClear()
+    act(() => pub.push({ lastOkAt: 12345, pending: false }))
+    await settle()
+    expect(fetchBoard).toHaveBeenCalled()
+  })
+
+  it('a stale disclosure text shows the re-confirm card instead of silently listing (R12)', async () => {
+    mocks.user = { id: 'u1', name: 'Ana' }
+    fetchBoard.mockResolvedValue(BOARD)
+    fetchMe.mockResolvedValue({ ...ME_JOINED, disclosureVersion: 0 })
+    await mount(); await settle()
+    expect(textOf()).toContain('confirm to stay listed')
+    const confirm = button('Confirm')
+    expect(confirm.disabled).toBe(true)
+    await act(async () => { host.querySelector('input[type=checkbox]').click() })
+    expect(confirm.disabled).toBe(false)
+    fetchMe.mockResolvedValue(ME_JOINED)
+    await act(async () => { confirm.click() })
+    await settle()
+    // The re-confirm sends the view's own (stale) member state: the server takes the CURRENT
+    // disclosure version from its own answer and the base sequence from what this device knows.
+    expect(joinLeaderboard).toHaveBeenCalledWith({ ...ME_JOINED, disclosureVersion: 0 }, 'Ana')
+    expect(pub.retryNow).toHaveBeenCalled()
   })
 
   it('the join card stays disabled until the disclosure is confirmed, then joins with the current versions', async () => {
@@ -102,17 +162,16 @@ describe('Leaderboard view', () => {
       expect.objectContaining({ enabled: false, currentDisclosureVersion: 1, consentVersion: 0 }),
       'Ana'
     )
-    expect(publishReport).toHaveBeenCalled() // the first report rides the enabled state
+    expect(pub.retryNow).toHaveBeenCalled()
   })
 
-  it('a suspended member sees the banner and reason, and nothing publishes', async () => {
+  it('a suspended member sees the banner and reason', async () => {
     mocks.user = { id: 'u1', name: 'Ana' }
     fetchBoard.mockResolvedValue({ ...BOARD, rows: [] })
     fetchMe.mockResolvedValue({ ...ME_JOINED, suspended: true, suspendedReason: 'checking numbers' })
     await mount(); await settle()
     expect(textOf()).toContain('Paused by an administrator')
     expect(textOf()).toContain('checking numbers')
-    expect(publishReport).not.toHaveBeenCalled()
   })
 
   it('a guest without public read sees the sign-in line, not an error', async () => {
@@ -126,7 +185,6 @@ describe('Leaderboard view', () => {
     mocks.user = { id: 'u2', name: 'Bo' }
     fetchBoard.mockResolvedValue(BOARD)
     fetchMe.mockResolvedValue({ ...ME_JOINED, publicMemberId: 'pubB' })
-    publishReport.mockResolvedValue({ ok: true })
     setCheer.mockResolvedValue({ liked: true, likeCount: 3 })
     await mount(); await settle()
 
@@ -136,5 +194,19 @@ describe('Leaderboard view', () => {
     await settle()
     expect(setCheer).toHaveBeenCalledWith('pubA', 'week', '2026-10-19', true)
     expect(textOf()).toContain('3')
+  })
+
+  it('leaving goes through the coordinator, so the intent survives being offline (R11)', async () => {
+    mocks.user = { id: 'u1', name: 'Ana' }
+    fetchBoard.mockResolvedValue(BOARD)
+    fetchMe.mockResolvedValue(ME_JOINED)
+    pub.requestLeave.mockResolvedValue({ ok: false })
+    await mount(); await settle()
+    window.confirm = () => true
+    await act(async () => { button('Leave the leaderboard').click() })
+    await settle()
+    expect(pub.requestLeave).toHaveBeenCalledWith(ME_JOINED)
+    act(() => pub.push({ withdrawPending: true })) // the coordinator's persisted intent
+    expect(textOf()).toContain('when you are online')
   })
 })

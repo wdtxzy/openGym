@@ -55,24 +55,38 @@ export function setCheer(targetPublicId, windowType, windowKey, on) {
   return api('/api/leaderboard/like?' + q, { method: 'DELETE' });
 }
 
-/** Publish this device's facts. Returns { ok, reportRev?, acceptedAt?, reason?, error? }. */
-export async function publishReport(S, me) {
-  const send = (m, requestId) => api('/api/leaderboard/report', {
+/** Publish this device's facts. Returns { ok, reportRev?, acceptedAt?, reason?, error? }.
+ *
+ *  On a stale base/consent (another device published, or the member joined/left) the PRD's
+ *  rule is: merge personal state FIRST, then re-aggregate — `opts.pull` (the store's
+ *  pullState) runs, and the retry is built from `opts.stateOf()` (the store's CURRENT state),
+ *  never from the closure's stale copy: re-serializing the same outdated facts under a fresh
+ *  revision is exactly how a newer device's totals get overwritten by an older one (R03). */
+export async function publishReport(S, me, opts = {}) {
+  const send = (facts, m, requestId) => api('/api/leaderboard/report', {
     method: 'PUT',
     body: JSON.stringify(buildReport(
-      { workouts: S.workouts || [], activities: S.activities || [] },
+      { workouts: facts.workouts || [], activities: facts.activities || [] },
       { consentVersion: m.consentVersion, baseReportRev: m.reportRev, requestId, now: Date.now() }
     ))
   });
   try {
-    return { ok: true, ...(await send(me, uid())) };
+    return { ok: true, ...(await send(S, me, uid())) };
   } catch (e) {
     const recoverable = e.status === 409 && (e.data?.error === 'report-stale' || e.data?.error === 'consent-stale');
     if (!recoverable) return { ok: false, error: e };
+    // No source of merged facts, no retry: re-serializing the very facts that were just
+    // refused is how a stale device overwrites a newer one's totals. The caller keeps the
+    // publish pending and retries with a merge (the coordinator always passes both).
+    if (typeof opts.stateOf !== 'function') return { ok: false, reason: 'needs-merge', error: e };
+    if (typeof opts.pull === 'function') {
+      try { await opts.pull() } catch { /* offline mid-recovery: the publish stays pending */ }
+    }
     const fresh = await fetchMe();
     if (!fresh || !fresh.enabled || fresh.suspended) return { ok: false, reason: 'disabled' };
+    const facts = opts.stateOf();
     try {
-      return { ok: true, ...(await send(fresh, uid())) };
+      return { ok: true, ...(await send(facts, fresh, uid())) };
     } catch (e2) {
       return { ok: false, error: e2 };
     }

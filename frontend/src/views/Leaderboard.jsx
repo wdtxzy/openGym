@@ -2,35 +2,31 @@
 // time over a Beijing-time week, month, or all history — the gym/synced split and both session
 // counts side by side, so a walk is never mistaken for a barbell session (PRD FR-1.6R).
 //
-// Nothing about joining is automatic: the join card shows the numbered disclosure — including
-// that the admin may later open the board to visitors, which is exactly what the member is
-// agreeing may happen — and joining is a deliberate checkbox + button. Publishing rides the
-// view: on open (and whenever the local facts change while it is open) the device's own report
-// is rebuilt from full history and pushed once, with the client-library's single-retry
-// recovery; nothing here ever blocks finishing or saving a workout.
+// Publishing is NOT this page's job: the global coordinator (lib/leaderboard-publish.js) reacts
+// to the personal facts wherever they change, merges before re-publishing on conflict, marks
+// success only after the server accepted, and keeps failures pending and visible. The page
+// shows the coordinator's status, retries on demand, and refreshes when a publish lands. A
+// withdrawal goes through the coordinator too, so the intent is persisted before the request
+// and survives going offline mid-way.
 //
 // Guests (signed out) see the board only when the instance opened public read — the server
-// enforces it; this screen just renders what comes back, without a viewerLiked column.
+// enforces it; this screen just renders what comes back, without a viewerLiked column. While
+// the tab is visible it refreshes at most every 30 s, so a withdrawal or suspension made on
+// another device disappears from an already-open page too (PRD §06).
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStore } from '../store/useStore.js'
 import { useUI } from '../store/useUI.js'
-import { t, tn } from '../lib/i18n.js'
+import { t } from '../lib/i18n.js'
 import { fmtDur } from '../lib/format.js'
 import { Button } from '../components/ui.jsx'
 import Icon from '../components/Icon.jsx'
-import { fetchBoard, fetchMe, joinLeaderboard, leaveLeaderboard, publishReport, setCheer } from '../lib/leaderboard-client.js'
+import { fetchBoard, fetchMe, joinLeaderboard, setCheer } from '../lib/leaderboard-client.js'
+import { invalidateMe, onPublishStatus, publishStatus, requestLeave, retryNow } from '../lib/leaderboard-publish.js'
 
 const toast = m => useUI.getState().toast(m)
 const WINDOWS = [['week', 'Week'], ['month', 'Month'], ['all', 'All']]
-const fmtWhen = ms => (ms ? new Date(ms).toLocaleString() : '')
-
-/** A cheap fingerprint of the local facts: republish only when something moved. Deliberately
- *  excludes the server's reportRev — bumping it after a publish must not re-trigger one. */
-const factsOf = S => JSON.stringify([
-  (S.workouts || []).length, (S.workouts || []).at(-1)?.end ?? 0,
-  (S.activities || []).length
-])
+const fmtWhen = ms => (ms ? new Date(ms).toLocaleTimeString() : '')
 
 export default function Leaderboard() {
   const nav = useNavigate()
@@ -43,11 +39,14 @@ export default function Leaderboard() {
   const [error, setError] = useState('')
   const [needSignin, setNeedSignin] = useState(false)
   const [agreed, setAgreed] = useState(false)
+  const [reagreed, setReagreed] = useState(false)
   const [busy, setBusy] = useState(false)
-  const published = useRef('')
+  const [pub, setPub] = useState(publishStatus())
+  const lastOkAt = useRef(null)
 
   const on = !!config?.leaderboard
   const myPublicId = me?.publicMemberId
+  const disclosureStale = !!(me?.enabled && me.disclosureVersion != null && me.disclosureVersion !== me.currentDisclosureVersion)
 
   async function reload() {
     setError(''); setNeedSignin(false)
@@ -62,17 +61,22 @@ export default function Leaderboard() {
 
   useEffect(() => { if (on) reload() }, [on, windowType, user?.id])
 
-  // Publish on open and on local change: the report is rebuilt from full history each time,
-  // so a first join already includes everything recorded before it (LB-07).
+  // A publish landing refreshes the board (the totals moved); the banner tracks coordinator state.
+  useEffect(() => onPublishStatus(s => {
+    setPub({ ...s })
+    if (s.lastOkAt && s.lastOkAt !== lastOkAt.current) {
+      lastOkAt.current = s.lastOkAt
+      if (!s.pending) reload()
+    }
+  }), [])
+
+  // While the tab is visible, what other devices changed shows up within 30 s (PRD §06).
   useEffect(() => {
-    if (!on || !user || !me?.enabled || me?.suspended) return
-    const fingerprint = factsOf(S)
-    if (published.current === fingerprint) return
-    published.current = fingerprint
-    publishReport(S, me).then(r => {
-      if (r.ok) setMe(m => ({ ...m, reportRev: r.reportRev }))
-    })
-  }, [on, user, me?.enabled, me?.suspended, me?.reportRev, S])
+    const tick = () => { if (document.visibilityState === 'visible') reload() }
+    const iv = setInterval(tick, 30000)
+    document.addEventListener('visibilitychange', tick)
+    return () => { clearInterval(iv); document.removeEventListener('visibilitychange', tick) }
+  }, [windowType, user?.id])
 
   if (!on) {
     return <div className="narrow">
@@ -85,10 +89,20 @@ export default function Leaderboard() {
     setBusy(true)
     try {
       await joinLeaderboard(me || { consentVersion: 0, currentDisclosureVersion: 1 }, user.name)
-      const fresh = await fetchMe()
-      setMe(fresh)
-      published.current = '' // let the publish effect push the first report now
+      invalidateMe()
       await reload()
+      retryNow() // the first report of a fresh join goes out now, not at the next change
+    } catch (e) { toast(e.message) }
+    setBusy(false)
+  }
+
+  async function reconfirm() {
+    setBusy(true)
+    try {
+      await joinLeaderboard(me, user.name) // the same call: current disclosure + the member's seq
+      invalidateMe()
+      await reload()
+      retryNow()
     } catch (e) { toast(e.message) }
     setBusy(false)
   }
@@ -96,11 +110,9 @@ export default function Leaderboard() {
   async function leave() {
     if (!window.confirm(t('Leave the leaderboard? Your published results are removed.'))) return
     setBusy(true)
-    try {
-      await leaveLeaderboard(me)
-      published.current = ''
-      await reload()
-    } catch (e) { toast(e.message) }
+    const r = await requestLeave(me)
+    if (r.ok) await reload()
+    else toast(t('Saved. We will finish leaving the leaderboard when you are online.'))
     setBusy(false)
   }
 
@@ -125,6 +137,15 @@ export default function Leaderboard() {
       ))}
     </div>
 
+    {user && me?.enabled && pub.lastError && <div className="card" style={{ borderColor: 'var(--danger, #c33)' }} role="alert">
+      <div className="small">{t('Publishing your totals failed. We will retry automatically.')}</div>
+      <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>{String(pub.lastError).slice(0, 160)}</div>
+      <div className="row" style={{ gap: 8, marginTop: 8 }}><Button size="sm" onClick={retryNow}>{t('Retry')}</Button></div>
+    </div>}
+    {user && me?.enabled && pub.withdrawPending && <div className="card" role="status">
+      <div className="small">{t('Saved. We will finish leaving the leaderboard when you are online.')}</div>
+    </div>}
+
     {me?.suspended && <div className="card" style={{ borderColor: 'var(--danger, #c33)' }}>
       <h2 style={{ margin: 0 }}>{t('Paused by an administrator')}</h2>
       <div className="muted small" style={{ marginTop: 4 }}>{t('Your listing is paused. Your training and history are unaffected.')}</div>
@@ -143,14 +164,28 @@ export default function Leaderboard() {
       <Button disabled={!agreed || busy} onClick={join}>{t('Join')}</Button>
     </div>}
 
+    {disclosureStale && <div className="card">
+      <h2>{t('The leaderboard terms changed — confirm to stay listed')}</h2>
+      <div className="muted small" style={{ marginBottom: 8 }}>
+        {t('Anyone who joins this instance sees your weekly, monthly and all-time training totals here. The administrator can also open the leaderboard to visitors — if they do, your results become visible to them too.')}
+      </div>
+      <label className="row" style={{ gap: 8, alignItems: 'center', marginBottom: 10 }}>
+        <input type="checkbox" checked={reagreed} onChange={e => setReagreed(e.target.checked)} />
+        <span className="small">{t('I understand')}</span>
+      </label>
+      <Button disabled={!reagreed || busy} onClick={reconfirm}>{t('Confirm')}</Button>
+    </div>}
+
     {needSignin && <div className="card"><div className="muted">{t('Sign in to view the leaderboard')}</div></div>}
     {error && <div className="card"><div className="muted">{error}</div></div>}
 
     {board && (board.rows.length ? board.rows.map(row => (
-      <div key={row.publicMemberId} className="card row between" style={{ alignItems: 'center', gap: 10 }}>
+      <div key={row.publicMemberId} className="card row between"
+        style={{ alignItems: 'center', gap: 10, ...(row.publicMemberId === myPublicId ? { background: 'var(--tint, rgba(127,127,127,.12))', borderColor: 'var(--accent, #888)' } : {}) }}
+        aria-label={row.publicMemberId === myPublicId ? t('You') : row.displayName || t('Anonymous lifter')}>
         <div className="row" style={{ gap: 10, minWidth: 0, alignItems: 'center' }}>
-          <div className="muted" style={{ width: 30, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{row.rank}</div>
-          <div style={{ fontSize: 22 }}>{row.emoji}</div>
+          <div className="muted" aria-label={t('Rank #{0}', row.rank)} style={{ width: 30, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{row.rank}</div>
+          <div style={{ fontSize: 22 }} aria-hidden="true">{row.emoji}</div>
           <div style={{ minWidth: 0 }}>
             <div>{row.displayName || t('Anonymous lifter')}{row.publicMemberId === myPublicId ? <span className="muted"> · {t('You')}</span> : null}</div>
             <div className="muted small">
@@ -162,16 +197,18 @@ export default function Leaderboard() {
         <div style={{ textAlign: 'right', flexShrink: 0 }}>
           <div style={{ fontVariantNumeric: 'tabular-nums' }}>{fmtDur(row.totalMs)}</div>
           {user && row.publicMemberId !== myPublicId
-            ? <Button size="sm" variant={row.viewerLiked ? 'tinted' : 'ghost'} disabled={busy} onClick={() => cheer(row)}>
+            ? <Button size="sm" variant={row.viewerLiked ? 'tinted' : 'ghost'} disabled={busy}
+              aria-label={row.viewerLiked ? t('Remove your cheer for {0}', row.displayName || t('Anonymous lifter')) : t('Cheer {0}', row.displayName || t('Anonymous lifter'))}
+              onClick={() => cheer(row)}>
               {t('Cheer')}{row.likeCount ? ' ' + row.likeCount : ''}
             </Button>
-            : (row.likeCount ? <div className="muted small">♡ {row.likeCount}</div> : null)}
+            : (row.likeCount ? <div className="muted small" aria-label={t('{0} cheers', row.likeCount)}>♡ {row.likeCount}</div> : null)}
           <div className="muted" style={{ fontSize: 11 }}>{row.dataAsOf ? t('Updated {0}', fmtWhen(row.dataAsOf)) : ''}</div>
         </div>
       </div>
     )) : <div className="card"><div className="muted">{t('No one has joined yet')}</div></div>)}
 
-    {user && me?.enabled && !me.suspended && <div className="card">
+    {user && me?.enabled && !me.suspended && !disclosureStale && <div className="card">
       <Button size="sm" variant="ghost" onClick={leave}>{t('Leave the leaderboard')}</Button>
     </div>}
   </div>
