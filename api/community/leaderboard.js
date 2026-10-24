@@ -21,11 +21,12 @@
  * translated lines; success values are plain objects built field by field — nothing internal
  * (uid, received-like records, raw buckets of other members) is ever serialized out. */
 import crypto from 'node:crypto';
-import { windowFor, rankRows, beijingDayKey } from './windows.js';
+import { windowFor, rankRows, beijingDayKey, CALENDAR_VERSION } from './windows.js';
 
 export const DISCLOSURE_VERSION = 1;
 export const REPORT_SCHEMA_VERSION = 1;
 export const REPORT_ALGORITHM_VERSION = 1;
+export const REPORT_CALENDAR_VERSION = CALENDAR_VERSION;
 export const RETAINED_DAYS = 93;
 
 const DAY = 86400000;
@@ -41,8 +42,18 @@ export class LeaderboardError extends Error {
 }
 
 const isCount = v => Number.isSafeInteger(v) && v >= 0 && v <= 1000;
+// A lifetime covers decades of training (Q03: all history counts) — 10 million sessions is
+// beyond a century of ten-a-day, so it bounds junk without ever rejecting real history the
+// way the day cap did when it was shared (R13).
+const isLifetimeCount = v => Number.isSafeInteger(v) && v >= 0 && v <= 1e7;
 const isMs = v => Number.isSafeInteger(v) && v >= 0 && v < 1000 * 365 * DAY; // ≤ 1000 years
-const isDayKey = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v + 'T00:00:00Z'));
+// 'YYYY-MM-DD' that is a real calendar day: Date.parse normalizes Feb 30 to Mar 2, so the
+// key has to survive the round trip back to itself (S09).
+const isDayKey = v => {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const ms = Date.parse(v + 'T00:00:00Z');
+  return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 10) === v;
+};
 const keyToMs = k => Date.parse(k + 'T00:00:00Z');
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 32);
 
@@ -68,14 +79,34 @@ export function createLeaderboard({ store, now = Date.now }) {
 
   const visible = m => m.enabled && !m.suspended && m.disclosureVersion === DISCLOSURE_VERSION;
 
-  function likeCount(data, targetUid, w) {
-    let n = 0;
+  /** One pass over the like table for the whole board, instead of one pass per member —
+   *  the difference between milliseconds and the ~11 s the per-member scan took at 500
+   *  members / 100k likes (R06). */
+  function likeCounts(data, w) {
+    const counts = new Map();
     for (const key of Object.keys(data.likes)) {
-      const [, t, type, win] = key.split('|');
-      if (t === targetUid && type === w.windowType && win === w.windowKey) n += 1;
+      const parts = key.split('|');
+      if (parts[2] === w.windowType && parts[3] === w.windowKey) {
+        counts.set(parts[1], (counts.get(parts[1]) || 0) + 1);
+      }
     }
-    return n;
+    return counts;
   }
+
+  /** Drop cheers whose period is over for good: nobody can see or add them any more (the
+   *  server refuses expired window keys), and the PRD keeps only the current week/month and
+   *  the all-time counter. Current-period and 'all' records always stay — which is what
+   *  preserves the received cheers across a withdraw/rejoin (Q05). Pure: `data` is mutated. */
+  function pruneLikes(data, nowMs) {
+    const week = windowFor('week', nowMs).windowKey;
+    const month = windowFor('month', nowMs).windowKey;
+    for (const key of Object.keys(data.likes)) {
+      const [actor, target, type, win] = key.split('|');
+      if (type === 'week' && win < week) delete data.likes[key];
+      else if (type === 'month' && win < month) delete data.likes[key];
+    }
+  }
+  const PRUNE_AT_LIKES = 2000; // amortized: pruned inside a like transaction past this size
 
   return {
     DISCLOSURE_VERSION,
@@ -145,9 +176,10 @@ export function createLeaderboard({ store, now = Date.now }) {
         if (!m.enabled) throw new LeaderboardError(403, 'not-participating');
         if (m.suspended) throw new LeaderboardError(403, 'suspended');
         if (body.consentVersion !== m.consentSeq) throw new LeaderboardError(409, 'consent-stale', { consentVersion: m.consentSeq });
-        if (body.schemaVersion !== REPORT_SCHEMA_VERSION || body.algorithmVersion !== REPORT_ALGORITHM_VERSION)
+        if (body.schemaVersion !== REPORT_SCHEMA_VERSION || body.algorithmVersion !== REPORT_ALGORITHM_VERSION
+          || body.calendarVersion !== REPORT_CALENDAR_VERSION)
           throw new LeaderboardError(409, 'version-stale', {
-            schemaVersion: REPORT_SCHEMA_VERSION, algorithmVersion: REPORT_ALGORITHM_VERSION
+            schemaVersion: REPORT_SCHEMA_VERSION, algorithmVersion: REPORT_ALGORITHM_VERSION, calendarVersion: REPORT_CALENDAR_VERSION
           });
         if (typeof body.requestId !== 'string' || !body.requestId || body.requestId.length > 64)
           throw new LeaderboardError(400, 'request-id');
@@ -185,7 +217,8 @@ export function createLeaderboard({ store, now = Date.now }) {
         const lifetime = {};
         for (const f of TOTALS_FIELDS) {
           const v = body.lifetime?.[f];
-          if (!(f.endsWith('Ms') ? isMs(v) : isCount(v))) throw new LeaderboardError(400, 'lifetime-field', { field: f });
+          const valid = f === 'gymMs' || f === 'syncedMs' ? isMs(v) : isLifetimeCount(v);
+          if (!valid) throw new LeaderboardError(400, 'lifetime-field', { field: f });
           lifetime[f] = v;
         }
         if (Number.isFinite(body.dataAsOf) && body.dataAsOf > now() + DAY) throw new LeaderboardError(400, 'future-clock');
@@ -214,6 +247,7 @@ export function createLeaderboard({ store, now = Date.now }) {
       const w = windowFor(windowType, now());
       if (!w) throw new LeaderboardError(400, 'window');
       const data = store.read();
+      const counts = likeCounts(data, w);
       const rows = [];
       for (const [uid, m] of Object.entries(data.members)) {
         if (!visible(m)) continue;
@@ -225,7 +259,7 @@ export function createLeaderboard({ store, now = Date.now }) {
           gymMs: t.gymMs, syncedMs: t.syncedMs,
           gymSessions: t.gymSessions, syncedSessions: t.syncedSessions,
           totalMs: t.gymMs + t.syncedMs,
-          likeCount: likeCount(data, uid, w),
+          likeCount: counts.get(uid) || 0,
           viewerLiked: viewerUid ? !!data.likes[`${viewerUid}|${uid}|${w.windowType}|${w.windowKey}`] : false,
           dataAsOf: m.dataAsOf
         });
@@ -254,7 +288,11 @@ export function createLeaderboard({ store, now = Date.now }) {
         } else {
           delete data.likes[key];
         }
-        return { liked: on, likeCount: likeCount(data, targetUid, w) };
+        // Amortized lifecycle: past a working-set size, expired week/month cheers go — the
+        // current period and the all-time counter are what anyone can still see or restore.
+        if (Object.keys(data.likes).length > PRUNE_AT_LIKES) pruneLikes(data, now());
+        const after = likeCounts(data, w).get(targetUid) || 0;
+        return { liked: on, likeCount: after };
       }).then(({ out }) => out);
     },
 

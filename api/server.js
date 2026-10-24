@@ -2621,7 +2621,10 @@ const routes = {
   // routes, and unanswered is a plain 404 — no entry point, no information leak (LB-01).
   ...(LEADERBOARD ? leaderboardRoutes({
     domain: leaderboardDomain, json, readBody, readSession, requireAdmin, audit,
-    publicRead: LEADERBOARD_PUBLIC_READ
+    publicRead: LEADERBOARD_PUBLIC_READ,
+    // The like budget's address half: the same client-IP reading the audit log uses, so a
+    // proxy that overwrites the header is honored and a direct peer counts as itself.
+    addressOf: req => clientIp(req) || ''
   }) : {}),
 
   /* ---------- photos & videos ---------- */

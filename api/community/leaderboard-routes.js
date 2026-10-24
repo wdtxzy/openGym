@@ -12,10 +12,24 @@ import { createWindow } from '../rate-limit.js';
 import { LeaderboardError } from './leaderboard.js';
 import { StoreError } from './store.js';
 
-const LIKE_BUDGET = 30; // per account per minute (PRD §15 governance numbers)
+const LIKE_BUDGET = 30;      // per account per minute (PRD §15 governance numbers)
+const LIKE_IP_BUDGET = 120;  // per address per minute across accounts: the bounded anti-abuse
+                             // budget the PRD asks for next to the account one (S06)
 
-export function leaderboardRoutes({ domain, json, readBody, readSession, requireAdmin, audit, publicRead }) {
+export function leaderboardRoutes({ domain, json, readBody, readSession, requireAdmin, audit, publicRead, addressOf }) {
   const likeBudget = createWindow({ max: LIKE_BUDGET, windowMs: 60000 });
+  const ipBudget = createWindow({ max: LIKE_IP_BUDGET, windowMs: 60000 });
+  const ipOf = req => (addressOf ? addressOf(req) : '') || 'unknown';
+  const tooMany = (res, wait) => json(res, 429, { error: 'too many', code: 'rate', retryAfter: wait }, { 'Retry-After': String(wait) });
+  // Both budgets, account first (the honest user's own limit) then address (a burst of
+  // accounts from one host). Either one answers 429 with Retry-After.
+  const likeThrottled = (req, res, user) => {
+    const waitAcct = likeBudget.take('like|' + user.id);
+    if (waitAcct) { tooMany(res, waitAcct); return true; }
+    const waitIp = ipBudget.take('like|ip|' + ipOf(req));
+    if (waitIp) { tooMany(res, waitIp); return true; }
+    return false;
+  };
 
   // One error shape for both module families: product refusals carry their own status, a
   // refused store is always 503 "unavailable" (PRD §7) — never a generic 500.
@@ -78,8 +92,7 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
     'PUT /api/leaderboard/like': async (req, res) => {
       const user = signedIn(req, res); if (!user) return;
       const body = await readBody(req);
-      const wait = likeBudget.take('like|' + user.id);
-      if (wait) return json(res, 429, { error: 'too many', code: 'rate', retryAfter: wait }, { 'Retry-After': String(wait) });
+      if (likeThrottled(req, res, user)) return;
       try {
         return json(res, 200, await domain.like({
           actorUid: user.id, targetPublicId: body.targetPublicId,
@@ -91,8 +104,7 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
     'DELETE /api/leaderboard/like': async (req, res) => {
       const user = signedIn(req, res); if (!user) return;
       const p = new URL(req.url, 'http://x').searchParams;
-      const wait = likeBudget.take('like|' + user.id);
-      if (wait) return json(res, 429, { error: 'too many', code: 'rate', retryAfter: wait }, { 'Retry-After': String(wait) });
+      if (likeThrottled(req, res, user)) return;
       try {
         return json(res, 200, await domain.like({
           actorUid: user.id, targetPublicId: p.get('targetPublicId'),

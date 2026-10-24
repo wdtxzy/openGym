@@ -264,7 +264,11 @@ function routeFixture({ publicRead = true } = {}) {
   const store = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {}, likes: {}, adminActions: [] }) });
   const domain = createLeaderboard({ store });
   const audited = [];
-  const users = { alice: { id: 'alice', name: 'Alice' }, bob: { id: 'bob', name: 'Bob' } };
+  const users = {
+    alice: { id: 'alice', name: 'Alice' }, bob: { id: 'bob', name: 'Bob' },
+    carol: { id: 'carol', name: 'Carol' }, dave: { id: 'dave', name: 'Dave' },
+    erin: { id: 'erin', name: 'Erin' }, frank: { id: 'frank', name: 'Frank' }
+  };
   const routes = leaderboardRoutes({
     domain,
     json: (res, code, obj, headers) => { res.status = code; res.body = obj; res.headers = headers; },
@@ -337,4 +341,108 @@ test('routes: auth, guest gating, error shape, rate limit, audit', async () => {
   }
   assert.equal(last.status, 429);
   assert.ok(last.headers && last.headers['Retry-After']);
+});
+
+/* ----------------- batch-5 regressions: capacity, limits, validation ----------------- */
+
+test('R13: a lifetime of 1001+ sessions publishes; the day cap still applies per day', async () => {
+  const { lb } = domainFixture();
+  await join(lb, 'u1');
+  const big = await lb.report('u1', reportBody({
+    requestId: 'big',
+    lifetime: { gymMs: 3600000, syncedMs: 0, gymSessions: 1001, syncedSessions: 0 }
+  }));
+  assert.equal(big.reportRev, 1);
+  assert.equal(lb.board('all', null).rows[0].gymSessions, 1001);
+  await rejects(lb.report('u1', reportBody({
+    requestId: 'big2', baseReportRev: 1,
+    days: [{ date: '2026-10-20', gymMs: 1, syncedMs: 0, gymSessions: 1001, syncedSessions: 0 }]
+  })), 400, 'day-field');
+});
+
+test('S08: an unknown calendar version is a conflict, never reinterpreted', async () => {
+  const { lb } = domainFixture();
+  await join(lb, 'u1');
+  await rejects(lb.report('u1', reportBody({ requestId: 'cal', calendarVersion: 99 })), 409, 'version-stale');
+});
+
+test('S09: dates must survive the calendar round trip — Feb 30 and friends are refused', async () => {
+  const { lb } = domainFixture(bj(2026, 10, 22, 10));
+  await join(lb, 'u1');
+  const day = (d, rq) => lb.report('u1', reportBody({ requestId: rq, days: [{ date: d, gymMs: 1, syncedMs: 0, gymSessions: 1, syncedSessions: 0 }] }));
+  await rejects(day('2026-02-30', 'd1'), 400, 'day-key');   // normalizes to Mar 2 — not a real day
+  await rejects(day('2027-02-29', 'd2'), 400, 'day-key');   // 2027 is not a leap year
+  await rejects(day('2026-13-01', 'd3'), 400, 'day-key');
+  await rejects(lb.report('u1', reportBody({ requestId: 'd4', coverageStart: '2026-02-30' })), 400, 'coverage');
+  const leap = await day('2024-02-29', 'd5');               // a real leap day (past) passes
+  assert.equal(leap.reportRev, 1);
+});
+
+test('S07: expired week/month cheers are pruned past a working-set size; current and all-time stay', async () => {
+  const { lb, store } = domainFixture(bj(2026, 10, 22, 10)); // week of 2026-10-19
+  await join(lb, 'u1');
+  await join(lb, 'u2');
+  await lb.report('u1', reportBody({}));
+  const target = lb.me('u1').publicMemberId;
+  // 2000 expired cheers (last week / last month), plus the ones that must survive.
+  await store.txn(d => {
+    for (let i = 0; i < 1000; i++) d.likes[`actor${i}|u1|week|2026-10-12`] = { createdAt: 1 };
+    for (let i = 1000; i < 2000; i++) d.likes[`actor${i}|u1|month|2026-09`] = { createdAt: 1 };
+  });
+  await lb.like({ actorUid: 'u2', targetPublicId: target, windowType: 'week', windowKey: '2026-10-19', on: true });
+  await lb.like({ actorUid: 'u2', targetPublicId: target, windowType: 'all', windowKey: 'all', on: true });
+  const data = store.read();
+  assert.equal(data.likes['u2|u1|week|2026-10-12'], undefined, 'the expired week cheer is gone');
+  assert.equal(Object.keys(data.likes).some(k => k.endsWith('|month|2026-09')), false, 'the expired month cheers are gone');
+  assert.ok(data.likes['u2|u1|week|2026-10-19'], 'the current week cheer stays');
+  assert.ok(data.likes['u2|u1|all|all'], 'the all-time cheer stays');
+  assert.equal(lb.board('week', null).rows.find(r => r.publicMemberId === target).likeCount, 1);
+});
+
+test('S06: a burst of accounts from one address hits the IP budget, not just their own', async () => {
+  const { call, users } = routeFixture();
+  for (const who of [users.alice, users.bob, users.carol, users.dave, users.erin]) {
+    assert.equal((await call('PUT /api/leaderboard/consent', { body: { enabled: true, disclosureVersion: DISCLOSURE_VERSION, baseConsentVersion: 0 }, user: who })).status, 200);
+  }
+  const me = await call('GET /api/leaderboard/me', { user: users.alice });
+  const target = me.body.publicMemberId;
+  const key = (await call('GET /api/leaderboard', { url: '/api/leaderboard?window=week' })).body.window.windowKey;
+  let last = null;
+  for (const who of [users.bob, users.carol, users.dave, users.erin, users.frank]) {
+    for (let i = 0; i < 24; i++) {
+      last = await call('PUT /api/leaderboard/like', { user: who, body: { targetPublicId: target, windowType: 'week', windowKey: key } });
+    }
+  }
+  // 5 accounts x 24 = 120 from one address: at the budget. frank's account is fresh, but the
+  // address is not — his 24 went through while the earlier four filled it; the 121st from any
+  // fresh account must refuse on the IP budget alone.
+  const fresh = { id: 'grace', name: 'Grace' };
+  const refused = await call('PUT /api/leaderboard/like', { user: fresh, body: { targetPublicId: target, windowType: 'week', windowKey: key } });
+  assert.equal(refused.status, 429);
+  assert.equal(refused.body.code, 'rate');
+});
+
+test('R06: 500 members and 100k cheers answer a board read in well under a second', async () => {
+  const { lb, store } = domainFixture(bj(2026, 10, 22, 10));
+  await store.txn(d => {
+    for (let i = 0; i < 500; i++) {
+      const uid = 'm' + i;
+      d.members[uid] = {
+        publicMemberId: 'pub' + i, displayName: 'M' + i, emoji: '💪', enabled: true,
+        disclosureVersion: 1, consentSeq: 1, reportSeq: 1, reportRequests: {},
+        suspended: false, suspendedReason: null, suspendedAt: null,
+        days: { '2026-10-20': { gymMs: 3600000 + i, syncedMs: 0, gymSessions: 1, syncedSessions: 0 } },
+        lifetime: { gymMs: 3600000, syncedMs: 0, gymSessions: 1, syncedSessions: 0 }, dataAsOf: 1
+      };
+    }
+    for (let i = 0; i < 100000; i++) {
+      d.likes[`actor${i}|m${i % 500}|week|2026-10-19`] = { createdAt: 1 };
+    }
+  });
+  const t0 = process.hrtime.bigint();
+  const board = lb.board('week', 'm0');
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.equal(board.rows.length, 500);
+  assert.equal(board.rows[0].likeCount, 200);
+  assert.ok(ms < 500, `board read took ${ms}ms — the per-member scan is back`);
 });
