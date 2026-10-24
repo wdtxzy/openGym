@@ -19,6 +19,9 @@ COPY frontend/package.json frontend/package-lock.json* ./
 # timed out on the shared runners — a lockfile-ignoring `npm install` fallback is no answer to that.
 RUN npm ci --ignore-scripts
 COPY api/coach/core/ /app/api/coach/core/
+# The leaderboard calendar is shared the same way the coach core is (frontend/src/lib/leaderboard.js
+# imports it), so it rides along into the web build.
+COPY api/community/ /app/api/community/
 COPY frontend/ ./
 # Which build this is, shown in the app as "1.3.8+<build>" next to the version. Without it every
 # image built between two releases calls itself the same thing, and "which build are you running?"
