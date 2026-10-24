@@ -34,6 +34,7 @@ import { createMediaStore, mediaLimits, mediaConfig, MediaError, HASH_RE } from 
 import { effectiveRoutineId } from './queue.js';
 import { stampPut } from './sync-stamps.js';
 import { atomicWrite as durableWrite } from './durable.js';
+import { createSharedStore, StoreError } from './community/store.js';
 import { excusedOn, nudgeFor, nudgeWindowOpen, toneOf } from './nudge.js';
 
 const PORT = +(process.env.PORT || 3000);
@@ -70,6 +71,27 @@ const ALLOW_GUEST = !/^(0|false|no|off)$/i.test(process.env.ALLOW_GUEST || '');
 // every account that opts in, so an instance has to ask for it. While it is off every password
 // route answers 404 and the app shows none of it; hashes already stored stay where they are.
 const PASSWORD_LOGIN = /^(1|true|yes|on)$/i.test(process.env.PASSWORD_LOGIN || '');
+// Community features (PRD v2.3 §3.3): off until the instance owner switches them on, and the
+// routes answer 404 while off, so an unchanged instance is byte-for-byte the app it was. The
+// *_PUBLIC_READ flags open the guest (signed-out) view of an already-enabled feature; they say
+// nothing on their own. First release wires the leaderboard only — SOCIAL stays reserved.
+const LEADERBOARD = /^(1|true|yes|on)$/i.test(process.env.LEADERBOARD || '');
+const LEADERBOARD_PUBLIC_READ = /^(1|true|yes|on)$/i.test(process.env.LEADERBOARD_PUBLIC_READ || '');
+const SOCIAL = /^(1|true|yes|on)$/i.test(process.env.SOCIAL || '');
+const SOCIAL_PUBLIC_READ = /^(1|true|yes|on)$/i.test(process.env.SOCIAL_PUBLIC_READ || '');
+// The shared leaderboard file, transactions only (community/store.js). Created lazily: an
+// instance with the feature off never touches the disk for it. A refusal here (a damaged file,
+// a second live writer) is logged and every leaderboard route keeps answering 503 rather than
+// taking the whole API — /api/health included — down with it.
+const leaderboardStore = createSharedStore({
+  file: path.join(DATA, 'leaderboard.json'),
+  schemaVersion: 1,
+  init: () => ({ members: {}, likes: {}, adminActions: [] })
+});
+if (LEADERBOARD) {
+  const probe = leaderboardStore.warmup();
+  if (!probe.ok) console.error(`leaderboard store unavailable (${probe.code}): ${probe.detail}`);
+}
 // The language the sign-in screen, and every profile that never picked one, starts in (#303) —
 // for an instance whose people share a language. Only a tag's shape is checked here; the app
 // matches it against the languages it has and ignores one it does not know. Unset, it is left
@@ -1941,6 +1963,10 @@ const routes = {
       // Public like the two flags above: the caps are not a secret, and the absence of the
       // block is how the app knows this server does not take photos and videos at all.
       ...(MEDIA_ON ? { media: mediaConfig(MEDIA_LIMITS) } : {}),
+      // Presence of this block is what the app keys its leaderboard entry points on; whether
+      // the guest view is open rides along because the signed-out Stats screen needs it before
+      // any session exists. Everything member-specific comes from /api/leaderboard/me.
+      ...(LEADERBOARD ? { leaderboard: { public_read: LEADERBOARD_PUBLIC_READ } } : {}),
       ...(readSession(req) ? { coach: coachConfig.publicConfig() } : {})
     });
   },
