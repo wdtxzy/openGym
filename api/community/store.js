@@ -21,6 +21,8 @@
  * erasing each other's revisions. The check is best-effort — a PID file without a live PID is
  * a stale lock from a crash, and is taken over. */
 import fs from 'node:fs';
+import os from 'node:os';
+import crypto from 'node:crypto';
 import { atomicWrite } from '../durable.js';
 
 /** Refused operation on a shared store. `code` is stable for the API error table. */
@@ -31,6 +33,11 @@ export class StoreError extends Error {
   }
 }
 
+/** Returned from a transaction callback when it changed nothing: the file is not rewritten,
+ *  the revision does not move, and the answer carries the current revision (N07 — a repeated
+ *  cheer or the removal of an absent one must not cost a full-file fsync). */
+export const NO_WRITE = Symbol('no-write');
+
 /** A PID that answers signal 0 (or that we may not signal, EPERM: alive but not ours). */
 function pidAlive(pid) {
   try { process.kill(pid, 0); return true; }
@@ -39,33 +46,77 @@ function pidAlive(pid) {
 
 export function createSharedStore({ file, schemaVersion, init, writer = atomicWrite, now = Date.now }) {
   const lockFile = file + '.lock';
+  // Ownership is a random token, minted per store instance and written in the lock — never a
+  // bare PID: two containers on one volume are both "pid 1", and a pid alone cannot tell them
+  // apart (N05). The hostname rides along so liveness stays a same-host judgement: a lock from
+  // another host/container namespace can never be proven dead, so it is honoured as live.
+  const myToken = crypto.randomBytes(16).toString('hex');
+  const myHost = os.hostname();
+  const readLock = () => {
+    try { return JSON.parse(fs.readFileSync(lockFile, 'utf8')); } catch { return null; }
+  };
+  const readAt = f => {
+    try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; }
+  };
+  const claimLock = () => {
+    const fd = fs.openSync(lockFile, 'wx');
+    try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, host: myHost, token: myToken })); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+  };
+  const iOwn = holder => holder && holder.token === myToken;
+
   let data = null;        // the parsed cache; null until the first successful load
   let refused = null;     // a StoreError once the file proved unusable — sticky until restart
   let knownMtime = 0;     // our own writes update it; a different mtime means an external hand
   let locked = false;
   let queue = Promise.resolve();
 
-  /* Best-effort single-writer guard (see header). The acquire is atomic — 'wx' fails if
-   * anyone created the lock first — so the winner is decided by the filesystem, never by a
-   * read-then-write that can trample a lock another process placed between the two steps.
-   * Taking over a stale lock goes unlink → wx: if a contender wins that race instead, we
-   * refuse. A lock is never written over blindly. */
+  /* Best-effort single-writer guard (see header). Acquire is the atomic 'wx' create; EEXIST is
+   * resolved by the holder's TOKEN, not by guessing from PIDs. Taking over a stale lock re-reads
+   * the holder immediately before removing it and gives up (refuses) the moment the lock names
+   * anyone else — a contender that won the stale lock after our judgement is never unseated. */
   function lock() {
     if (locked) return;
     try {
-      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
+      claimLock();
       locked = true;
       return;
     } catch (e) {
       if (e.code !== 'EEXIST') throw new StoreError('lock', e.message);
     }
-    let pid = 0;
-    try { pid = Number(fs.readFileSync(lockFile, 'utf8')) || 0; } catch { /* vanished: fall through to the retry */ }
-    if (pid === process.pid) { locked = true; return; } // ours from an earlier store in this process
-    if (pid && pidAlive(pid)) throw new StoreError('second-writer', `pid ${pid} already owns ${file}`);
-    try { fs.unlinkSync(lockFile); } catch { /* already gone */ }
+    let holder = readLock();
+    if (iOwn(holder)) { locked = true; return; }               // our own, from this store
+    const judge = h => {
+      if (!h || !h.token) return 'gone';                      // unreadable/garbage: free to try
+      if (h.host !== myHost) return 'foreign-host';           // unverifiable: honour as live (N05)
+      if (h.pid === process.pid) return 'same-pid';           // provably THIS process: may take over
+      return pidAlive(h.pid) ? 'live' : 'dead';
+    };
+    const verdict = judge(holder);
+    if (verdict === 'live' || verdict === 'foreign-host')
+      throw new StoreError('second-writer', `${verdict} holder (${JSON.stringify(holder)}) owns ${file}`);
+    // Stale on our host. The takeover is capture-verify-discard, never a blind delete: the
+    // lock is atomically MOVED to a private tombstone (rename), and only if what the tombstone
+    // captured is still the exact holder we judged dead does it get discarded and claimed. A
+    // contender that replaced the lock in the meantime lands in the tombstone instead, is put
+    // back, and we refuse — no live owner is ever unseated (N05).
+    const before = readLock();
+    const tomb = lockFile + '.take.' + crypto.randomBytes(6).toString('hex');
+    let captured = null;
+    try { fs.renameSync(lockFile, tomb); captured = readAt(tomb); }
+    catch (e) { if (e.code !== 'ENOENT') throw new StoreError('lock', e.message); }
+    // Only a captured OBJECT with a token is an owner; anything else (absent, unparseable, or
+    // plain garbage like a bare number that still parses as JSON) is what we judged 'gone'.
+    const contender = (captured && typeof captured === 'object' && captured.token) ? captured : null;
+    if (contender && (!before || !before.token || contender.token !== before.token)) {
+      // What we captured is not the stale holder: a live contender owns the lock now. Put it
+      // back exactly as it was and walk away.
+      try { fs.renameSync(tomb, lockFile); } catch { try { fs.unlinkSync(tomb); } catch { /* gone */ } }
+      throw new StoreError('second-writer', `lost the takeover race for ${file}`);
+    }
+    try { fs.unlinkSync(tomb); } catch { /* already gone */ }
     try {
-      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
+      claimLock();
       locked = true;
     } catch (e) {
       if (e.code === 'EEXIST') throw new StoreError('second-writer', `lost the takeover race for ${file}`);
@@ -132,6 +183,15 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   }
 
   return {
+    /** The live cached object, NOT copied — for read-only request paths over a large shared
+     *  file (board reads), where cloning every like on every GET is the difference between
+     *  milliseconds and the load-test timeouts (N07). Callers must not mutate it; anything
+     *  that does belongs in a txn, where the draft is a private clone. */
+    peek() {
+      lock();
+      return load();
+    },
+
     /** A private copy of the current state. Refused (throws StoreError) when unusable. */
     read() {
       lock();
@@ -150,6 +210,7 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
         const draft = structuredClone(current);
         const out = fn(draft);
         const value = (out && typeof out.then === 'function') ? await out : out;
+        if (value === NO_WRITE) return { revision: current.revision || 0, out: undefined };
         draft.revision = (current.revision || 0) + 1;
         draft.updatedAt = now();
         persist(draft);

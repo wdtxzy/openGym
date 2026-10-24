@@ -22,6 +22,7 @@
  * (uid, received-like records, raw buckets of other members) is ever serialized out. */
 import crypto from 'node:crypto';
 import { windowFor, rankRows, beijingDayKey, CALENDAR_VERSION } from './windows.js';
+import { NO_WRITE } from './store.js';
 
 export const DISCLOSURE_VERSION = 1;
 export const REPORT_SCHEMA_VERSION = 1;
@@ -110,13 +111,15 @@ export function createLeaderboard({ store, now = Date.now }) {
     }
   }
   const PRUNE_AT_LIKES = 2000; // amortized: pruned inside a like transaction past this size
+  let prunedAtSize = 0;        // …but at most once per 25% growth, never on every like (N07)
 
   return {
     DISCLOSURE_VERSION,
 
-    /** What /api/leaderboard/me answers: the member's own state, never anyone else's. */
+    /** The member's own state, never anyone else's. `displayName` is null before a first
+     *  choice, '' once the member chose to be anonymous (S01/N06). */
     me(uid) {
-      const data = store.read();
+      const data = store.peek();
       const m = memberOf(data, uid);
       return {
         enabled: !!m?.enabled,
@@ -140,7 +143,10 @@ export function createLeaderboard({ store, now = Date.now }) {
       return store.txn(data => {
         const m = data.members[uid] || (data.members[uid] = {
           publicMemberId: crypto.randomBytes(8).toString('base64url'),
-          displayName: '', emoji: '💪',
+          // null = never chosen. An empty string is the member's explicit anonymous choice and
+          // must survive a withdraw/rejoin; only an unset (null) name is filled at first join
+          // (N06: rejoining must not drag the account's real name back over it).
+          displayName: null, emoji: '💪',
           enabled: false, disclosureVersion: null, consentSeq: 0,
           reportSeq: 0, reportRequests: {},
           suspended: false, suspendedReason: null, suspendedAt: null,
@@ -153,9 +159,8 @@ export function createLeaderboard({ store, now = Date.now }) {
             throw new LeaderboardError(409, 'disclosure-stale', { currentDisclosureVersion: DISCLOSURE_VERSION });
           m.enabled = true;
           m.disclosureVersion = DISCLOSURE_VERSION;
-          // The display name rides along at join time only; a rejoin keeps the stored one so a
-          // withdrawn-then-back member does not change identity mid-period.
-          if (!m.displayName && typeof displayName === 'string' && displayName.trim()) m.displayName = displayName.trim().slice(0, 40);
+          if (m.displayName === null && typeof displayName === 'string' && displayName.trim())
+            m.displayName = displayName.trim().slice(0, 40);
         } else {
           m.enabled = false;
           m.days = {};
@@ -249,7 +254,7 @@ export function createLeaderboard({ store, now = Date.now }) {
     board(windowType, viewerUid) {
       const w = windowFor(windowType, now());
       if (!w) throw new LeaderboardError(400, 'window');
-      const data = store.read();
+      const data = store.peek(); // read-only path: no per-request clone (N07)
       const counts = likeCounts(data, w);
       const rows = [];
       for (const [uid, m] of Object.entries(data.members)) {
@@ -277,7 +282,8 @@ export function createLeaderboard({ store, now = Date.now }) {
       const w = windowFor(windowType, now());
       if (!w) throw new LeaderboardError(400, 'window');
       if (windowKey !== w.windowKey) throw new LeaderboardError(409, 'window-expired', { windowKey: w.windowKey });
-      return store.txn(data => {
+      let noopTarget = null;
+      const r = await store.txn(data => {
         let targetUid = null;
         let target = null;
         for (const [uid, m] of Object.entries(data.members)) {
@@ -285,18 +291,32 @@ export function createLeaderboard({ store, now = Date.now }) {
         }
         if (!targetUid || !visible(target)) throw new LeaderboardError(404, 'no-such-member');
         if (targetUid === actorUid) throw new LeaderboardError(403, 'self');
+        noopTarget = targetUid;
         const key = `${actorUid}|${targetUid}|${w.windowType}|${w.windowKey}`;
+        const sizeBefore = Object.keys(data.likes).length;
         if (on) {
-          if (!data.likes[key]) data.likes[key] = { createdAt: now() };
+          if (data.likes[key]) return NO_WRITE; // a repeat cheer changes nothing: no rewrite, no fsync
+          data.likes[key] = { createdAt: now() };
         } else {
+          if (!data.likes[key]) return NO_WRITE; // removing an absent cheer is a no-op too
           delete data.likes[key];
         }
-        // Amortized lifecycle: past a working-set size, expired week/month cheers go — the
-        // current period and the all-time counter are what anyone can still see or restore.
-        if (Object.keys(data.likes).length > PRUNE_AT_LIKES) pruneLikes(data, now());
+        // Amortized lifecycle: expired week/month cheers go once the table has both passed the
+        // working set AND grown a quarter since the last pass — never on every single like
+        // (N07). The current period and the all-time counter always survive.
+        if (sizeBefore > PRUNE_AT_LIKES && sizeBefore > prunedAtSize * 1.25) {
+          pruneLikes(data, now());
+          prunedAtSize = Object.keys(data.likes).length;
+        }
         const after = likeCounts(data, w).get(targetUid) || 0;
         return { liked: on, likeCount: after };
-      }).then(({ out }) => out);
+      });
+      if (r.out === undefined) {
+        // The no-op path: the answer is still the member's current count, read without a write.
+        const data = store.peek();
+        return { liked: on, likeCount: likeCounts(data, w).get(noopTarget) || 0 };
+      }
+      return r.out;
     },
 
     /** Admin suspension (Q20): reasoned, audited by the caller, idempotent by actionId, and
@@ -347,7 +367,7 @@ export function createLeaderboard({ store, now = Date.now }) {
     /** The admin card's member list (S05): identity and status per joined member — no day
      *  buckets, no totals; the operator suspends and restores, they do not browse training. */
     adminMembers() {
-      const data = store.read();
+      const data = store.peek(); // read-only path: no per-request clone (N07)
       return Object.entries(data.members)
         .map(([uid, m]) => ({
           uid,
@@ -379,7 +399,7 @@ export function createLeaderboard({ store, now = Date.now }) {
 
     /** Which uid a public id maps to — the admin card's view, never a client API. */
     uidOfPublicId(publicMemberId) {
-      const data = store.read();
+      const data = store.peek(); // read-only path: no per-request clone (N07)
       for (const [uid, m] of Object.entries(data.members)) if (m.publicMemberId === publicMemberId) return uid;
       return null;
     }

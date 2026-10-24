@@ -900,23 +900,65 @@ function compactAudit() {
   catch (e) { console.error('audit compact failed', e.message); }
 }
 
-// Never throws: a log that can't be written must not break signing in.
+// Never throws: a log that can't be written must not break signing in. A record that cannot
+// land right now is NOT dropped, though — it waits in a sibling outbox file and every later
+// audit() flushes what stranded there first, so an operator who repairs the log gets the gap
+// backfilled in order (N11; PRD §15's "审计未落盘时保留待补写" without a second subsystem).
+const auditOutbox = auditFile + '.outbox';
+function auditAppend(line) {
+  try { fs.appendFileSync(auditFile, line + '\n'); return true; }
+  catch { return false; }
+}
+function flushAuditOutbox() {
+  let stranded;
+  try { stranded = fs.readFileSync(auditOutbox, 'utf8'); } catch { return; }
+  const lines = stranded.split('\n').filter(Boolean);
+  const remaining = [];
+  for (const line of lines) {
+    if (auditAppend(line)) { console.error('audit outbox flushed a stranded record'); }
+    else remaining.push(line);
+  }
+  try {
+    if (remaining.length) fs.writeFileSync(auditOutbox, remaining.join('\n') + '\n');
+    else fs.unlinkSync(auditOutbox);
+  } catch { /* the outbox itself is unwritable — nothing more to do */ }
+}
+// While records are stranded, retry at a human-imperceptible cadence — an operator who fixes
+// the log gets the gap backfilled within moments, without waiting for the next audited event.
+let auditRetryTimer = null;
+function scheduleAuditRetry() {
+  if (auditRetryTimer) return;
+  auditRetryTimer = setTimeout(() => {
+    auditRetryTimer = null;
+    flushAuditOutbox();
+    try { if (fs.existsSync(auditOutbox)) scheduleAuditRetry(); } catch { /* stat refused */ }
+  }, 50);
+  auditRetryTimer.unref?.();
+}
 function audit(req, ev, f = {}) {
   if (!AUDIT_ON) return;
   const rec = { id: ++auditSeq, ts: Date.now(), ev, ok: f.ok !== false };
   if (f.user) { rec.uid = f.user.id; rec.name = String(f.user.name || '').slice(0, 40); }
   else {
     if (f.uid) rec.uid = f.uid;
-    if (f.name) rec.name = String(f.name).slice(0, 40);
+    if (f.name) rec.name = String(f.name || '').slice(0, 40);
   }
   if (f.target) { rec.tgt = f.target.id; rec.tname = String(f.target.name || '').slice(0, 40); }
   if (f.msg) rec.msg = String(f.msg).slice(0, 120);
   // What a failed proof of ownership was guarding (proveOwner): 'email', 'passkey-add', …
   if (f.act) rec.act = String(f.act).slice(0, 40);
+  // Structured extras an operator correlates by (the leaderboard's actionId, its applied flag).
+  if (f.meta && typeof f.meta === 'object') rec.meta = JSON.parse(JSON.stringify(f.meta));
   const ip = clientIp(req);
   if (ip) rec.ip = ip;
-  try { fs.appendFileSync(auditFile, JSON.stringify(rec) + '\n'); }
-  catch (e) { return console.error('audit write failed', e.message); }
+  const line = JSON.stringify(rec);
+  flushAuditOutbox();
+  if (!auditAppend(line)) {
+    try { fs.appendFileSync(auditOutbox, line + '\n'); }
+    catch (e2) { return console.error('audit write failed and the outbox refused too:', e2.message); }
+    scheduleAuditRetry();
+    return console.error('audit write failed — record held in the outbox for replay');
+  }
   // Amortized: a 5000-event cap rewrites the file once per ~1250 events.
   if (AUDIT_MAX && ++auditCount > AUDIT_MAX * 1.25) compactAudit();
 }
@@ -2510,12 +2552,17 @@ const routes = {
     if (!u) return json(res, 404, { error: 'no such user' });
     if (u.id === admin.id) return json(res, 400, { error: 'you cannot delete your own account' });
     if (isAdmin(u) && db.users.filter(isAdmin).length <= 1) return json(res, 400, { error: 'cannot delete the last admin' });
-    // The leaderboard's shared copy of this person (PRD §17 账号删除) goes first: a failure
-    // here aborts the delete so the admin can retry, instead of finishing it and leaving a
-    // deleted account's name and totals public. Only when the feature is on — on an off
-    // instance there is no shared file to clean, and touching it would create one.
-    if (LEADERBOARD) {
-      try { leaderboardDomain.forget(u.id); }
+    // The leaderboard's shared copy of this person (PRD §17 账号删除) goes first, AWAITED: the
+    // cleanup is a transaction whose rejection is asynchronous, and an unawaited one deletes the
+    // account anyway and takes the process down with an unhandled rejection (N01). A failure
+    // aborts the delete so the admin can retry, instead of finishing it and leaving a deleted
+    // account's name and totals public.
+    // It runs whenever the instance HAS shared facts — a switched-off feature keeps its file
+    // (PRD §16: 关闭后数据保留), and a member deleted during the off period must not come back
+    // public when it is switched on again (N02). A file that was never created is left that way:
+    // the cleanup must not be what first puts an empty leaderboard.json on disk.
+    if (LEADERBOARD || fs.existsSync(path.join(DATA, 'leaderboard.json'))) {
+      try { await leaderboardDomain.forget(u.id); }
       catch (e) {
         console.error('leaderboard cleanup for account delete failed', e.message);
         audit(req, 'admin.user.delete', { ok: false, user: admin, msg: 'leaderboard cleanup failed' });

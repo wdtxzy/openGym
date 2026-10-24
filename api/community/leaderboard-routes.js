@@ -63,7 +63,9 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
 
     'GET /api/leaderboard/me': async (req, res) => {
       const user = signedIn(req, res); if (!user) return;
-      json(res, 200, domain.me(user.id));
+      try {
+        json(res, 200, domain.me(user.id));
+      } catch (e) { return fail(res, e); } // a refused store answers 503, not a 500 (N10)
     },
 
     'PUT /api/leaderboard/consent': async (req, res) => {
@@ -144,7 +146,8 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
           user: admin,
           target: { id: String(body.targetUid || ''), name: String(body.targetName || '') },
           act: (body.suspended ? 'suspend' : 'restore') + (out.applied ? '' : ' (replay)'),
-          msg: String(body.reason || '')
+          msg: String(body.reason || ''),
+          meta: { actionId: String(body.actionId || ''), applied: !!out.applied }
         });
         return json(res, 200, out);
       } catch (e) {

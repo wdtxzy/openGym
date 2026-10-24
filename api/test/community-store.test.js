@@ -122,24 +122,38 @@ test('a foreign live PID in the lock is refused; a dead one is taken over', asyn
   // A real second process, so PID liveness is not faked: it outlives the refusal check.
   const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
   await new Promise(r => child.on('spawn', r));
-  fs.writeFileSync(file + '.lock', String(child.pid));
+  fs.writeFileSync(file + '.lock', JSON.stringify({ pid: child.pid, host: os.hostname(), token: 'live-foreign' }));
   const first = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   assert.equal(first.warmup().code, 'second-writer');
   // The refusal left the live owner's lock exactly as it was — never trampled.
-  assert.equal(fs.readFileSync(file + '.lock', 'utf8'), String(child.pid));
+  assert.deepEqual(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')), { pid: child.pid, host: os.hostname(), token: 'live-foreign' });
 
   child.kill('SIGKILL');
   await new Promise(r => child.on('exit', r));
   const second = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   assert.equal(second.warmup().ok, true, 'a stale lock from a crash does not wedge the feature');
+  assert.equal(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')).pid, process.pid);
 });
 
-test('a lock that is not a PID at all is stale garbage, taken over', () => {
+test('a lock from another host (a sibling container on one volume) is honoured as live', async () => {
   const file = path.join(dir(), 'shared.json');
-  fs.writeFileSync(file + '.lock', 'not-a-pid');
+  // Two containers on one volume are both pid 1: a bare pid cannot tell them apart (N05) —
+  // the hostname is what makes the second writer refuse.
+  fs.writeFileSync(file + '.lock', JSON.stringify({ pid: process.pid, host: 'other-container', token: 't' }));
   const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  assert.equal(s.warmup().ok, true);
-  assert.equal(fs.readFileSync(file + '.lock', 'utf8'), String(process.pid));
+  assert.equal(s.warmup().code, 'second-writer');
+});
+
+test('a lock that is not readable at all is stale garbage, taken over', () => {
+  const file = path.join(dir(), 'shared.json');
+  // Both flavours of garbage: not JSON at all, and a bare number — which JSON.parse happily
+  // returns, and which must never be mistaken for a live owner's lock.
+  for (const garbage of ['not-a-pid', '99999999']) {
+    fs.writeFileSync(file + '.lock', garbage);
+    const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+    assert.equal(s.warmup().ok, true, `garbage lock ${JSON.stringify(garbage)}`);
+    assert.equal(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')).pid, process.pid);
+  }
 });
 
 test('R07: a file that corrupts after warmup refuses both reads and writes, and survives byte for byte', async () => {
@@ -222,4 +236,34 @@ test('a restart continues the revision from what is on disk', async () => {
   const second = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   const { revision } = await second.txn(d => { d.members.c = 3; });
   assert.equal(revision, 3);
+});
+
+test('N05: a contender that lands during the takeover is captured, restored and refused — never deleted', async () => {
+  const file = path.join(dir(), 'shared.json');
+  const lock = file + '.lock';
+  // A genuinely dead stale lock, and a genuinely live second process.
+  fs.writeFileSync(lock, JSON.stringify({ pid: 99999999, host: os.hostname(), token: 'dead-token' }));
+  const owner = spawn(process.execPath, ['-e', 'setInterval(()=>{},10000)'], { stdio: 'ignore' });
+  await new Promise(r => owner.on('spawn', r));
+  const live = JSON.stringify({ pid: owner.pid, host: os.hostname(), token: 'live-contender' });
+  // The worst window: the contender replaces the lock in the instant our takeover reaches for
+  // it. Hooking rename is the only place that can happen now — unlink no longer touches it.
+  const rename = fs.renameSync;
+  let injected = false;
+  fs.renameSync = function (from, to) {
+    if (from === lock && !injected) { injected = true; fs.writeFileSync(lock, live); }
+    return rename(from, to);
+  };
+  try {
+    const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+    assert.equal(s.warmup().code, 'second-writer');
+    assert.equal(JSON.parse(fs.readFileSync(lock, 'utf8')).token, 'live-contender', 'the live owner keeps the lock');
+  } finally {
+    fs.renameSync = rename;
+    owner.kill('SIGKILL');
+    await new Promise(r => owner.on('exit', r));
+  }
+  // With the contender gone the stale lock really is stale: a retry takes it over cleanly.
+  const s2 = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  assert.equal(s2.warmup().ok, true);
 });
