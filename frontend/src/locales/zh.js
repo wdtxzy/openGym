@@ -2278,4 +2278,12 @@ export default {
   "Participating": "已参与",
   "Not participating": "未参与",
   "Open the leaderboard": "打开排行榜",
+  "could not load the leaderboard members": "无法加载排行榜成员",
+  "Reason (shown to the member and kept in the audit log):": "理由（成员可见，并记入审计日志）：",
+  "Everyone who joined the opt-in leaderboard. Suspending hides a member from every board and blocks their publishing, with a reason they can see; it never touches their training data.": "所有加入排行榜的成员。暂停会将其从所有榜单隐藏并停止其发布，成员可见理由；绝不影响其训练数据。",
+  "anonymous": "匿名",
+  "suspended": "已暂停",
+  "left": "已退出",
+  "Suspend": "暂停",
+  "Restore": "恢复",
 }

@@ -92,12 +92,19 @@ export async function publishReport(S, me, opts = {}) {
     // refused is how a stale device overwrites a newer one's totals. The caller keeps the
     // publish pending and retries with a merge (the coordinator always passes both).
     if (typeof opts.stateOf !== 'function') return { ok: false, reason: 'needs-merge', error: e };
+    // N03: the merge must actually land. pullState swallows its own errors, so the wrapper
+    // answers true/false; a false (failed, offline, or held for adoption) leaves the publish
+    // pending instead of re-sending the same outdated facts under a fresh revision.
     if (typeof opts.pull === 'function') {
-      try { await opts.pull() } catch { /* offline mid-recovery: the publish stays pending */ }
+      let merged = true;
+      try { merged = await opts.pull() } catch { merged = false }
+      if (merged === false) return { ok: false, reason: 'merge-failed', error: e };
     }
     const fresh = await fetchMe();
     if (!fresh || !fresh.enabled || fresh.suspended) return { ok: false, reason: 'disabled' };
     const facts = opts.stateOf();
+    // N04: the account switched mid-recovery — the store no longer belongs to the publish.
+    if (!facts) return { ok: false, reason: 'account-switched', error: e };
     try {
       return { ok: true, ...(await send(facts, fresh, uid())) };
     } catch (e2) {

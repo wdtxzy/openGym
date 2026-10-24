@@ -119,7 +119,7 @@ export function createLeaderboard({ store, now = Date.now }) {
     /** The member's own state, never anyone else's. `displayName` is null before a first
      *  choice, '' once the member chose to be anonymous (S01/N06). */
     me(uid) {
-      const data = store.peek();
+      const data = store.peek ? store.peek() : store.read();
       const m = memberOf(data, uid);
       return {
         enabled: !!m?.enabled,
@@ -254,7 +254,7 @@ export function createLeaderboard({ store, now = Date.now }) {
     board(windowType, viewerUid) {
       const w = windowFor(windowType, now());
       if (!w) throw new LeaderboardError(400, 'window');
-      const data = store.peek(); // read-only path: no per-request clone (N07)
+      const data = store.peek ? store.peek() : store.read(); // read-only path: no per-request clone (N07)
       const counts = likeCounts(data, w);
       const rows = [];
       for (const [uid, m] of Object.entries(data.members)) {
@@ -313,7 +313,7 @@ export function createLeaderboard({ store, now = Date.now }) {
       });
       if (r.out === undefined) {
         // The no-op path: the answer is still the member's current count, read without a write.
-        const data = store.peek();
+        const data = store.peek ? store.peek() : store.read();
         return { liked: on, likeCount: likeCounts(data, w).get(noopTarget) || 0 };
       }
       return r.out;
@@ -367,7 +367,7 @@ export function createLeaderboard({ store, now = Date.now }) {
     /** The admin card's member list (S05): identity and status per joined member — no day
      *  buckets, no totals; the operator suspends and restores, they do not browse training. */
     adminMembers() {
-      const data = store.peek(); // read-only path: no per-request clone (N07)
+      const data = store.peek ? store.peek() : store.read(); // read-only path: no per-request clone (N07)
       return Object.entries(data.members)
         .map(([uid, m]) => ({
           uid,
@@ -399,7 +399,7 @@ export function createLeaderboard({ store, now = Date.now }) {
 
     /** Which uid a public id maps to — the admin card's view, never a client API. */
     uidOfPublicId(publicMemberId) {
-      const data = store.peek(); // read-only path: no per-request clone (N07)
+      const data = store.peek ? store.peek() : store.read(); // read-only path: no per-request clone (N07)
       for (const [uid, m] of Object.entries(data.members)) if (m.publicMemberId === publicMemberId) return uid;
       return null;
     }

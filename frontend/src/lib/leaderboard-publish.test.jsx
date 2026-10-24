@@ -1,12 +1,12 @@
 // @vitest-environment happy-dom
-// The global publish coordinator: the review's R03 (merge before re-publish), R05 (publishes
-// without the page, fingerprint over the real aggregate inputs), R10 (failure stays pending
-// and visible, success records the fingerprint), R11 (an offline withdrawal blocks publishing
-// and retries first), R12 (an unconfirmed disclosure blocks publishing).
+// The global publish coordinator, round 2: R03/R05/R10/R11/R12 from the first review plus the
+// second round's N03 (healthy-sync gate, merge must land), N04 (account binding across awaits),
+// N08 (changes during a slow publish run next; pending is derived, never blanket-cleared) and
+// N09 (the withdrawal mark is per instance+account and a late leave clears only its own).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => {
-  const state = { user: null, S: null, config: null, pullState: vi.fn() }
+  const state = { user: null, S: null, config: null, sync: { status: 'ok' }, pullState: vi.fn() }
   const listeners = []
   return {
     state, listeners,
@@ -32,6 +32,7 @@ const mod = () => import('./leaderboard-publish.js')
 
 const ME = { enabled: true, suspended: false, disclosureVersion: 1, currentDisclosureVersion: 1, consentVersion: 1, reportRev: 0 }
 const facts = workouts => ({ workouts: workouts || [], activities: [] })
+const ORIGIN = typeof location !== 'undefined' ? location.origin : 'local'
 
 async function fresh() {
   vi.resetModules()
@@ -40,10 +41,12 @@ async function fresh() {
   mocks.state.user = { id: 'u1', name: 'A' }
   mocks.state.config = { leaderboard: { public_read: false } }
   mocks.state.S = facts([])
+  mocks.state.sync = { status: 'ok' }
   mocks.fetchMe.mockResolvedValue({ ...ME })
   localStorage.clear()
   return mod()
 }
+const fire = () => { for (const l of mocks.listeners) l() }
 
 describe('fingerprintOf — the aggregate inputs, not counts (R05)', () => {
   it('an edit to an OLD workout moves it; a same-length activity swap moves it', async () => {
@@ -53,89 +56,143 @@ describe('fingerprintOf — the aggregate inputs, not counts (R05)', () => {
       { id: 'b', d: '2026-10-02', start: 300, end: 400 }
     ]))
     const editedOld = fingerprintOf(facts([
-      { id: 'a', d: '2026-10-01', start: 100, end: 999 },   // same count, older item edited
+      { id: 'a', d: '2026-10-01', start: 100, end: 999 },
       { id: 'b', d: '2026-10-02', start: 300, end: 400 }
     ]))
     expect(editedOld).not.toBe(before)
-    const withActs1 = fingerprintOf({ workouts: [], activities: [{ id: 'x', startMs: 1, endMs: 2 }] })
-    const withActs2 = fingerprintOf({ workouts: [], activities: [{ id: 'y', startMs: 3, endMs: 4 }] })
-    expect(withActs1).not.toBe(withActs2)
+    const acts1 = fingerprintOf({ workouts: [], activities: [{ id: 'x', startMs: 1, endMs: 2 }] })
+    const acts2 = fingerprintOf({ workouts: [], activities: [{ id: 'y', startMs: 3, endMs: 4 }] })
+    expect(acts1).not.toBe(acts2)
   })
 })
 
-describe('the coordinator (started once, no page involved)', () => {
+describe('the coordinator', () => {
   beforeEach(() => { vi.useFakeTimers() })
   afterEach(() => { vi.useRealTimers() })
 
-  it('publishes when the store moves, with pull+stateOf for conflict recovery (R03/R05)', async () => {
+  it('publishes when the store moves, with a merge-verifying pull and an account-bound stateOf (R03/R05)', async () => {
     const m = await fresh()
     mocks.publishReport.mockResolvedValue({ ok: true, reportRev: 1 })
     m.startPublishing()
     await vi.advanceTimersByTimeAsync(10)
-    expect(mocks.publishReport).toHaveBeenCalledTimes(1) // the boot pass over an empty history
-    // The conflict recovery pulls through the store's own merge, then reads the merged state.
-    mocks.publishReport.mock.calls[0][2].pull()
-    expect(mocks.state.pullState).toHaveBeenCalled()
-
-    // A finished workout with no leaderboard page anywhere: the store fires, the publish runs.
-    mocks.publishReport.mockClear()
-    mocks.state.S = facts([{ id: 'w1', d: '2026-10-20', start: 1, end: 2 }])
-    for (const l of mocks.listeners) l()
-    await vi.advanceTimersByTimeAsync(3000)
     expect(mocks.publishReport).toHaveBeenCalledTimes(1)
-    expect(mocks.publishReport.mock.calls[0][2].stateOf()).toBe(mocks.state.S)
+    const opts = mocks.publishReport.mock.calls[0][2]
+    // The pull wrapper answers false when the merge did not land healthy (N03).
+    mocks.state.pullState.mockResolvedValue()
+    mocks.state.sync = { status: 'offline' }
+    await expect(opts.pull()).resolves.toBe(false)
+    mocks.state.sync = { status: 'ok' }
+    await expect(opts.pull()).resolves.toBe(true)
+    // stateOf stays bound to the account it started under (N04).
+    expect(opts.stateOf()).toBe(mocks.state.S)
+    mocks.state.user = { id: 'u2', name: 'B' }
+    expect(opts.stateOf()).toBe(null)
+    mocks.state.user = { id: 'u1', name: 'A' }
+  })
+
+  it('N03: nothing publishes while personal sync is unhealthy — offline, erroring, or held', async () => {
+    const m = await fresh()
+    for (const status of ['offline', 'error', 'held', 'auth', 'pending']) {
+      mocks.state.sync = { status }
+      mocks.publishReport.mockClear()
+      m.retryNow()
+      await vi.advanceTimersByTimeAsync(10)
+      expect(mocks.publishReport).not.toHaveBeenCalled()
+    }
+    mocks.state.sync = { status: 'ok' }
+    m.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(mocks.publishReport).toHaveBeenCalledTimes(1)
+  })
+
+  it('N04: an account switch mid-flight aborts — one account\'s facts never reach the next session', async () => {
+    const m = await fresh()
+    let resolveMe
+    mocks.fetchMe.mockReturnValue(new Promise(r => { resolveMe = r }))
+    m.startPublishing()
+    await vi.advanceTimersByTimeAsync(5)
+    // The me() answer lands after this device signed out and back in as someone else.
+    mocks.state.user = { id: 'u2', name: 'B' }
+    resolveMe({ ...ME })
+    await vi.advanceTimersByTimeAsync(20)
+    expect(mocks.publishReport).not.toHaveBeenCalled()
+  })
+
+  it('N08: a change landing during a slow publish runs next, and pending follows the live facts', async () => {
+    const m = await fresh()
+    mocks.publishReport.mockResolvedValue({ ok: true })
+    m.startPublishing()
+    await vi.advanceTimersByTimeAsync(10) // boot pass over the empty history
+
+    let resolveFirst
+    mocks.publishReport.mockClear()
+    mocks.publishReport.mockReturnValue(new Promise(r => { resolveFirst = r }))
+    mocks.state.S = facts([{ id: 'w1', d: '2026-10-20', start: 1, end: 2 }])
+    fire()
+    await vi.advanceTimersByTimeAsync(3000)       // the slow publish starts
+    expect(mocks.publishReport).toHaveBeenCalledTimes(1)
+
+    mocks.state.S = facts([{ id: 'w1', d: '2026-10-20', start: 1, end: 2 }, { id: 'w2', d: '2026-10-21', start: 3, end: 4 }])
+    fire()
+    await vi.advanceTimersByTimeAsync(3000)       // debounces while the first is in flight
+    expect(mocks.publishReport).toHaveBeenCalledTimes(1)
+
+    mocks.publishReport.mockClear()
+    mocks.publishReport.mockResolvedValue({ ok: true })
+    resolveFirst({ ok: true })                    // the first answer lands: fingerprint w1 only
+    await vi.advanceTimersByTimeAsync(10)
+    expect(m.publishStatus().pending).toBe(true)  // w2 is still unpublished — not blanket-cleared
+    await vi.advanceTimersByTimeAsync(3000)       // the rerun publishes the newer facts
+    expect(mocks.publishReport).toHaveBeenCalledTimes(1)
+    expect(mocks.publishReport.mock.calls[0][0].workouts).toHaveLength(2)
     expect(m.publishStatus().pending).toBe(false)
   })
 
-  it('a failed publish stays pending with the error; success records the fingerprint (R10)', async () => {
+  it('R10: a failed publish stays pending with the error; success records the fingerprint', async () => {
     const m = await fresh()
     m.startPublishing()
     await vi.advanceTimersByTimeAsync(10)
     mocks.publishReport.mockResolvedValue({ ok: false, error: new Error('offline') })
     mocks.state.S = facts([{ id: 'w1', d: '2026-10-20', start: 1, end: 2 }])
-    for (const l of mocks.listeners) l()
+    fire()
     await vi.advanceTimersByTimeAsync(3000)
     expect(m.publishStatus().pending).toBe(true)
     expect(m.publishStatus().lastError).toBe('offline')
 
-    // The same facts retry on the next tick; only acceptance closes them.
     mocks.publishReport.mockResolvedValue({ ok: true, reportRev: 2 })
-    for (const l of mocks.listeners) l()
+    fire()
     await vi.advanceTimersByTimeAsync(3000)
     expect(m.publishStatus().pending).toBe(false)
     expect(m.publishStatus().lastError).toBe(null)
-    // Nothing more to do: an unchanged store fire publishes nothing.
     mocks.publishReport.mockClear()
-    for (const l of mocks.listeners) l()
+    fire()
     await vi.advanceTimersByTimeAsync(3000)
     expect(mocks.publishReport).not.toHaveBeenCalled()
   })
 
-  it('an offline withdrawal is persisted, blocks publishing, and retries the leave first (R11)', async () => {
+  it('R11/N09: an offline withdrawal blocks publishing; a late success clears only its own mark', async () => {
     const m = await fresh()
-    mocks.leaveLeaderboard.mockRejectedValue(new Error('offline'))
-    const r = await m.requestLeave({ ...ME })
-    expect(r.ok).toBe(false)
-    expect(localStorage.getItem('lb-withdraw:u1')).toBe('1')
+    let resolveLeave
+    mocks.leaveLeaderboard.mockReturnValue(new Promise(r => { resolveLeave = r }))
+    const pending = m.requestLeave({ ...ME })
+    expect(localStorage.getItem(`lb-withdraw:${ORIGIN}:u1`)).toBe('1')
 
     m.startPublishing()
     await vi.advanceTimersByTimeAsync(10)
-    // The withdrawal goes first; while it cannot land, no report is published at all.
     expect(mocks.publishReport).not.toHaveBeenCalled()
-    expect(m.publishStatus().withdrawPending).toBe(true)
 
-    mocks.leaveLeaderboard.mockResolvedValue({})
-    // The leave landing turns the member off server-side; nothing publishes afterwards.
-    mocks.fetchMe.mockResolvedValue({ ...ME, enabled: false })
-    mocks.state.S = facts([{ id: 'w1', d: '2026-10-20', start: 1, end: 2 }])
-    for (const l of mocks.listeners) l()
-    await vi.advanceTimersByTimeAsync(3000)
-    expect(localStorage.getItem('lb-withdraw:u1')).toBe(null)
-    expect(m.publishStatus().withdrawPending).toBe(false)
-    expect(mocks.publishReport).not.toHaveBeenCalled()
+    // While A's leave is in flight, the device switches to B — who has a withdrawal of their own.
+    mocks.state.user = { id: 'u2', name: 'B' }
+    localStorage.setItem(`lb-withdraw:${ORIGIN}:u2`, '1')
+    resolveLeave({})
+    await pending
+    await vi.advanceTimersByTimeAsync(10)
+    // A's mark is cleared by A's answer; B's mark is untouched by it.
+    expect(localStorage.getItem(`lb-withdraw:${ORIGIN}:u1`)).toBe(null)
+    expect(localStorage.getItem(`lb-withdraw:${ORIGIN}:u2`)).toBe('1')
   })
 
-  it('an unconfirmed disclosure text blocks publishing (R12)', async () => {
+  it('R12: an unconfirmed disclosure text blocks publishing', async () => {
     const m = await fresh()
     mocks.fetchMe.mockResolvedValue({ ...ME, disclosureVersion: 0, currentDisclosureVersion: 1 })
     m.startPublishing()
@@ -150,17 +207,5 @@ describe('the coordinator (started once, no page involved)', () => {
     m.startPublishing()
     await vi.advanceTimersByTimeAsync(10)
     expect(mocks.publishReport).not.toHaveBeenCalled()
-  })
-
-  it('a sign-in switch resets the published fingerprint between accounts', async () => {
-    const m = await fresh()
-    mocks.publishReport.mockResolvedValue({ ok: true })
-    m.startPublishing()
-    await vi.advanceTimersByTimeAsync(10)
-    mocks.state.user = { id: 'u2', name: 'B' }
-    for (const l of mocks.listeners) l()
-    await vi.advanceTimersByTimeAsync(3000)
-    // u2's first pass publishes (fresh fingerprint), never u1's recorded one.
-    expect(mocks.publishReport).toHaveBeenCalled()
   })
 })

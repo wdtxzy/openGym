@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStore } from '../store/useStore.js'
+import { t } from '../lib/i18n.js'
 import { useUI } from '../store/useUI.js'
 import { api } from '../lib/api.js'
 import { fmtDate, fmtNum, fmtVol, fmtDur } from '../lib/format.js'
@@ -252,9 +253,10 @@ function AuditCard({ tick }) {
 }
 
 // The leaderboard card (S05): who joined, and the one governance act the PRD gives the
-// operator over it — a reasoned, audited suspension that survives withdraw/rejoin. Like the
-// rest of this dashboard it is English-only, and like every admin route it is guarded again
-// server-side. Shown only where the instance switched the feature on.
+// operator over it — a reasoned, audited suspension that survives withdraw/rejoin. Like every
+// admin route it is guarded again server-side. Shown only where the instance switched the
+// feature on. This card IS translated (the second review asked for it, N12); the rest of the
+// dashboard stays English-only per its own note below.
 function LeaderboardAdmin() {
   const config = useStore(s => s.config)
   const toast = useUI(s => s.toast)
@@ -262,12 +264,12 @@ function LeaderboardAdmin() {
   const [busy, setBusy] = useState(false)
   const load = () => api('/api/admin/leaderboard/members')
     .then(d => setMembers(d.members || []))
-    .catch(e => toast(e.message || 'could not load the leaderboard members'))
+    .catch(e => toast(e.message || t('could not load the leaderboard members')))
   useEffect(() => { if (config?.leaderboard) load() }, [!!config?.leaderboard])
   if (!config?.leaderboard) return null
 
   const setStatus = async (m, suspended) => {
-    const reason = suspended ? (window.prompt('Reason (shown to the member and kept in the audit log):') || '').trim() : ''
+    const reason = suspended ? (window.prompt(t('Reason (shown to the member and kept in the audit log):')) || '').trim() : ''
     if (suspended && !reason) return
     setBusy(true)
     try {
@@ -282,24 +284,24 @@ function LeaderboardAdmin() {
 
   return <div className="card">
     <div className="row between" style={{ alignItems: 'center' }}>
-      <h2 style={{ margin: 0 }}>Leaderboard</h2>
-      <Button size="sm" variant="ghost" disabled={busy} onClick={load}>Refresh</Button>
+      <h2 style={{ margin: 0 }}>{t('Leaderboard')}</h2>
+      <Button size="sm" variant="ghost" disabled={busy} onClick={load}>{t('Refresh')}</Button>
     </div>
     <div className="adm-lead">
-      Everyone who joined the opt-in leaderboard. Suspending hides a member from every board and blocks their publishing, with a reason they can see; it never touches their training data.
+      {t('Everyone who joined the opt-in leaderboard. Suspending hides a member from every board and blocks their publishing, with a reason they can see; it never touches their training data.')}
     </div>
-    {members === null ? <div className="muted">Loading…</div> : members.length === 0 ? <div className="muted">Nobody has joined yet.</div> : <div>
+    {members === null ? <div className="muted">{t('Loading…')}</div> : members.length === 0 ? <div className="muted">{t('No one has joined yet')}</div> : <div>
       {members.map(m => <div key={m.uid} className="row between" style={{ alignItems: 'center', gap: 10, padding: '6px 0' }}>
         <div style={{ minWidth: 0 }}>
-          <div>{m.emoji} {m.displayName || <span className="muted">anonymous ({m.publicMemberId})</span>}
-            {m.suspended ? <span style={{ color: 'var(--red)' }}> · suspended</span> : null}
-            {!m.enabled ? <span className="muted"> · left</span> : null}
+          <div>{m.emoji} {m.displayName || <span className="muted">{t('anonymous')} ({m.publicMemberId})</span>}
+            {m.suspended ? <span style={{ color: 'var(--red)' }}> · {t('suspended')}</span> : null}
+            {!m.enabled ? <span className="muted"> · {t('left')}</span> : null}
           </div>
           {m.suspended && m.suspendedReason ? <div className="muted" style={{ fontSize: 11 }}>“{m.suspendedReason}”</div> : null}
         </div>
         {m.suspended
-          ? <Button size="sm" disabled={busy} onClick={() => setStatus(m, false)}>Restore</Button>
-          : <Button size="sm" variant="ghost" disabled={busy || !m.enabled} onClick={() => setStatus(m, true)}>Suspend</Button>}
+          ? <Button size="sm" disabled={busy} onClick={() => setStatus(m, false)}>{t('Restore')}</Button>
+          : <Button size="sm" variant="ghost" disabled={busy || !m.enabled} onClick={() => setStatus(m, true)}>{t('Suspend')}</Button>}
       </div>)}
     </div>}
   </div>

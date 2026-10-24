@@ -2333,4 +2333,12 @@ export default {
   "Participating": "Participating",
   "Not participating": "Not participating",
   "Open the leaderboard": "Open the leaderboard",
+  "could not load the leaderboard members": "could not load the leaderboard members",
+  "Reason (shown to the member and kept in the audit log):": "Reason (shown to the member and kept in the audit log):",
+  "Everyone who joined the opt-in leaderboard. Suspending hides a member from every board and blocks their publishing, with a reason they can see; it never touches their training data.": "Everyone who joined the opt-in leaderboard. Suspending hides a member from every board and blocks their publishing, with a reason they can see; it never touches their training data.",
+  "anonymous": "anonymous",
+  "suspended": "suspended",
+  "left": "left",
+  "Suspend": "Suspend",
+  "Restore": "Restore",
 }
