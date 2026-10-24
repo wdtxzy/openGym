@@ -157,6 +157,14 @@ tags:
     description: >-
       AI Coach: plans, reviews and debriefs. Every route here answers 503 unless the
       instance has the Coach switched on and a provider connected.
+  - name: leaderboard
+    description: >-
+      The instance leaderboard: total movement time over a Beijing-time week, month or
+      all history, from day buckets members publish themselves. Every route here is a 404
+      unless the instance runs with `LEADERBOARD=1`; `GET /api/leaderboard` additionally
+      requires the session unless `LEADERBOARD_PUBLIC_READ=1`. Members opt in
+      individually — joining confirms a numbered disclosure that says the administrator
+      may later open the board to visitors.
 
 security:
   - cookieAuth: []
@@ -285,6 +293,14 @@ paths:
                       always wins; a tag the app has no translation for is ignored.
                   media:
                     $ref: '#/components/schemas/MediaConfig'
+                  leaderboard:
+                    type: object
+                    description: >-
+                      Present only when the instance runs with LEADERBOARD=1; its absence
+                      is how the app knows there is no leaderboard here. `public_read`
+                      says whether signed-out visitors may see the board.
+                    properties:
+                      public_read: { type: boolean }
               examples:
                 anonymous: { value: { invite_only: true, allow_guest: false } }
                 signedInNoCoach: { value: { invite_only: true, allow_guest: false, coach: null } }
@@ -295,6 +311,282 @@ paths:
                     coach: { enabled: true, provider: compatible, providerLabel: "OpenAI-compatible endpoint", authMode: instance, community: false }
                 passwordLogin: { value: { invite_only: true, allow_guest: false, password_login: true } }
                 media: { value: { invite_only: false, allow_guest: true, media: { imageMB: 2, gifMB: 8, videoMB: 40, videoSec: 60, quotaMB: 200, workouts: true } } }
+
+  /api/leaderboard:
+    get:
+      tags: [leaderboard]
+      operationId: getLeaderboard
+      summary: The board for one window
+      description: |
+        Rows are members who joined under the current disclosure text, are not suspended,
+        and have not withdrawn — hand-built fields only: no internal uid, no other
+        member's day buckets. Ranking is 1, 1, 3 by `totalMs` (gym + synced), the stable
+        `publicMemberId` breaking ties. The window is named by the server's clock
+        (Asia/Shanghai, Monday weeks, natural months, half-open) — the same definition for
+        everyone on the instance, whatever their phone says. A guest gets this only when
+        the instance opened public read, and never gets `viewerLiked`.
+      security: []
+      parameters:
+        - name: window
+          in: query
+          schema: { type: string, enum: [week, month, all], default: week }
+      responses:
+        '200':
+          description: Window metadata plus the ranked rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  window:
+                    type: object
+                    properties:
+                      windowKey: { type: string, description: "'YYYY-MM-DD' of the Monday for weeks, 'YYYY-MM' for months, 'all'." }
+                      startKey: { type: ['string', 'null'] }
+                      endKey: { type: ['string', 'null'], description: Exclusive; null for `all`. }
+                      timezone: { type: string, const: Asia/Shanghai }
+                      weekStart: { type: integer, const: 1 }
+                      calendarVersion: { type: integer }
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        publicMemberId: { type: string }
+                        displayName: { type: string }
+                        emoji: { type: string }
+                        rank: { type: integer }
+                        gymMs: { type: integer, description: Own recorded session time, ms. }
+                        syncedMs: { type: integer, description: Health-activity time minus training overlaps, ms. }
+                        totalMs: { type: integer }
+                        gymSessions: { type: integer }
+                        syncedSessions: { type: integer }
+                        likeCount: { type: integer, description: Cheers for this row in this window. }
+                        viewerLiked: { type: boolean, description: Omitted entirely for guests. }
+                        dataAsOf: { type: ['integer', 'null'], description: The facts timestamp of the member's last accepted report. }
+        '401': { description: Not signed in and the instance has not opened public read. }
+        '400': { description: Unknown window type. }
+
+  /api/leaderboard/me:
+    get:
+      tags: [leaderboard]
+      operationId: getLeaderboardMe
+      summary: The caller's own participation state
+      description: >-
+        What the join/leave screen needs: enabled, suspension (with the reason when
+        suspended — visible to the member themselves), the consent sequence and
+        report revision for optimistic calls, and the disclosure version currently
+        required to (re)join.
+      responses:
+        '200':
+          description: The member state, or all-defaults for someone who never joined.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  suspended: { type: boolean }
+                  suspendedReason: { type: string }
+                  disclosureVersion: { type: ['integer', 'null'], description: The text version this member confirmed. }
+                  currentDisclosureVersion: { type: integer }
+                  consentVersion: { type: integer, description: Pass back as baseConsentVersion / in reports. }
+                  reportRev: { type: integer }
+                  dataAsOf: { type: ['integer', 'null'] }
+                  publicMemberId: { type: ['string', 'null'] }
+                  displayName: { type: ['string', 'null'] }
+                  emoji: { type: ['string', 'null'] }
+
+  /api/leaderboard/consent:
+    put:
+      tags: [leaderboard]
+      operationId: putLeaderboardConsent
+      summary: Join or withdraw
+      description: |
+        Joining requires confirming the server's **current** disclosure version and a
+        `baseConsentVersion` matching the member's sequence — a device that never saw a
+        withdrawal cannot undo it. Joining mints the public member id once and keeps it
+        forever, across withdrawals. Withdrawing deletes the published day buckets and
+        lifetime but keeps cheers received (hidden while out, restored on rejoin) and
+        bumps the sequence so stale reports answer 409. Withdrawal never launders an
+        admin suspension.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled, baseConsentVersion]
+              properties:
+                enabled: { type: boolean }
+                disclosureVersion: { type: integer, description: Required when enabling. }
+                baseConsentVersion: { type: integer }
+                displayName: { type: string, maxLength: 40, description: Taken at first join only. }
+      responses:
+        '200':
+          description: The new state and sequence.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  consentVersion: { type: integer }
+        '409':
+          description: >-
+            consent-stale (base did not match — re-read /me) or disclosure-stale (an
+            older text was confirmed; the current version rides along).
+        '401': { description: Not signed in. }
+
+  /api/leaderboard/report:
+    put:
+      tags: [leaderboard]
+      operationId: putLeaderboardReport
+      summary: Publish the caller's day buckets and lifetime
+      description: |
+        A full replacement inside the declared coverage; days outside it are dropped and
+        absent days inside it read as zero. The server keeps only the last 93 days.
+        `requestId` is idempotent (same body = the same answer, marked `replayed`;
+        same id with a different body = 409) and is checked **before** the optimistic
+        `baseReportRev`, so a retry of an accepted report costs nothing. Bound to the
+        current consent sequence; a suspended member cannot publish. Values are
+        non-negative safe integers; days in the future (server clock, Beijing) are
+        refused.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [schemaVersion, algorithmVersion, calendarVersion, consentVersion, baseReportRev, requestId, coverageStart, coverageEnd, days, lifetime]
+              properties:
+                schemaVersion: { type: integer, const: 1 }
+                algorithmVersion: { type: integer, const: 1 }
+                calendarVersion: { type: integer, const: 1 }
+                consentVersion: { type: integer }
+                baseReportRev: { type: integer }
+                requestId: { type: string, maxLength: 64 }
+                dataAsOf: { type: integer, description: When the facts were computed, epoch ms. }
+                coverageStart: { type: string, format: date }
+                coverageEnd: { type: string, format: date }
+                days:
+                  type: array
+                  items:
+                    type: object
+                    required: [date, gymMs, syncedMs, gymSessions, syncedSessions]
+                    properties:
+                      date: { type: string, format: date }
+                      gymMs: { type: integer }
+                      syncedMs: { type: integer }
+                      gymSessions: { type: integer }
+                      syncedSessions: { type: integer }
+                lifetime:
+                  type: object
+                  required: [gymMs, syncedMs, gymSessions, syncedSessions]
+                  properties:
+                    gymMs: { type: integer }
+                    syncedMs: { type: integer }
+                    gymSessions: { type: integer }
+                    syncedSessions: { type: integer }
+      responses:
+        '200':
+          description: Accepted; the revision to base the next publish on.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reportRev: { type: integer }
+                  acceptedAt: { type: integer }
+                  replayed: { type: boolean, description: True when requestId had already been accepted with this body. }
+        '400': { description: Malformed coverage, future days, or out-of-range values. }
+        '403': { description: Not participating, or suspended. }
+        '409':
+          description: >-
+            report-stale (baseReportRev mismatch; the current rev rides along),
+            consent-stale, request-conflict, or version-stale.
+
+  /api/leaderboard/like:
+    put:
+      tags: [leaderboard]
+      operationId: putLeaderboardLike
+      summary: Cheer a member for the current window
+      description: >-
+        Sets the cheer for `windowType`/`windowKey` — the server judges the key by its
+        own clock, and an expired one answers 409 with the current key. Idempotent: a
+        repeat keeps the first createdAt. One cheer per actor and window; week, month
+        and all are independent counters. Self-cheers, and cheers for hidden or
+        withdrawn members, are refused. 30 per minute per account, then 429.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targetPublicId, windowType, windowKey]
+              properties:
+                targetPublicId: { type: string }
+                windowType: { type: string, enum: [week, month, all] }
+                windowKey: { type: string }
+      responses:
+        '200':
+          description: The resulting state and the target's new likeCount.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  liked: { type: boolean }
+                  likeCount: { type: integer }
+        '403': { description: Self-cheer. }
+        '404': { description: No such visible member. }
+        '409': { description: window-expired; the current windowKey rides along. }
+        '429': { description: Rate; Retry-After header. }
+    delete:
+      tags: [leaderboard]
+      operationId: deleteLeaderboardLike
+      summary: Take the cheer back
+      description: Same target and window semantics as PUT; removing an absent cheer is a no-op.
+      parameters:
+        - { name: targetPublicId, in: query, required: true, schema: { type: string } }
+        - { name: windowType, in: query, required: true, schema: { type: string, enum: [week, month, all] } }
+        - { name: windowKey, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: The resulting state and likeCount. }
+        '409': { description: window-expired. }
+        '429': { description: Rate; Retry-After header. }
+
+  /api/admin/leaderboard/member-status:
+    put:
+      tags: [leaderboard, admin]
+      operationId: putLeaderboardMemberStatus
+      summary: Suspend or restore a member's listing
+      description: >-
+        Admin-only. A suspension needs a non-empty reason, is idempotent by `actionId`,
+        lands in the audit log, hides the member from every board, blocks publishing and
+        cheers, and survives withdraw/rejoin — it never touches the member's personal
+        training files.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targetUid, suspended, actionId]
+              properties:
+                targetUid: { type: string }
+                suspended: { type: boolean }
+                reason: { type: string, maxLength: 500, description: Required when suspending. }
+                actionId: { type: string, maxLength: 64 }
+      responses:
+        '200':
+          description: Applied, or already applied by this actionId.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  applied: { type: boolean, description: False when actionId was already used. }
+                  at: { type: integer }
+        '400': { description: Missing reason (suspending) or bad actionId. }
+        '404': { description: No such member. }
 
   /api/me:
     get:

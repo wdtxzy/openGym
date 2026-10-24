@@ -39,7 +39,10 @@ function specOperations(yaml) {
 test('every route the server registers is in openapi.yaml, and nothing else is', () => {
   const routes = new Set([
     ...routeKeys(read(path.join(API, 'server.js'))),
-    ...routeKeys(read(path.join(API, 'coach', 'routes.js')))
+    ...routeKeys(read(path.join(API, 'coach', 'routes.js'))),
+    // Feature-gated spreads are invisible to the static scan; their route module carries the
+    // same literal keys, so it stands in for them (the runtime gating has its own test).
+    ...routeKeys(read(path.join(API, 'community', 'leaderboard-routes.js')))
   ]);
   const ops = new Set(specOperations(spec));
   assert.ok(routes.size > 40, `only found ${routes.size} routes — the route table moved`);

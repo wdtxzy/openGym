@@ -15,7 +15,12 @@ License: AGPL-3.0-or-later.
 frontend/  React 19 + Vite app (src/views, src/components, src/store, src/lib). Builds to static files.
            android/ + ios/ are the Capacitor shells for the standalone mobile app (docs/MOBILE.md).
 api/       backend — server.js (Node, no framework), deps: @simplewebauthn/server, web-push.
-           coach/ is the optional AI coach; openapi.yaml documents every route.
+           coach/ is the optional AI coach; community/ is the leaderboard (store.js: serialized
+           transactional JSON store shared by future social features; windows.js: the one
+           Beijing/Monday calendar definition, imported by the frontend too; leaderboard.js +
+           leaderboard-routes.js: participation, published day-bucket reports, periodic cheers,
+           admin suspension — all behind LEADERBOARD=1, off = routes absent). openapi.yaml
+           documents every route.
 web/       multi-stage Dockerfile (builds frontend → nginx) + nginx.conf.template (serves app, proxies /api).
 mcp/       optional MCP server — read-only stdio bridge exposing a user's workouts/1RM/muscle
            balance to LLM clients (Claude Desktop, Cursor…). Not part of the Docker build; only
@@ -86,7 +91,8 @@ directly; the mirror is fast-forward only.
     session back, is a pure helper here with a unit test beside it** — not verifiable by
     clicking, and the progression engine has already had two bugs that only a test caught.
 - **`views/`** — one file per screen (Home, Workout, Plan, Library, Stats, History, Settings,
-  Admin, Login, RoutineEdit), routed by `react-router-dom` from `App.jsx`.
+  Admin, Login, RoutineEdit; Leaderboard behind the instance's LEADERBOARD flag, reached from
+  Stats), routed by `react-router-dom` from `App.jsx`.
 - **`components/`** — shared UI (charts, modals, timers); `instr/` holds per-language exercise
   instruction text; `locales/` is the i18n string catalogue (`lib/i18n.js` / `i18n-core.js`).
 - Mobile: `@capacitor/*` wraps the same web build into native shells under `frontend/android` and
