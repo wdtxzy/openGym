@@ -55,6 +55,10 @@ RUN npm ci --omit=dev --omit=optional && npm cache clean --force
 # else, and one that is missing only shows at boot, as ERR_MODULE_NOT_FOUND.
 COPY server.js push-messages.js nudge.js nudge-copy.js verify-error.js password.js rate-limit.js passkeys-store.js device-link.js media.js queue.js sync-stamps.js durable.js ./
 COPY coach ./coach
+# server.js imports the community modules unconditionally (the LEADERBOARD flag gates the
+# routes, not the imports), so the image needs them to boot at all — missing here, the
+# container died on ERR_MODULE_NOT_FOUND even with every feature off.
+COPY community ./community
 ENV NODE_ENV=production
 ENV PORT=3000
 EXPOSE 3000
