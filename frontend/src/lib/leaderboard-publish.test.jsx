@@ -165,7 +165,7 @@ describe('the coordinator factory', () => {
     h.client.leaveLeaderboard.mockRejectedValue(new Error('offline'))
     h.p.start()
     await h.p.requestLeave({ ...ME })
-    expect(h.storage['lb-withdraw:https://alpha.example:a']).toBe('1')
+    expect(JSON.parse(h.storage['lb-withdraw:https://alpha.example:a']).i).toBeTypeOf('string')
     expect(h.client.leaveLeaderboard).toHaveBeenCalledTimes(1)
     // Switch the same uid to beta: no leave replay, the alpha mark survives.
     h.state.sync = { status: 'ok', server: 'https://beta.example', lastSynced: 1 }
@@ -173,7 +173,7 @@ describe('the coordinator factory', () => {
     h.p.retryNow()
     await vi.advanceTimersByTimeAsync(10)
     expect(h.client.leaveLeaderboard).toHaveBeenCalledTimes(1)
-    expect(h.storage['lb-withdraw:https://alpha.example:a']).toBe('1')
+    expect(JSON.parse(h.storage['lb-withdraw:https://alpha.example:a']).i).toBeTypeOf('string')
     // A v2 key with a REAL URL (colons galore) on this device's own origin counts as here.
     // beta is not the WebView origin here, so a v2 key for another origin stays ambiguous.
     h.storage['lb-withdraw:https://paired-elsewhere.example:3000:a'] = '1'
@@ -219,18 +219,18 @@ describe('the coordinator factory', () => {
     h.client.leaveLeaderboard.mockReturnValueOnce(new Promise(r => { resolveLeave = r }))
     h.p.start()
     const pending = h.p.requestLeave({ ...ME })
-    expect(h.storage['lb-withdraw:https://alpha.example:a']).toBe('1')
+    expect(JSON.parse(h.storage['lb-withdraw:https://alpha.example:a']).i).toBeTypeOf('string')
     h.merged()
     await vi.advanceTimersByTimeAsync(3000)
     expect(h.client.publishReport).not.toHaveBeenCalled() // withdrawal blocks publishing
     // Switch to b, who has a withdrawal of their own.
     h.state.user = { id: 'b', name: 'B' }
-    h.storage['lb-withdraw:https://alpha.example:b'] = '1'
+    h.storage['lb-withdraw:https://alpha.example:b'] = JSON.stringify({v:3,i:'b-intent'})
     h.fire()
     resolveLeave({})
     await pending
     expect('lb-withdraw:https://alpha.example:a' in h.storage).toBe(false)
-    expect(h.storage['lb-withdraw:https://alpha.example:b']).toBe('1') // untouched
+    expect(JSON.parse(h.storage['lb-withdraw:https://alpha.example:b']).i).toBe('b-intent') // untouched
     h.p.stop()
   })
 

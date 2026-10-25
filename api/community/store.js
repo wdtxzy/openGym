@@ -21,9 +21,11 @@
  * erasing each other's revisions. The check is best-effort — a PID file without a live PID is
  * a stale lock from a crash, and is taken over. */
 import fs from 'node:fs';
+import path from 'node:path';
+import { atomicWrite, syncDir } from '../durable.js';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { atomicWrite } from '../durable.js';
+
 
 /** Refused operation on a shared store. `code` is stable for the API error table. */
 export class StoreError extends Error {
@@ -71,6 +73,20 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     finally { fs.closeSync(fd); }
   };
   const iOwn = holder => holder && holder.token === myToken;
+
+  /** H01: removing a commit marker must also remove the private commit file it recorded —
+   *  a paused committer's final rename then fails ENOENT instead of overwriting the writer
+   *  that took over. Both temp layers are the recorded commit's property. */
+  function clearMarker() {
+    try {
+      const marker = readAt(commitMarker);
+      if (marker && marker.tmp) {
+        try { fs.unlinkSync(marker.tmp); } catch { /* already gone */ }
+        try { fs.unlinkSync(marker.tmp + '.tmp'); } catch { /* inner layer */ }
+      }
+    } catch { /* unparseable marker: the takeover's own checks decide */ }
+    try { fs.unlinkSync(commitMarker); } catch { /* already gone */ }
+  }
   // The lease is rewritten ATOMICALLY (temp + rename), never by truncating the lock in place:
   // a truncating write leaves a moment where the lock reads empty and a peer would take the
   // file for ownerless (F02). Deposition (F01): a holder whose lease was taken over while it
@@ -139,9 +155,9 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
           ? (typeof holder.at === 'number' && now() - holder.at <= STALE_HOST_MS)
           : (holder.pid === process.pid || pidAlive(holder.pid)));
         if (leaseAlive) throw new StoreError('second-writer', `${file}: a commit is in progress`);
-        fs.unlinkSync(commitMarker);
+        clearMarker();
       } else {
-        fs.unlinkSync(commitMarker);
+        clearMarker();
       }
     } catch (e) {
       if (e instanceof StoreError) throw e;
@@ -206,6 +222,15 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
       throw new StoreError('second-writer', `lost the takeover race for ${file}`);
     }
     try { fs.unlinkSync(tomb); } catch { /* already gone */ }
+    // H01: the marker recorded the paused committer's private file — remove it (both layers)
+    // so its final rename fails instead of overwriting what we are about to commit.
+    try {
+      const marker = readAt(commitMarker);
+      if (marker && marker.tmp) {
+        try { fs.unlinkSync(marker.tmp); } catch { /* already gone */ }
+        try { fs.unlinkSync(marker.tmp + '.tmp'); } catch { /* inner layer */ }
+      }
+    } catch { /* marker vanished mid-recovery: the commit-critical-section check re-runs below */ }
     try {
       claimLock();
       locked = true;
@@ -242,30 +267,40 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
    *   remove marker, refresh lease
    * A takeover sees a fresh marker and refuses (the "dead" writer is mid-commit); a marker
    * silent past the stale window is crash debris and is removed. */
+  /* The commit protocol (G01/H01): the injectable writer only produces a PRIVATE, already
+   * durable temp file whose name is RECORDED IN THE MARKER; the shared file is reached
+   * through <file>.committing. The takeover path that recovers a dead lease removes exactly
+   * the recorded private file, so a process paused inside the critical section finds its
+   * rename source gone and can never overwrite the writer that properly took over — the
+   * final rename re-verifies the marker token first and tolerates the source being gone.
+   * The commit rename is followed by a directory fsync (H06), keeping durable.js's
+   * data-fsync/rename/dir-fsync contract end to end. */
   function persist(draft) {
     if (!locked || deposed) throw new StoreError('lost-lock', `${file}: not the lease owner`);
     const tmpData = `${file}.commit.${crypto.randomBytes(6).toString('hex')}`;
     try {
       writer(tmpData, JSON.stringify(draft, null, 2) + '\n', 0o600);
     } catch (e) {
-      try { fs.unlinkSync(tmpData); } catch { /* never got written */ }
+      cleanupTemp(tmpData);
       throw new StoreError('write-failed', e.message);
     }
     let markerFd = null;
     try {
       markerFd = fs.openSync(commitMarker, 'wx');
-      fs.writeSync(markerFd, JSON.stringify({ pid: process.pid, host: myHost, token: myToken, at: now() }));
+      fs.writeSync(markerFd, JSON.stringify({ pid: process.pid, host: myHost, token: myToken, at: now(), tmp: tmpData }));
       fs.closeSync(markerFd);
       markerFd = null;
     } catch (e) {
       try { fs.closeSync(markerFd); } catch { /* not open */ }
       markerFd = null;
-      try { fs.unlinkSync(tmpData); } catch { /* keep the disk honest */ }
+      cleanupTemp(tmpData);
       if (e.code === 'EEXIST') throw new StoreError('second-writer', `${file}: another commit is in progress`);
       throw new StoreError('write-failed', e.message);
     }
     try {
-      if (!iOwn(readLock())) {
+      // Re-verify the MARKER (not just the lease): it is what the takeover clears.
+      const marker = readAt(commitMarker);
+      if (!marker || marker.token !== myToken || !iOwn(readLock())) {
         deposed = true;
         locked = false;
         refused = new StoreError('lost-lock', `${file}: another writer owns the lease now`);
@@ -274,14 +309,23 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
       }
       fs.renameSync(tmpData, file);
       knownMtime = fs.statSync(file).mtimeMs;
+      syncDir(path.dirname(file)); // H06: the project's durable contract ends with a dir fsync
     } catch (e) {
-      try { fs.unlinkSync(tmpData); } catch { /* already renamed or never written */ }
+      cleanupTemp(tmpData);
       try { fs.unlinkSync(commitMarker); } catch { /* keep recovery honest */ }
       if (e instanceof StoreError) throw e;
       throw new StoreError('write-failed', e.message);
     }
     try { fs.unlinkSync(commitMarker); } catch { /* a crash here leaves recoverable debris */ }
     refreshLease(); // a long commit must not look abandoned, and a lost lease surfaces now
+  }
+
+  /** H08: the default writer wraps our private name in its own inner .tmp; both layers are
+   *  this commit's property and go with it on every failure path. */
+  function cleanupTemp(tmpData) {
+    for (const name of [tmpData, tmpData + '.tmp']) {
+      try { fs.unlinkSync(name); } catch { /* never created, or already renamed */ }
+    }
   }
 
   function load() {

@@ -87,7 +87,8 @@ export async function publishReport(S, me, opts = {}) {
       { workouts: facts.workouts || [], activities: facts.activities || [] },
       { consentVersion: m.consentVersion, baseReportRev: m.reportRev, requestId, now: Date.now() }
     );
-    if (Number.isFinite(m.personalRev)) body.personalRev = m.personalRev;
+    if (Number.isFinite(opts.validatedPersonalRev)) body.personalRev = opts.validatedPersonalRev;
+    else if (Number.isFinite(m.personalRev)) body.personalRev = m.personalRev; // legacy fallback: no confirmed pairing known
     return api('/api/leaderboard/report', { method: 'PUT', body: JSON.stringify(body) })
       .then(out => ({ ...out, acceptedFingerprint: fingerprintOf(facts) }));
   };

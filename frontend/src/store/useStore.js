@@ -437,6 +437,9 @@ export const useStore = create((set, get) => {
     const cur = get().sync
     const next = { ...cur, ...patch }
     next.status = statusOf(next, get().user)
+    // H02: the personal-state revision the store currently holds — the only version a
+    // report built from S may claim. Derived, never set by hand.
+    next.rev = meta.get(get().S)?.base?.rev ?? null
     if (Object.keys(next).some(k => (k === 'lastError' ? !sameError(next[k], cur[k]) : next[k] !== cur[k]))) set({ sync: next })
   }
   const isNetworkError = e => e && e.status == null   // fetch itself failed, or gave up: no response at all

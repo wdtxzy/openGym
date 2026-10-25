@@ -328,7 +328,8 @@ test('routes: auth, guest gating, error shape, rate limit, audit', async () => {
   assert.equal((await call('PUT /api/admin/leaderboard/member-status', { body: { targetUid: 'bob', suspended: true, reason: 'x', actionId: 'z1' }, user: users.bob })).status, 403);
   const admin = { ...users.alice, admin: true };
   assert.equal((await call('PUT /api/admin/leaderboard/member-status', { body: { targetUid: 'alice', suspended: false, actionId: 'z2' }, user: admin })).status, 200);
-  assert.ok(audited.some(([e]) => e === 'leaderboard.admin.status'));
+  await new Promise(r => setTimeout(r, 5)) // the flush runs async after the answer
+  assert.ok(audited.some(([e]) => e === 'leaderboard.admin.status'), 'exactly one delivered audit: ' + JSON.stringify(audited));
 
   // Like rate limit: 30 per minute per account, then 429 with Retry-After.
   assert.equal((await call('PUT /api/leaderboard/consent', { body: { enabled: true, disclosureVersion: DISCLOSURE_VERSION, baseConsentVersion: 0 }, user: users.bob })).status, 200);

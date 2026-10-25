@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 // The leaderboard's global publisher — a session machine, not a pile of module globals.
 //
 // One publisher instance (created once from App), one store subscription, and ONE session
@@ -66,8 +67,15 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   /* ---------- withdrawal state, resolved per session ---------- */
 
   const readMark = key => { try { return storage.getItem(key) !== null } catch { return false } }
+  const readIntent = key => {
+    try {
+      const raw = storage.getItem(key)
+      if (raw == null) return null
+      try { const p = JSON.parse(raw); return p && p.i ? p.i : 'legacy' } catch { return 'legacy' }
+    } catch { return null }
+  }
   const clearMark = key => { try { storage.removeItem(key) } catch { /* private mode */ } }
-  const setMark = key => { try { storage.setItem(key, '1') } catch { /* private mode */ } }
+  const setMark = (key, intentId) => { try { storage.setItem(key, JSON.stringify({ v: 3, i: intentId })) } catch { /* private mode */ } }
 
   /* ---------- withdrawal marks, resolved per session (G04) ----------
    * Historical keys are captured as WHOLE strings and classified by exact prefix, never by
@@ -119,19 +127,26 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   async function requestLeave(me) {
     const sess = session
     if (!sess) return { ok: false, error: new Error('not signed in') }
-    setMark(KEY_V3(sess.instance, sess.uid))
+    // H05: every leave intent gets a unique id; the response clears the key ONLY while it
+    // still stores this exact intent — a late success cannot erase a newer intent that the
+    // same account made on the same server after this request was already in flight.
+    const intentId = (randomUUID ? randomUUID() : String(clock()) + '-' + Math.random().toString(36).slice(2))
+    setMark(KEY_V3(sess.instance, sess.uid), intentId)
+    sess.withdrawIntent = intentId
     sess.withdrawMarked = true
     status.withdrawPending = true
     status.withdrawAmbiguous = false
     emit()
     try {
       await client.leaveLeaderboard(me)
-      clearMark(KEY_V3(sess.instance, sess.uid))
+      // H05: clear only while the stored intent is still THIS one.
+      if (readIntent(KEY_V3(sess.instance, sess.uid)) === intentId) clearMark(KEY_V3(sess.instance, sess.uid))
       sess.withdrawMarked = false
       if (session === sess) {
-        status.withdrawPending = false
+        status.withdrawPending = withdrawalState(sess).pending
+        status.withdrawAmbiguous = withdrawalState(sess).ambiguous
         sess.me = null
-        ok()
+        if (!status.withdrawPending) ok()
       }
       return { ok: true }
     } catch (e) {
@@ -193,10 +208,11 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     if (publishing) { rerun = true; return }
     publishing = true
     rerun = false
+    let sess = null // hoisted: the catch must know whose failure it is handling (H09)
     try {
       const start = get()
       if (!start.user?.id || !start.config?.leaderboard) return
-      const sess = session
+      sess = session
       const stillUs = () => active && session === sess
 
       const wd = withdrawalState(sess)
@@ -252,13 +268,13 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       // in between (G03): a fresh reportRev does not authorize old facts — merge first and
       // rebuild. The first publish of a session has no earlier sighting; its pairing is
       // verified server-side via personalRev instead.
-      // G03: whenever the server's baseline could be someone else's newer publish — a rev
-      // different from the one this session last saw, or any server-side report before this
-      // session's FIRST publish (our facts may predate it) — merge personal state first and
-      // rebuild, looping until the baseline is stable across a whole merge. The stability
-      // check closes the merge→read window; the personalRev pairing (verified server-side)
-      // closes the send window. A merge that does not confirm (pullState swallowed a failure)
-      // leaves the publish pending.
+      // G03/H02: whenever the server's baseline could be someone else's newer publish — a
+      // rev different from the one this session last SAW, or any server-side report before
+      // this session's FIRST publish — merge personal state first and rebuild, looping until
+      // the baseline is stable across a whole merge. "Seen" is not "merged into": on
+      // exhaustion the sighting is restored, so the next round still owes a merge. After a
+      // stable merge the session records the personal-state revision the NEW facts were
+      // confirmed at (sync.rev) — the only version a report may claim (H02).
       if (prevSeen == null ? m.reportRev > 0 : m.reportRev !== prevSeen) {
         let merged = false
         for (let attempt = 0; attempt < 3 && !merged; attempt++) {
@@ -269,10 +285,14 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
           if (!(stillUs() && after.sync?.status === 'ok' && after.sync?.lastSynced !== syncBefore)) return
           m = await me(sess, true)
           if (!stillUs() || !healthy()) return
-          sess.lastSeenReportRev = m.reportRev
           if (m.reportRev === revBefore) merged = true // no new publish during the merge
         }
-        if (!merged) return // still racing after 3 rounds: retry on the next change
+        if (!merged) {
+          sess.lastSeenReportRev = prevSeen // H02: exhaustion keeps the merge obligation
+          return // retry on the next change; never send facts older than the baseline
+        }
+        sess.lastSeenReportRev = m.reportRev
+        sess.validatedPersonalRev = get().sync?.rev ?? sess.validatedPersonalRev
         if (!m?.enabled || m.suspended) { setPending(false); return }
         if (m.disclosureVersion !== m.currentDisclosureVersion) { setPending(false); return }
         if (fingerprintOf(get().S) === sess.lastPublished) { setPending(false); return }
@@ -284,6 +304,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
 
       const sentFacts = get().S // captured at send: the fallback when the client cannot name the accepted fingerprint
       const r = await client.publishReport(sentFacts, m, {
+        validatedPersonalRev: sess.validatedPersonalRev,
         // N03: the pull wrapper answers whether the merge actually landed healthy.
         pull: async () => {
           try { await get().pullState() } catch { return false }
@@ -301,6 +322,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         sess.lastPublished = r.acceptedFingerprint ?? fingerprintOf(sentFacts)
         sess.lastAcceptedReportRev = r.reportRev ?? m.reportRev
         sess.lastSeenReportRev = sess.lastAcceptedReportRev
+        if (get().sync?.rev != null) sess.validatedPersonalRev = get().sync.rev
         if (sess.me) sess.me = { ...sess.me, reportRev: sess.lastSeenReportRev } // the cache must not look stale next round
         ok()
       } else if (r.reason === 'disabled') {
@@ -310,7 +332,9 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         fail(r.error || new Error('publication failed'))
       }
     } catch (e) {
-      fail(e)
+      // H09: a late failure belongs to the session that started it — a replaced or stopped
+      // session's rejection must not paint the new session's status.
+      if (sess && active && session === sess) fail(e)
     } finally {
       publishing = false
       if (rerun) { rerun = false; schedule() }
@@ -344,6 +368,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         meAt: 0,
         lastAcceptedReportRev: null,
         lastSeenReportRev: null,
+        validatedPersonalRev: null,
         withdrawMarked: false,
         lastPublished: ''
       }

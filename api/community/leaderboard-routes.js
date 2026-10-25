@@ -143,17 +143,9 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
           actorUid: admin.id, targetUid: body.targetUid,
           suspended: !!body.suspended, reason: body.reason, actionId: body.actionId
         });
-        // audit() keeps the fields it knows: operator (user), target ({id,name}), act, msg.
-        // Everything an operator reading audit.log back needs to know who suspended whom,
-        // why, and whether this was the action or a replay of one already applied.
-        audit(req, 'leaderboard.admin.status', {
-          ok: true,
-          user: admin,
-          target: { id: String(body.targetUid || ''), name: String(body.targetName || '') },
-          act: (body.suspended ? 'suspend' : 'restore') + (out.applied ? '' : ' (replay)'),
-          msg: String(body.reason || ''),
-          meta: { actionId: String(body.actionId || ''), applied: !!out.applied }
-        });
+        // H03: ONE delivery path. The disposition transaction already enqueued the pending
+        // audit event (with operator/target/act/reason); the flush below is the same reliable
+        // pipeline the boot and periodic deliverers use — no second, undeduplicated write.
         const flush = domain.flushAudits(({ actionId, actor, targetUid, suspended, reason, at }) =>
           audit(req, 'leaderboard.admin.status', {
             ok: true,

@@ -28,6 +28,9 @@ export const DISCLOSURE_VERSION = 1;
 export const REPORT_SCHEMA_VERSION = 1;
 export const REPORT_ALGORITHM_VERSION = 1;
 export const REPORT_CALENDAR_VERSION = CALENDAR_VERSION;
+/** H04: the undelivered-audit queue refuses new dispositions past this depth instead of
+ *  trimming promised events; the deliverer drains it. */
+export const AUDIT_BACKLOG_MAX = 2000;
 export const RETAINED_DAYS = 93;
 /** The emoji a member may show beside their name — a controlled set, so the board cannot
  *  become an image board (PRD §17: no external images, no tracking pixels). */
@@ -59,6 +62,7 @@ const isDayKey = v => {
   return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 10) === v;
 };
 const keyToMs = k => Date.parse(k + 'T00:00:00Z');
+const list = v => (Array.isArray(v) ? v : []);
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 32);
 
 export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
@@ -179,12 +183,6 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
      *  by requestId; optimistic by baseReportRev; bound to the current consent sequence. */
     report(uid, body) {
       const today = beijingDayKey(now());
-      // G03: the report must be built against the personal state the server currently
-      // holds. A device that merged, then watched another device sync first, sends a stale
-      // pairing and is refused here — with the current revision so it can merge and retry —
-      // instead of overwriting the newer totals with its own older facts.
-      if (personalRevOf && Number.isFinite(body.personalRev) && body.personalRev !== personalRevOf(uid))
-        throw new LeaderboardError(409, 'personal-stale', { personalRev: personalRevOf(uid) });
       return store.txn(data => {
         const m = requireMember(data, uid);
         if (!m.enabled) throw new LeaderboardError(403, 'not-participating');
@@ -208,6 +206,13 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
           if (seen.hash === hash(content)) return { reportRev: seen.rev, acceptedAt: seen.at, replayed: true };
           throw new LeaderboardError(409, 'request-conflict');
         }
+        // G03/H02 — AFTER idempotency (H07): a retry of an already-accepted report must get
+        // its replayed answer even if the personal state has since moved on. Only a NEW
+        // publish is held to the personalRev pairing: the facts must be built against the
+        // personal state the server currently holds, or the older totals would overwrite a
+        // newer device's. Absent personalRev = a pre-5.4 client; accepted as before.
+        if (personalRevOf && Number.isFinite(body.personalRev) && body.personalRev !== personalRevOf(uid))
+          throw new LeaderboardError(409, 'personal-stale', { personalRev: personalRevOf(uid) });
         if (body.baseReportRev !== m.reportSeq)
           throw new LeaderboardError(409, 'report-stale', { reportRev: m.reportSeq });
 
@@ -345,7 +350,14 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
           m.suspendedReason = null;
           m.suspendedAt = null;
         }
-        const action = { actionId, at: now(), actor: actorUid, targetUid, suspended: !!suspended, reason: suspended ? m.suspendedReason : String(reason || '').slice(0, 500), audited: false };
+        // H04: the pending audit event lives in its OWN queue that is never silently
+        // trimmed — losing a promised audit is worse than refusing a new action once the
+        // backlog is extreme. The capped adminActions list keeps only the reviewed history.
+        const action = { actionId, at: now(), actor: actorUid, targetUid, suspended: !!suspended, reason: suspended ? m.suspendedReason : String(reason || '').slice(0, 500) };
+        const pending = list(data.pendingAudits);
+        if (pending.length >= AUDIT_BACKLOG_MAX)
+          throw new LeaderboardError(503, 'audit-backlog', { backlog: pending.length });
+        data.pendingAudits = [...pending, { ...action, audited: false }];
         data.adminActions = [...(data.adminActions || []), action].slice(-500); // bounded, newest last
         return { ok: true, applied: true, at: action.at };
       }).then(({ out }) => out);
@@ -391,7 +403,7 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
      *  accessors let the deliverer flush and confirm them as a separate, retryable step. */
     unauditedActions() {
       const data = store.peek();
-      return (data.adminActions || []).filter(a => a.audited === false).map(a => ({ ...a }));
+      return list(data.pendingAudits).map(a => ({ ...a }));
     },
     /** Deliver pending audits through  (one call per action). Whatever wrote
      *  successfully is marked audited even when a later one fails, so a partial delivery
@@ -414,9 +426,13 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
     markAudited(actionIds) {
       const ids = new Set(actionIds);
       return store.txn(data => {
-        let n = 0;
-        for (const a of data.adminActions || []) if (ids.has(a.actionId) && a.audited === false) { a.audited = true; n++ }
-        return n;
+        const pending = list(data.pendingAudits);
+        const delivered = pending.filter(a => ids.has(a.actionId));
+        // Delivered events join the capped reviewed history; the pending queue only shrinks
+        // by actual delivery — never by the history window (H04).
+        data.pendingAudits = pending.filter(a => !ids.has(a.actionId));
+        data.adminActions = [...(data.adminActions || []), ...delivered].slice(-500);
+        return delivered.length;
       }).then(({ out }) => out);
     },
 
