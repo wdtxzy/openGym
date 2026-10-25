@@ -167,3 +167,14 @@ export function windowTotals(days = {}, windowType, now) {
   }
   return totals;
 }
+
+/* ---------- publish fingerprint (G02) ---------- */
+
+/** The aggregate inputs a report is built from, hashed cheaply: edits to an OLD session or a
+ *  same-count activity swap move it, not just counts. Pure — the publisher and the client use
+ *  it to name exactly which facts the server accepted. */
+export function fingerprintOf(S) {
+  const w = (S?.workouts || []).map(x => [x.id, x.d, x.start ?? 0, x.end ?? 0])
+  const a = (S?.activities || []).map(x => [x.id, x.startMs ?? 0, x.endMs ?? 0, !!x.userExcluded, !!x.sourceDeleted, x.linkedWorkoutId ?? null])
+  return JSON.stringify([w, a])
+}

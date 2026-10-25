@@ -92,7 +92,14 @@ const leaderboardStore = createSharedStore({
 });
 // One domain instance for the whole process: the routes and the account-deletion cleanup
 // below go through the same serialized store, so they can never interleave badly.
-const leaderboardDomain = createLeaderboard({ store: leaderboardStore });
+// The personal-state revision a report was built against (G03): the domain refuses a
+// report whose pairing no longer matches the live state file, closing the merge→send window
+// where another device syncs in between.
+// The personal-state revision a report was built against (G03): the domain refuses a
+// report whose pairing no longer matches the live state file, closing the merge→send window
+// where another device syncs in between.
+function personalRevOf(uid) { return readState(uid)?._rev || 0 }
+const leaderboardDomain = createLeaderboard({ store: leaderboardStore, personalRevOf });
 if (LEADERBOARD) {
   const probe = leaderboardStore.warmup();
   if (!probe.ok) console.error(`leaderboard store unavailable (${probe.code}): ${probe.detail}`);
@@ -2717,7 +2724,7 @@ const routes = {
   // Only when the instance switched the leaderboard on: an off instance has none of these
   // routes, and unanswered is a plain 404 — no entry point, no information leak (LB-01).
   ...(LEADERBOARD ? leaderboardRoutes({
-    domain: leaderboardDomain, json, readBody, readSession, requireAdmin, audit, auditAppendable,
+    domain: leaderboardDomain, json, readBody, readSession, requireAdmin, audit, auditAppendable, personalRevOf,
     publicRead: LEADERBOARD_PUBLIC_READ,
     // The like budget's address half: the runtime PEER (F10), not the audit record — with
     // AUDIT_IP=off the audit stores nothing, and the budget still counts clients apart.

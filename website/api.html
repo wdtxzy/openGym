@@ -2531,7 +2531,7 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
     <div class="ptab">
   <div class="prow rrow">
     <span class="r-code s2">200</span>
-    <span class="p-desc">The member state, or all-defaults for someone who never joined.<span class="r-sig">{ enabled: boolean, suspended: boolean, suspendedReason: string, disclosureVersion: integer | null, currentDisclosureVersion: integer, consentVersion: integer, reportRev: integer, dataAsOf: integer | null, publicMemberId: string | null, displayName: string | null, emoji: string | null }</span></span>
+    <span class="p-desc">The member state, or all-defaults for someone who never joined.<span class="r-sig">{ enabled: boolean, suspended: boolean, suspendedReason: string, disclosureVersion: integer | null, currentDisclosureVersion: integer, consentVersion: integer, reportRev: integer, personalRev: integer | null, dataAsOf: integer | null, publicMemberId: string | null, displayName: string | null, emoji: string | null }</span></span>
   </div>
     </div>
   </div>
@@ -2626,6 +2626,11 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
     <span class="p-desc"></span>
   </div>
   <div class="prow">
+    <span class="p-name">personalRev</span>
+    <span class="p-type">integer</span>
+    <span class="p-desc">The personal-state revision this report's facts were merged at (from GET /api/leaderboard/me). Refused with 409 personal-stale when the server's live state has moved past it.</span>
+  </div>
+  <div class="prow">
     <span class="p-name">requestId<em class="p-req" title="required">required</em></span>
     <span class="p-type">string <span class="p-hint">(&le; 64 chars)</span></span>
     <span class="p-desc"></span>
@@ -2717,7 +2722,7 @@ main.api-main .lead { color: var(--fg-2); max-width: 58ch; margin: 14px 0 0; fon
   </div>
   <div class="prow rrow">
     <span class="r-code s4">409</span>
-    <span class="p-desc">report-stale (baseReportRev mismatch; the current rev rides along), consent-stale, request-conflict, or version-stale.</span>
+    <span class="p-desc">report-stale (baseReportRev mismatch; the current rev rides along), consent-stale, personal-stale (the personal state moved; re-merge), request-conflict, or version-stale.</span>
   </div>
     </div>
   </div>

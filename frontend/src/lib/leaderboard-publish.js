@@ -20,6 +20,7 @@
 // instance cannot be proven blocks publishing and waits for the person to resolve it — it is
 // never silently dropped, never replayed against a server it cannot be proven to belong to.
 import { useStore } from '../store/useStore.js'
+import { fingerprintOf } from './leaderboard.js'
 import { fetchMe, leaveLeaderboard, publishReport } from './leaderboard-client.js'
 
 const DEBOUNCE_MS = 2500
@@ -40,6 +41,7 @@ const KEY_V1 = uid => `lb-withdraw:${uid}`
 export function createPublisher({ store = useStore, client = { fetchMe, leaveLeaderboard, publishReport }, clock = Date.now, storage = globalThis.localStorage } = {}) {
   const get = () => store.getState()
   let started = false
+  let active = false // G08: false once stopped — in-flight answers must be refused
   let timer = null
   let publishing = false
   let rerun = false
@@ -59,13 +61,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     emit()
   }
 
-  /** The aggregate inputs, hashed cheaply: edits to an OLD session or a same-count activity
-   *  swap move it, not just counts. */
-  function fingerprintOf(S) {
-    const w = (S?.workouts || []).map(x => [x.id, x.d, x.start ?? 0, x.end ?? 0])
-    const a = (S?.activities || []).map(x => [x.id, x.startMs ?? 0, x.endMs ?? 0, !!x.userExcluded, !!x.sourceDeleted, x.linkedWorkoutId ?? null])
-    return JSON.stringify([w, a])
-  }
+  
 
   /* ---------- withdrawal state, resolved per session ---------- */
 
@@ -169,7 +165,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       const start = get()
       if (!start.user?.id || !start.config?.leaderboard) return
       const sess = session
-      const stillUs = () => session === sess
+      const stillUs = () => active && session === sess
 
       const wd = withdrawalState(sess)
       status.withdrawPending = wd.pending
@@ -245,8 +241,10 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       })
       if (!stillUs() || !healthy()) return // the answer belongs to a previous session
       if (r.ok) {
-        // Record the fingerprint of the facts actually accepted (the store may have moved).
-        sess.lastPublished = fingerprintOf(get().S)
+        // G02: record the fingerprint of the facts the server ACTUALLY accepted (the 409
+        // recovery may have sent the merged retry, not the caller's snapshot) — the response
+        // carries it, so no guessing from the response-time store.
+        sess.lastPublished = r.acceptedFingerprint ?? fingerprintOf(get().S)
         sess.lastAcceptedReportRev = r.reportRev ?? m.reportRev
         ok()
       } else if (r.reason === 'disabled') {
@@ -311,6 +309,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   function start() {
     if (started) return
     started = true
+    active = true
     unsub = store.subscribe(onStoreChange)
     onStoreChange() // register the initial session before the first pass
     window.addEventListener('online', onOnline)
@@ -319,9 +318,14 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   let unsub = null
   const onOnline = () => { if (status.pending) runPublish() }
   function stop() {
+    // G08: going inactive first — every stillUs() turns false, so an in-flight me()/report()
+    // answer is dropped instead of seeding caches, setting status, or sending more requests.
+    // Already-sent requests cannot be un-sent; nothing further leaves from here.
+    active = false
     if (unsub) { unsub(); unsub = null }
     window.removeEventListener('online', onOnline)
     clearTimeout(timer)
+    session = null
     started = false
   }
 
@@ -352,4 +356,3 @@ export const onPublishStatus = l => singleton?.onPublishStatus(l) || (() => {})
 export const requestLeave = (...a) => singleton?.requestLeave(...a) ?? { ok: false, error: new Error('no session') }
 export const resolveAmbiguousWithdraw = (...a) => singleton?.resolveAmbiguousWithdraw(...a) ?? { ok: false }
 export const invalidateMe = () => singleton?.invalidateMe()
-export function fingerprintOf(S) { return singleton ? singleton.fingerprintOf(S) : '[]' }

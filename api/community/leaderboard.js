@@ -61,7 +61,7 @@ const isDayKey = v => {
 const keyToMs = k => Date.parse(k + 'T00:00:00Z');
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 32);
 
-export function createLeaderboard({ store, now = Date.now }) {
+export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
   const memberOf = (data, uid) => data.members[uid] || null;
 
   function requireMember(data, uid) {
@@ -179,6 +179,12 @@ export function createLeaderboard({ store, now = Date.now }) {
      *  by requestId; optimistic by baseReportRev; bound to the current consent sequence. */
     report(uid, body) {
       const today = beijingDayKey(now());
+      // G03: the report must be built against the personal state the server currently
+      // holds. A device that merged, then watched another device sync first, sends a stale
+      // pairing and is refused here — with the current revision so it can merge and retry —
+      // instead of overwriting the newer totals with its own older facts.
+      if (personalRevOf && Number.isFinite(body.personalRev) && body.personalRev !== personalRevOf(uid))
+        throw new LeaderboardError(409, 'personal-stale', { personalRev: personalRevOf(uid) });
       return store.txn(data => {
         const m = requireMember(data, uid);
         if (!m.enabled) throw new LeaderboardError(403, 'not-participating');

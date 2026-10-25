@@ -392,6 +392,14 @@ paths:
                   currentDisclosureVersion: { type: integer }
                   consentVersion: { type: integer, description: Pass back as baseConsentVersion / in reports. }
                   reportRev: { type: integer }
+                  personalRev:
+                    type: ['integer', 'null']
+                    description: >-
+                      The live revision of this member's personal state file. A report must
+                      be built against the personalRev the server reported; the server
+                      verifies the pairing at commit time and answers 409 personal-stale
+                      otherwise (closing the window where another device syncs between the
+                      client's merge and its send).
                   dataAsOf: { type: ['integer', 'null'] }
                   publicMemberId: { type: ['string', 'null'] }
                   displayName: { type: ['string', 'null'] }
@@ -463,6 +471,12 @@ paths:
                 calendarVersion: { type: integer, const: 1 }
                 consentVersion: { type: integer }
                 baseReportRev: { type: integer }
+                personalRev:
+                  type: integer
+                  description: >-
+                    The personal-state revision this report's facts were merged at (from
+                    GET /api/leaderboard/me). Refused with 409 personal-stale when the
+                    server's live state has moved past it.
                 requestId: { type: string, maxLength: 64 }
                 dataAsOf: { type: integer, description: When the facts were computed, epoch ms. }
                 coverageStart: { type: string, format: date }
@@ -502,7 +516,8 @@ paths:
         '409':
           description: >-
             report-stale (baseReportRev mismatch; the current rev rides along),
-            consent-stale, request-conflict, or version-stale.
+            consent-stale, personal-stale (the personal state moved; re-merge),
+            request-conflict, or version-stale.
 
   /api/leaderboard/like:
     put:

@@ -8,7 +8,7 @@
 // loop is how a withdrawal gets undone by a phone that never heard of it.
 import { api } from './api.js'
 import { uid } from './format.js'
-import { buildReport } from './leaderboard.js'
+import { buildReport, fingerprintOf } from './leaderboard.js'
 
 /** The member's own state; null when the feature is off (404) rather than an error. */
 export async function fetchMe() {
@@ -68,25 +68,33 @@ export function setCheer(targetPublicId, windowType, windowKey, on) {
   return api('/api/leaderboard/like?' + q, { method: 'DELETE' });
 }
 
-/** Publish this device's facts. Returns { ok, reportRev?, acceptedAt?, reason?, error? }.
+/** Publish this device's facts. Returns { ok, reportRev?, acceptedFingerprint?, reason?, error? }.
  *
- *  On a stale base/consent (another device published, or the member joined/left) the PRD's
- *  rule is: merge personal state FIRST, then re-aggregate — `opts.pull` (the store's
- *  pullState) runs, and the retry is built from `opts.stateOf()` (the store's CURRENT state),
- *  never from the closure's stale copy: re-serializing the same outdated facts under a fresh
- *  revision is exactly how a newer device's totals get overwritten by an older one (R03). */
+ *  On a stale base/consent/personal-state (another device published or synced, or the member
+ *  joined/left) the PRD's rule is: merge personal state FIRST, then re-aggregate — `opts.pull`
+ *  (the store's pullState) runs, and the retry is built from `opts.stateOf()` (the store's
+ *  CURRENT state), never from the closure's stale copy.
+ *
+ *  G02: the answer names the fingerprint of the facts ACTUALLY accepted — the send may have
+ *  been the merged retry, not the caller's original snapshot — so the coordinator records what
+ *  the server really holds instead of guessing from the response-time store. G03: every send
+ *  carries the member's `personalRev` (the personal-state revision the server reported); the
+ *  server refuses the report when that no longer matches its live state, which is what closes
+ *  the merge→read window where another device syncs in between. */
 export async function publishReport(S, me, opts = {}) {
-  const send = (facts, m, requestId) => api('/api/leaderboard/report', {
-    method: 'PUT',
-    body: JSON.stringify(buildReport(
+  const send = (facts, m, requestId) => {
+    const body = buildReport(
       { workouts: facts.workouts || [], activities: facts.activities || [] },
       { consentVersion: m.consentVersion, baseReportRev: m.reportRev, requestId, now: Date.now() }
-    ))
-  });
+    );
+    if (Number.isFinite(m.personalRev)) body.personalRev = m.personalRev;
+    return api('/api/leaderboard/report', { method: 'PUT', body: JSON.stringify(body) })
+      .then(out => ({ ...out, acceptedFingerprint: fingerprintOf(facts) }));
+  };
   try {
     return { ok: true, ...(await send(S, me, uid())) };
   } catch (e) {
-    const recoverable = e.status === 409 && (e.data?.error === 'report-stale' || e.data?.error === 'consent-stale');
+    const recoverable = e.status === 409 && (e.data?.error === 'report-stale' || e.data?.error === 'consent-stale' || e.data?.error === 'personal-stale');
     if (!recoverable) return { ok: false, error: e };
     // No source of merged facts, no retry: re-serializing the very facts that were just
     // refused is how a stale device overwrites a newer one's totals. The caller keeps the

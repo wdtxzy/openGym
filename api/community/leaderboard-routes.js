@@ -16,7 +16,7 @@ const LIKE_BUDGET = 30;      // per account per minute (PRD §15 governance numb
 const LIKE_IP_BUDGET = 120;  // per address per minute across accounts: the bounded anti-abuse
                              // budget the PRD asks for next to the account one (S06)
 
-export function leaderboardRoutes({ domain, json, readBody, readSession, requireAdmin, audit, auditAppendable, publicRead, addressOf }) {
+export function leaderboardRoutes({ domain, json, readBody, readSession, requireAdmin, audit, auditAppendable, personalRevOf, publicRead, addressOf }) {
   const likeBudget = createWindow({ max: LIKE_BUDGET, windowMs: 60000 });
   const ipBudget = createWindow({ max: LIKE_IP_BUDGET, windowMs: 60000 });
   const ipOf = req => (addressOf ? addressOf(req) : '') || 'unknown';
@@ -64,7 +64,9 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
     'GET /api/leaderboard/me': async (req, res) => {
       const user = signedIn(req, res); if (!user) return;
       try {
-        json(res, 200, domain.me(user.id));
+        // personalRev: the live personal-state revision the client must build its report
+        // against (G03); the server verifies the pairing at commit time.
+        json(res, 200, { ...domain.me(user.id), ...(personalRevOf ? { personalRev: personalRevOf(user.id) } : {}) });
       } catch (e) { return fail(res, e); } // a refused store answers 503, not a 500 (N10)
     },
 
