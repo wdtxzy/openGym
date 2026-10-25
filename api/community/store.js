@@ -46,6 +46,7 @@ function pidAlive(pid) {
 
 export function createSharedStore({ file, schemaVersion, init, writer = atomicWrite, now = Date.now }) {
   const lockFile = file + '.lock';
+  const commitMarker = file + '.committing';
   // Ownership is a random token, minted per store instance and written in the lock — never a
   // bare PID: two containers on one volume are both "pid 1" (N05). The hostname rides along so
   // liveness stays a same-host judgement; a foreign-host holder is honoured as live UNLESS its
@@ -125,6 +126,17 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   function lock() {
     if (refused) throw new StoreError(refused.code, refused.message); // settled: refuse with a clean error
     if (locked) return;
+    // A commit marker is the commit protocol's critical section (G01): fresh, the "dead"
+    // writer may simply be mid-commit — refuse. Silent past the stale window, it is debris
+    // from a crash between rename and cleanup, and the takeover may clear it.
+    try {
+      const markerAge = now() - fs.statSync(commitMarker).mtimeMs;
+      if (markerAge <= STALE_HOST_MS) throw new StoreError('second-writer', `${file}: a commit is in progress`);
+      fs.unlinkSync(commitMarker);
+    } catch (e) {
+      if (e instanceof StoreError) throw e;
+      if (e.code !== 'ENOENT') throw new StoreError('lock', e.message);
+    }
     try {
       claimLock();
       locked = true;
@@ -161,6 +173,15 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     // the lock is atomically MOVED to a private tombstone, and only what that captured —
     // still the judged holder's token, or still nothing — is discarded and claimed. Anything
     // else is put back and we refuse.
+    let markerFd = null;
+    try {
+      markerFd = fs.openSync(commitMarker, 'wx');
+      fs.closeSync(markerFd);
+      markerFd = null;
+    } catch (e) {
+      if (e.code === 'EEXIST') throw new StoreError('second-writer', `${file}: another commit is in progress`);
+      throw new StoreError('lock', e.message);
+    }
     const tomb = lockFile + '.take.' + crypto.randomBytes(6).toString('hex');
     let captured = null;
     try { fs.renameSync(lockFile, tomb); captured = readAt(tomb); }
@@ -171,6 +192,7 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     if (!safeToDiscard) {
       // What the tombstone captured is not what we judged: a contender owns the lock now.
       try { fs.renameSync(tomb, lockFile); } catch { try { fs.unlinkSync(tomb); } catch { /* gone */ } }
+      try { fs.unlinkSync(commitMarker); } catch { /* keep recovery honest */ }
       throw new StoreError('second-writer', `lost the takeover race for ${file}`);
     }
     try { fs.unlinkSync(tomb); } catch { /* already gone */ }
@@ -179,9 +201,11 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
       locked = true;
       beat();
     } catch (e) {
+      try { fs.unlinkSync(commitMarker); } catch { /* keep recovery honest */ }
       if (e.code === 'EEXIST') throw new StoreError('second-writer', `lost the takeover race for ${file}`);
       throw new StoreError('lock', e.message);
     }
+    try { fs.unlinkSync(commitMarker); } catch { /* keep recovery honest */ }
   }
 
   /** Graceful shutdown: release the lock so a recreated instance starts clean instead of
@@ -197,29 +221,57 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     } catch { /* nothing more we can do honestly */ }
   }
 
+  /* The commit protocol (G01): a lease check and the actual write are two steps, and a
+   * process paused between them used to come back and overwrite the writer that had properly
+   * taken over. Now the injectable writer only ever produces a PRIVATE temp file; the real
+   * file is reached through a commit marker that a takeover must honour:
+   *   writer(tmp) — no shared state touched, however long this takes
+   *   create <file>.committing (wx)      — only one committer at a time, anywhere
+   *   verify the lease still ours        — a recovered-over writer deposes here, writes nothing
+   *   rename(tmp → file)                 — the atomic commit
+   *   remove marker, refresh lease
+   * A takeover sees a fresh marker and refuses (the "dead" writer is mid-commit); a marker
+   * silent past the stale window is crash debris and is removed. */
   function persist(draft) {
-    // F01: the commit point proves the lease. A writer whose lease was recovered while it was
-    // paused must fail HERE — before any byte of the shared file moves — not overwrite the
-    // new owner's data. (Deposition is usually noticed by the conditional heartbeat first;
-    // this is the backstop that makes 'locked' mean 'allowed to commit'.)
     if (!locked || deposed) throw new StoreError('lost-lock', `${file}: not the lease owner`);
-    if (!iOwn(readLock())) {
-      deposed = true;
-      locked = false;
-      refused = new StoreError('lost-lock', `${file}: another writer owns the lease now`);
-      if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
-      throw refused;
-    }
+    const tmpData = `${file}.commit.${crypto.randomBytes(6).toString('hex')}`;
     try {
-      writer(file, JSON.stringify(draft, null, 2) + '\n', 0o600);
-      knownMtime = fs.statSync(file).mtimeMs;
-      refreshLease(); // a long write must not look abandoned, and a lost lease surfaces now
+      writer(tmpData, JSON.stringify(draft, null, 2) + '\n', 0o600);
     } catch (e) {
-      if (e instanceof StoreError) throw e;
-      // atomicWrite leaves the previous file in place on any failure, so the cache still
-      // matches what is on disk; the caller's transaction simply did not happen.
+      try { fs.unlinkSync(tmpData); } catch { /* never got written */ }
       throw new StoreError('write-failed', e.message);
     }
+    let markerFd = null;
+    try {
+      markerFd = fs.openSync(commitMarker, 'wx');
+      fs.writeSync(markerFd, JSON.stringify({ pid: process.pid, host: myHost, token: myToken, at: now() }));
+      fs.closeSync(markerFd);
+      markerFd = null;
+    } catch (e) {
+      try { fs.closeSync(markerFd); } catch { /* not open */ }
+      markerFd = null;
+      try { fs.unlinkSync(tmpData); } catch { /* keep the disk honest */ }
+      if (e.code === 'EEXIST') throw new StoreError('second-writer', `${file}: another commit is in progress`);
+      throw new StoreError('write-failed', e.message);
+    }
+    try {
+      if (!iOwn(readLock())) {
+        deposed = true;
+        locked = false;
+        refused = new StoreError('lost-lock', `${file}: another writer owns the lease now`);
+        if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+        throw refused;
+      }
+      fs.renameSync(tmpData, file);
+      knownMtime = fs.statSync(file).mtimeMs;
+    } catch (e) {
+      try { fs.unlinkSync(tmpData); } catch { /* already renamed or never written */ }
+      try { fs.unlinkSync(commitMarker); } catch { /* keep recovery honest */ }
+      if (e instanceof StoreError) throw e;
+      throw new StoreError('write-failed', e.message);
+    }
+    try { fs.unlinkSync(commitMarker); } catch { /* a crash here leaves recoverable debris */ }
+    refreshLease(); // a long commit must not look abandoned, and a lost lease surfaces now
   }
 
   function load() {

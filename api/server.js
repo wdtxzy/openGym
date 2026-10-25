@@ -873,6 +873,19 @@ function clientIp(req) {
   return g ? g + '::/48' : null;
 }
 
+// F10: the runtime identity a rate-limit budget counts a request BY is not the audit record.
+// Audit storage may be off (AUDIT_IP=off stores nothing) without collapsing every client into
+// one shared bucket — so budgets resolve the peer from the same header chain, unmasked and
+// never persisted, falling back to the socket peer when nothing trustworthy is in front.
+function peerOf(req) {
+  const raw = String(req.headers['cf-connecting-ip'] || '').trim()
+    || String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+    || String(req.headers['x-real-ip'] || '').trim()
+    || String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '').trim();
+  const ip = raw.replace(/^\[|\]$/g, '').slice(0, 45);
+  return /^[0-9a-fA-F:.]{3,45}$/.test(ip) ? ip : 'unknown';
+}
+
 function auditLines() {
   let text;
   try { text = fs.readFileSync(auditFile, 'utf8'); } catch { return []; }
@@ -2706,9 +2719,9 @@ const routes = {
   ...(LEADERBOARD ? leaderboardRoutes({
     domain: leaderboardDomain, json, readBody, readSession, requireAdmin, audit, auditAppendable,
     publicRead: LEADERBOARD_PUBLIC_READ,
-    // The like budget's address half: the same client-IP reading the audit log uses, so a
-    // proxy that overwrites the header is honored and a direct peer counts as itself.
-    addressOf: req => clientIp(req) || ''
+    // The like budget's address half: the runtime PEER (F10), not the audit record — with
+    // AUDIT_IP=off the audit stores nothing, and the budget still counts clients apart.
+    addressOf: req => peerOf(req)
   }) : {}),
 
   /* ---------- photos & videos ---------- */
