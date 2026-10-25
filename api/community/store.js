@@ -47,23 +47,44 @@ function pidAlive(pid) {
 export function createSharedStore({ file, schemaVersion, init, writer = atomicWrite, now = Date.now }) {
   const lockFile = file + '.lock';
   // Ownership is a random token, minted per store instance and written in the lock — never a
-  // bare PID: two containers on one volume are both "pid 1", and a pid alone cannot tell them
-  // apart (N05). The hostname rides along so liveness stays a same-host judgement: a lock from
-  // another host/container namespace can never be proven dead, so it is honoured as live.
+  // bare PID: two containers on one volume are both "pid 1" (N05). The hostname rides along so
+  // liveness stays a same-host judgement; a foreign-host holder is honoured as live UNLESS its
+  // heartbeat went silent past STALE_HOST_MS — the cross-container recovery path for a crash
+  // or a `docker rm` that no signal could clean up after (T04). A graceful stop releases the
+  // lock outright (release(), wired to SIGTERM in server.js), so a normal recreate needs no
+  // window at all.
   const myToken = crypto.randomBytes(16).toString('hex');
   const myHost = os.hostname();
+  const HEARTBEAT_MS = 1000;
+  const STALE_HOST_MS = 15000;
   const readLock = () => {
     try { return JSON.parse(fs.readFileSync(lockFile, 'utf8')); } catch { return null; }
   };
   const readAt = f => {
     try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; }
   };
+  const lockBody = () => JSON.stringify({ pid: process.pid, host: myHost, token: myToken, at: now() });
   const claimLock = () => {
     const fd = fs.openSync(lockFile, 'wx');
-    try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, host: myHost, token: myToken })); fs.fsyncSync(fd); }
+    try { fs.writeSync(fd, lockBody()); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
   };
   const iOwn = holder => holder && holder.token === myToken;
+  // While we hold the lock, keep its `at` fresh so a recreated peer can tell a live holder
+  // from a crashed one (T04). One timer per store, only once locked, best-effort — and every
+  // successful persist refreshes it too, so a long write cannot look abandoned mid-flight.
+  let heartbeat = null;
+  const touchLock = () => {
+    try { fs.writeFileSync(lockFile, lockBody()); } catch { /* a hand we will notice elsewhere */ }
+  };
+  const beat = () => {
+    if (heartbeat || !locked) return;
+    heartbeat = setInterval(() => {
+      if (!locked) { clearInterval(heartbeat); heartbeat = null; return; }
+      touchLock();
+    }, HEARTBEAT_MS);
+    heartbeat.unref?.();
+  };
 
   let data = null;        // the parsed cache; null until the first successful load
   let refused = null;     // a StoreError once the file proved unusable — sticky until restart
@@ -80,37 +101,41 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     try {
       claimLock();
       locked = true;
+      beat();
       return;
     } catch (e) {
       if (e.code !== 'EEXIST') throw new StoreError('lock', e.message);
     }
     let holder = readLock();
-    if (iOwn(holder)) { locked = true; return; }               // our own, from this store
+    if (iOwn(holder)) { locked = true; beat(); return; }       // our own, from this store
     const judge = h => {
       if (!h || !h.token) return 'gone';                      // unreadable/garbage: free to try
-      if (h.host !== myHost) return 'foreign-host';           // unverifiable: honour as live (N05)
+      if (h.host !== myHost) {
+        // Cross-container: live while the heartbeat is fresh; silent past STALE_HOST_MS, the
+        // holder crashed without a signal and a recreated instance may recover the file (T04).
+        const age = typeof h.at === 'number' ? now() - h.at : Infinity;
+        return age <= STALE_HOST_MS ? 'foreign-host' : 'foreign-stale';
+      }
       if (h.pid === process.pid) return 'same-pid';           // provably THIS process: may take over
       return pidAlive(h.pid) ? 'live' : 'dead';
     };
     const verdict = judge(holder);
     if (verdict === 'live' || verdict === 'foreign-host')
       throw new StoreError('second-writer', `${verdict} holder (${JSON.stringify(holder)}) owns ${file}`);
-    // Stale on our host. The takeover is capture-verify-discard, never a blind delete: the
-    // lock is atomically MOVED to a private tombstone (rename), and only if what the tombstone
-    // captured is still the exact holder we judged dead does it get discarded and claimed. A
-    // contender that replaced the lock in the meantime lands in the tombstone instead, is put
-    // back, and we refuse — no live owner is ever unseated (N05).
-    const before = readLock();
+    // Stale. The takeover is capture-verify-discard against THE HOLDER WE JUDGED (the first
+    // read) — never against a fresher re-read, which a live contender could already own (T03):
+    // the lock is atomically MOVED to a private tombstone, and only what that captured —
+    // still the judged holder's token, or still nothing — is discarded and claimed. Anything
+    // else is put back and we refuse.
     const tomb = lockFile + '.take.' + crypto.randomBytes(6).toString('hex');
     let captured = null;
     try { fs.renameSync(lockFile, tomb); captured = readAt(tomb); }
     catch (e) { if (e.code !== 'ENOENT') throw new StoreError('lock', e.message); }
-    // Only a captured OBJECT with a token is an owner; anything else (absent, unparseable, or
-    // plain garbage like a bare number that still parses as JSON) is what we judged 'gone'.
-    const contender = (captured && typeof captured === 'object' && captured.token) ? captured : null;
-    if (contender && (!before || !before.token || contender.token !== before.token)) {
-      // What we captured is not the stale holder: a live contender owns the lock now. Put it
-      // back exactly as it was and walk away.
+    const judgedToken = holder && typeof holder === 'object' && holder.token ? holder.token : null;
+    const capturedToken = captured && typeof captured === 'object' && captured.token ? captured.token : null;
+    const safeToDiscard = judgedToken ? capturedToken === judgedToken : !capturedToken;
+    if (!safeToDiscard) {
+      // What the tombstone captured is not what we judged: a contender owns the lock now.
       try { fs.renameSync(tomb, lockFile); } catch { try { fs.unlinkSync(tomb); } catch { /* gone */ } }
       throw new StoreError('second-writer', `lost the takeover race for ${file}`);
     }
@@ -118,16 +143,31 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     try {
       claimLock();
       locked = true;
+      beat();
     } catch (e) {
       if (e.code === 'EEXIST') throw new StoreError('second-writer', `lost the takeover race for ${file}`);
       throw new StoreError('lock', e.message);
     }
   }
 
+  /** Graceful shutdown: release the lock so a recreated instance starts clean instead of
+   *  waiting out the heartbeat window (T04). Best-effort — a crash leaves the stale-heartbeat
+   *  path as the fallback. */
+  function release() {
+    if (!locked) return;
+    locked = false;
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    try {
+      const holder = readLock();
+      if (iOwn(holder)) fs.unlinkSync(lockFile);
+    } catch { /* nothing more we can do honestly */ }
+  }
+
   function persist(draft) {
     try {
       writer(file, JSON.stringify(draft, null, 2) + '\n', 0o600);
       knownMtime = fs.statSync(file).mtimeMs;
+      if (locked) touchLock(); // a long write must not look like an abandoned holder (T04)
     } catch (e) {
       // atomicWrite leaves the previous file in place on any failure, so the cache still
       // matches what is on disk; the caller's transaction simply did not happen.
@@ -183,6 +223,15 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   }
 
   return {
+    /** Graceful shutdown: hand the lock back so a recreated instance starts clean (T04). */
+    release,
+
+    /** Cheap liveness for a deploy probe: false once the store refused (second writer,
+     *  damaged file) — the container is up but this feature is not. */
+    healthy() {
+      return !refused && data != null;
+    },
+
     /** The live cached object, NOT copied — for read-only request paths over a large shared
      *  file (board reads), where cloning every like on every GET is the difference between
      *  milliseconds and the load-test timeouts (N07). Callers must not mutate it; anything

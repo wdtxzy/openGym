@@ -297,6 +297,9 @@ function LeaderboardAdmin() {
             {m.suspended ? <span style={{ color: 'var(--red)' }}> · {t('suspended')}</span> : null}
             {!m.enabled ? <span className="muted"> · {t('left')}</span> : null}
           </div>
+          {/* Two members can share one alias: the account id is what an operator can actually
+              tell apart, so it rides along on every row (S05's identity-mapping tail). */}
+          <div className="muted" style={{ fontSize: 11, fontVariantNumeric: 'tabular-nums' }}>{m.uid}</div>
           {m.suspended && m.suspendedReason ? <div className="muted" style={{ fontSize: 11 }}>“{m.suspendedReason}”</div> : null}
         </div>
         {m.suspended

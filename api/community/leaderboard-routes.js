@@ -16,7 +16,7 @@ const LIKE_BUDGET = 30;      // per account per minute (PRD §15 governance numb
 const LIKE_IP_BUDGET = 120;  // per address per minute across accounts: the bounded anti-abuse
                              // budget the PRD asks for next to the account one (S06)
 
-export function leaderboardRoutes({ domain, json, readBody, readSession, requireAdmin, audit, publicRead, addressOf }) {
+export function leaderboardRoutes({ domain, json, readBody, readSession, requireAdmin, audit, auditAppendable, publicRead, addressOf }) {
   const likeBudget = createWindow({ max: LIKE_BUDGET, windowMs: 60000 });
   const ipBudget = createWindow({ max: LIKE_IP_BUDGET, windowMs: 60000 });
   const ipOf = req => (addressOf ? addressOf(req) : '') || 'unknown';
@@ -133,6 +133,12 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
     'PUT /api/admin/leaderboard/member-status': async (req, res) => {
       const admin = requireAdmin(req, res); if (!admin) return;
       const body = await readBody(req);
+      // Pre-flight (T08): a governance action that cannot be audited durably — neither the
+      // log nor the outbox accepts a write — is refused BEFORE it is applied, rather than
+      // succeeding with no recoverable record of itself.
+      if (auditAppendable && !auditAppendable()) {
+        return json(res, 503, { error: 'the audit log cannot be written; fix it and retry', code: 'audit-unavailable' });
+      }
       try {
         const out = await domain.adminStatus({
           actorUid: admin.id, targetUid: body.targetUid,

@@ -935,6 +935,15 @@ function scheduleAuditRetry() {
   }, 50);
   auditRetryTimer.unref?.();
 }
+/** Can an audit record be durably placed at all right now — the log, or the outbox that
+ *  replays into it? Used as a pre-flight by the routes whose action MUST be auditable: when
+ *  neither path accepts a write, the operation is refused before it is applied instead of
+ *  succeeding with no recoverable record of itself (T08). */
+function auditAppendable() {
+  try { fs.appendFileSync(auditFile, ''); return true; } catch { /* the log refuses */ }
+  try { fs.appendFileSync(auditOutbox, ''); return true; } catch { /* the outbox refuses too */ }
+  return false;
+}
 function audit(req, ev, f = {}) {
   if (!AUDIT_ON) return;
   const rec = { id: ++auditSeq, ts: Date.now(), ev, ok: f.ok !== false };
@@ -955,17 +964,41 @@ function audit(req, ev, f = {}) {
   flushAuditOutbox();
   if (!auditAppend(line)) {
     try { fs.appendFileSync(auditOutbox, line + '\n'); }
-    catch (e2) { return console.error('audit write failed and the outbox refused too:', e2.message); }
+    catch (e2) {
+      console.error('audit write failed and the outbox refused too:', e2.message);
+      return false; // NOT durably recorded — callers that must be auditable check this (T08)
+    }
     scheduleAuditRetry();
-    return console.error('audit write failed — record held in the outbox for replay');
+    console.error('audit write failed — record held in the outbox for replay');
+    return true; // durable in the outbox; the retry loop delivers it
   }
   // Amortized: a 5000-event cap rewrites the file once per ~1250 events.
   if (AUDIT_MAX && ++auditCount > AUDIT_MAX * 1.25) compactAudit();
+  return true;
 }
 if (AUDIT_ON) {
+  // Records stranded in the outbox by a previous life come back first: their ids join the
+  // sequence BEFORE anything new is numbered (a restart used to reissue a stranded id, and the
+  // same log ended up with two id=41s — T07), and the flush itself puts them back in order.
+  try {
+    for (const line of fs.readFileSync(auditOutbox, 'utf8').split('\n').filter(Boolean)) {
+      try { const r = JSON.parse(line); if (+r.id > auditSeq) auditSeq = +r.id; } catch { /* a torn line */ }
+    }
+  } catch { /* no outbox */ }
   compactAudit();                                // prune on boot, seed auditSeq/auditCount
+  flushAuditOutbox();
   setInterval(compactAudit, 3600000).unref();    // honour AUDIT_DAYS on an idle instance too
 }
+
+// A graceful stop hands the shared-file lock back, so a recreated container starts clean
+// instead of waiting out the stale-heartbeat window (T04). A crash (SIGKILL, power) skips
+// this — that is what the heartbeat staleness path recovers from.
+const stopCleanly = () => {
+  try { leaderboardStore.release(); } catch { /* best effort */ }
+  process.exit(0);
+};
+process.on('SIGTERM', stopCleanly);
+process.on('SIGINT', stopCleanly);
 
 /* ---------- sign-in throttle ---------- */
 // The password routes are counted (rate-limit.js) — only on an instance with PASSWORD_LOGIN on,
@@ -1979,7 +2012,11 @@ const routes = {
   // what "unhealthy" is for. The 200 keeps the shape it had, plus the flag it is now asserting.
   'GET /api/health': async (req, res) => {
     if (!dataWritable()) return json(res, 503, { ok: false, writable: false });
-    json(res, 200, { ok: true, users: db.users.length, writable: true });
+    // With the leaderboard on, its store's state rides along: a container that lost the
+    // shared-file lock (a peer is live, or a stale lock not yet recovered past the heartbeat
+    // window) is up but the feature is not — the probe an operator needs before calling a
+    // recreate done (T04).
+    json(res, 200, { ok: true, users: db.users.length, writable: true, ...(LEADERBOARD ? { leaderboard: leaderboardStore.healthy() } : {}) });
   },
 
   // Public config the login screen needs before anyone is signed in. `coach` is absent unless
@@ -2667,7 +2704,7 @@ const routes = {
   // Only when the instance switched the leaderboard on: an off instance has none of these
   // routes, and unanswered is a plain 404 — no entry point, no information leak (LB-01).
   ...(LEADERBOARD ? leaderboardRoutes({
-    domain: leaderboardDomain, json, readBody, readSession, requireAdmin, audit,
+    domain: leaderboardDomain, json, readBody, readSession, requireAdmin, audit, auditAppendable,
     publicRead: LEADERBOARD_PUBLIC_READ,
     // The like budget's address half: the same client-IP reading the audit log uses, so a
     // proxy that overwrites the header is honored and a direct peer counts as itself.

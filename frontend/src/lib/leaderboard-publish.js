@@ -57,36 +57,48 @@ export function fingerprintOf(S) {
   return JSON.stringify([w, a])
 }
 
-/* ---------- the withdrawal mark (N09): per instance AND account, survives reloads ---------- */
+/* ---------- the withdrawal mark: per real server base AND account, survives reloads ---------- */
 
-// The instance is where the app is served from / paired to — a copied or migrated instance can
-// legitimately hold the same uids, so the origin (or the phone's paired base) belongs in the key.
-const instanceOf = () => {
-  try { return typeof location !== 'undefined' && location.origin ? location.origin : 'local' }
-  catch { return 'local' }
-}
-const withdrawKey = (uid, instance) => `lb-withdraw:${instance || instanceOf()}:${uid}`
-const withdrawPendingFor = uid => {
-  try { return !!uid && !!localStorage.getItem(withdrawKey(uid)) } catch { return false }
-}
-const markWithdraw = (uid, instance) => { try { localStorage.setItem(withdrawKey(uid, instance), '1') } catch { /* private mode */ } }
-const clearWithdraw = (uid, instance) => { try { localStorage.removeItem(withdrawKey(uid, instance)) } catch { /* private mode */ } }
+// The instance is where requests actually go: the phone's paired base, or the page's own
+// origin — same WebView origin hosts every pairing, and an origin alone cannot tell two
+// paired servers apart (T05). The store keeps the live answer in sync.server.
+const instanceOf = st => (st?.sync?.server) || (typeof location !== 'undefined' && location.origin) || 'local';
+const withdrawKey = (uid, instance) => `lb-withdraw:${instance}:${uid}`;
+// The previous release kept `lb-withdraw:<uid>` with no instance. An old mark is neither
+// dropped nor blindly replayed against a different server (T06): it blocks publishing and is
+// resolved the moment a leave lands or clearly has nothing to leave here.
+const legacyWithdrawKey = uid => `lb-withdraw:${uid}`;
+const withdrawPendingFor = (uid, instance) => {
+  try {
+    if (!uid) return false;
+    if (localStorage.getItem(withdrawKey(uid, instance))) return true;
+    return localStorage.getItem(legacyWithdrawKey(uid)) !== null;
+  } catch { return false }
+};
+const markWithdraw = (uid, instance) => { try { localStorage.setItem(withdrawKey(uid, instance), '1') } catch { /* private mode */ } };
+const clearWithdraw = (uid, instance) => {
+  try {
+    localStorage.removeItem(withdrawKey(uid, instance));
+    localStorage.removeItem(legacyWithdrawKey(uid)); // resolved once, in whichever format
+  } catch { /* private mode */ }
+};
 
-/** Withdraw with the offline guarantee: the intent is persisted first (for THIS account and
- *  instance) and blocks publishing immediately; the coordinator retries the server call until
+/** Withdraw with the offline guarantee: the intent is persisted first (for THIS account on
+ *  THIS server) and blocks publishing immediately; the coordinator retries the server call until
  *  it confirms. A late answer clears only the mark this call wrote (N09). */
 export async function requestLeave(me) {
-  const uid = useStore.getState().user?.id
-  const instance = instanceOf()
-  if (!uid) return { ok: false, error: new Error('not signed in') }
-  markWithdraw(uid, instance)
-  status.withdrawPending = true
-  emit()
+  const st = useStore.getState();
+  const uid = st.user?.id;
+  const instance = instanceOf(st);
+  if (!uid) return { ok: false, error: new Error('not signed in') };
+  markWithdraw(uid, instance);
+  status.withdrawPending = true;
+  emit();
   try {
     await leaveLeaderboard(me)
     // The captured account's mark goes, whoever is signed in NOW: the leave succeeded for
     // that account on that instance, and the mark belongs to it, not to the session (N09).
-    clearWithdraw(uid, instance)
+    clearWithdraw(uid, instance);
     if (useStore.getState().user?.id !== uid) return { ok: true, note: 'account switched' }
     status.withdrawPending = false
     meCache = null
@@ -109,6 +121,22 @@ async function me(force = false) {
 /** Forget the cached member state (after a join, a re-confirm, an admin action). */
 export function invalidateMe() { meCache = null }
 
+/* ---------- session identity (T02): uid + REAL server base, and a generation that only
+ * ---------- ever moves forward. A task captures both; any switch — sign-out, A→B, B→A, the
+ * ---------- same uid onto another paired server — bumps the generation and orphans it. */
+
+let sessionGen = 0;
+let seenSessionKey = null;
+const sessionKeyOf = st => `${st.user?.id || ''}|${instanceOf(st)}`;
+
+/* ---------- the this-session merge credential (T01): a healthy sync.status can be a value
+ * ---------- restored from storage at boot, before this session's /api/data has answered.
+ * lastSynced only moves when a real exchange CONFIRMED in this page's lifetime, so publishing
+ * waits until the coordinator has SEEN it move (from the baseline captured at start). */
+
+let baselineSyncedAt = 0;
+let sessionSyncedAt = 0;
+
 async function runPublish() {
   if (publishing) { rerun = true; return }   // N08: what changed mid-flight runs next
   publishing = true
@@ -117,13 +145,23 @@ async function runPublish() {
     const start = useStore.getState()
     const uid = start.user?.id
     if (!uid || !start.config?.leaderboard) return
-    const instance = instanceOf()
-    // N04: everything below belongs to this account on this instance; any await may come back
-    // after a sign-out/sign-in, so the binding is re-checked before acting on an answer.
-    const stillUs = () => useStore.getState().user?.id === uid
+    const instance = instanceOf(start)
+    const sessionKey = sessionKeyOf(start)
+    const gen = sessionGen
+    // T04/T02: everything below belongs to this account, on this server, in this session
+    // stretch; any await may come back after a switch, so the binding is re-checked before
+    // anything is acted on.
+    const stillUs = () => {
+      const st = useStore.getState()
+      return sessionKeyOf(st) === sessionKey && sessionGen === gen
+    }
+    const healthy = () => {
+      const st = useStore.getState()
+      return st.sync?.status === 'ok'
+    }
 
     // A withdrawal waiting on the network goes first, and blocks publishing meanwhile.
-    if (withdrawPendingFor(uid)) {
+    if (withdrawPendingFor(uid, instance)) {
       const m = await me(true)
       if (!stillUs()) return
       if (!m?.enabled) { clearWithdraw(uid, instance); status.withdrawPending = false; emit(); return }
@@ -138,17 +176,19 @@ async function runPublish() {
       return
     }
 
-    // N03: publish only from a healthy personal sync. 'offline'/'error' publish nothing; the
-    // 'held' state (this copy still waiting to be adopted into an account) publishes nothing —
-    // facts of no certain ownership never leave the device. All of it stays pending.
-    const sync = useStore.getState().sync
-    if (!sync || sync.status !== 'ok') return
+    // T01: no publish until THIS session has completed a personal merge — the baseline was
+    // captured at start, and only a real confirmed exchange since then moves lastSynced.
+    if (!sessionSyncedAt) return
+    // N03: publish only from a healthy personal sync — and healthy NOW, not just at capture.
+    if (!healthy()) return
 
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return // stays pending; 'online' retries
     const m = await me()
-    if (!stillUs()) return
-    if (!m?.enabled || m.suspended) return
-    if (m.disclosureVersion !== m.currentDisclosureVersion) return // needs re-confirmation first (R12)
+    if (!stillUs() || !healthy()) return
+    // Terminal gates below are owed NOTHING: a member who is out, suspended, or unconfirmed
+    // is blocked on a person's decision, not on a retry — pending comes back off.
+    if (!m?.enabled || m.suspended) { setPending(false); return }
+    if (m.disclosureVersion !== m.currentDisclosureVersion) { setPending(false); return } // R12
     // A fresh join, or a rejoin after a withdrawal: the server holds nothing (reportRev 0),
     // so whatever fingerprint this device remembers is meaningless — publish everything.
     if (!m.reportRev) lastPublished = ''
@@ -161,15 +201,15 @@ async function runPublish() {
       pull: async () => {
         try { await useStore.getState().pullState() } catch { return false }
         const st = useStore.getState()
-        return st.user?.id === uid && st.sync?.status === 'ok'
+        return sessionKeyOf(st) === sessionKey && sessionGen === gen && st.sync?.status === 'ok'
       },
-      // N04: the retry's facts come from the store only if it is still the same account.
+      // N04: the retry's facts come from the store only if it is still the same session.
       stateOf: () => {
         const st = useStore.getState()
-        return st.user?.id === uid ? st.S : null
+        return sessionKeyOf(st) === sessionKey && sessionGen === gen ? st.S : null
       }
     })
-    if (!stillUs()) return // the answer belongs to a previous session: nothing is recorded
+    if (!stillUs() || !healthy()) return // the answer belongs to a previous session: nothing is recorded
     if (r.ok) {
       lastPublished = fingerprint
       ok() // re-derives pending from the live facts (N08)
@@ -197,28 +237,47 @@ const schedule = () => {
 export function startPublishing() {
   if (started || typeof window === 'undefined') return
   started = true
+  // The merge baseline is whatever storage restored — a value from BEFORE this page loaded
+  // proves nothing about this session's sync (T01).
+  baselineSyncedAt = useStore.getState().sync?.lastSynced ?? 0
+  // Prime the session registry with the CURRENT session before the first pass, so the boot
+  // pass and the subscribers agree on the generation instead of the first fire invalidating it.
+  seenSessionKey = sessionKeyOf(useStore.getState())
+  useStore.subscribe(() => {
+    const st = useStore.getState()
+    // A real confirmed exchange this session: lastSynced moved off the boot baseline.
+    const synced = st.sync?.lastSynced
+    if (typeof synced === 'number' && synced !== baselineSyncedAt && synced !== sessionSyncedAt) {
+      sessionSyncedAt = synced
+    }
+  })
+  useStore.subscribe(() => {
+    const st = useStore.getState()
+    // Any session change — user, server, sign-out and back — bumps the generation: the old
+    // one's in-flight tasks die on their next stillUs() (T02), and nothing of the previous
+    // session's memory (member cache, published fingerprint) carries over.
+    const key = sessionKeyOf(st)
+    if (key !== seenSessionKey) {
+      const first = seenSessionKey === null
+      seenSessionKey = key
+      sessionGen++
+      lastPublished = ''
+      meCache = null
+      status.withdrawPending = withdrawPendingFor(st.user?.id, instanceOf(st))
+      setPending(false)
+      if (!first) schedule() // the new session deserves a fresh pass once it syncs
+    }
+  })
   useStore.subscribe(() => {
     const { user, S } = useStore.getState()
     if (!user || !S) return
-    const sync = useStore.getState().sync
-    if (sync?.status && sync.status !== 'ok') return // nothing to publish while unhealthy (N03)
-    if (fingerprintOf(S) === lastPublished && !withdrawPendingFor(user.id)) return
+    const st = useStore.getState()
+    if (st.sync?.status && st.sync.status !== 'ok') return // nothing to publish while unhealthy (N03)
+    if (!sessionSyncedAt) return                            // nor before this session's merge (T01)
+    if (fingerprintOf(S) === lastPublished && !withdrawPendingFor(user.id, instanceOf(st))) return
     schedule()
   })
   window.addEventListener('online', () => { if (status.pending) runPublish() })
-  // A sign-in/instance switch must not carry another account's published fingerprint or marks.
-  let seenKey = null
-  useStore.subscribe(() => {
-    const st = useStore.getState()
-    const key = (st.user?.id || '') + '@' + instanceOf()
-    if (key !== seenKey) {
-      seenKey = key
-      lastPublished = ''
-      meCache = null
-      status.withdrawPending = withdrawPendingFor(st.user?.id)
-      setPending(false)
-    }
-  })
   runPublish()
 }
 

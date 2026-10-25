@@ -138,10 +138,29 @@ test('a foreign live PID in the lock is refused; a dead one is taken over', asyn
 test('a lock from another host (a sibling container on one volume) is honoured as live', async () => {
   const file = path.join(dir(), 'shared.json');
   // Two containers on one volume are both pid 1: a bare pid cannot tell them apart (N05) —
-  // the hostname is what makes the second writer refuse.
-  fs.writeFileSync(file + '.lock', JSON.stringify({ pid: process.pid, host: 'other-container', token: 't' }));
+  // the hostname is what makes the second writer refuse. A FRESH heartbeat says the peer is
+  // alive; only a silent one (crash/recreate) opens the recovery path (T04).
+  fs.writeFileSync(file + '.lock', JSON.stringify({ pid: process.pid, host: 'other-container', token: 't', at: Date.now() }));
   const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   assert.equal(s.warmup().code, 'second-writer');
+});
+
+test('a foreign-host lock whose heartbeat went silent is recovered (crash / rm, no signal)', () => {
+  const file = path.join(dir(), 'shared.json');
+  fs.writeFileSync(file + '.lock', JSON.stringify({ pid: 1, host: 'gone-container', token: 't', at: Date.now() - 60000 }));
+  const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  assert.equal(s.warmup().ok, true, 'a peer silent past the window no longer blocks the feature');
+  assert.equal(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')).host, os.hostname());
+});
+
+test('release() hands the lock back, so a recreated instance starts clean', async () => {
+  const file = path.join(dir(), 'shared.json');
+  const first = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  assert.equal(first.warmup().ok, true);
+  first.release();
+  assert.equal(fs.existsSync(file + '.lock'), false);
+  const second = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  assert.equal(second.warmup().ok, true);
 });
 
 test('a lock that is not readable at all is stale garbage, taken over', () => {
