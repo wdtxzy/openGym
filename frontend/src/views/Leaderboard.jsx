@@ -22,7 +22,7 @@ import { fmtDur } from '../lib/format.js'
 import { Button } from '../components/ui.jsx'
 import Icon from '../components/Icon.jsx'
 import { fetchBoard, fetchMe, joinLeaderboard, saveProfile, setCheer } from '../lib/leaderboard-client.js'
-import { invalidateMe, onPublishStatus, publishStatus, requestLeave, retryNow } from '../lib/leaderboard-publish.js'
+import { invalidateMe, onPublishStatus, publishStatus, requestLeave, resolveAmbiguousWithdraw, retryNow } from '../lib/leaderboard-publish.js'
 const toast = m => useUI.getState().toast(m)
 const WINDOWS = [['week', 'Week'], ['month', 'Month'], ['all', 'All']]
 const EMOJIS = ['💪', '🏋️', '🔥', '⚡', '🏃', '🚴', '🏅', '🧘']
@@ -154,7 +154,20 @@ export default function Leaderboard() {
       <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>{String(pub.lastError).slice(0, 160)}</div>
       <div className="row" style={{ gap: 8, marginTop: 8 }}><Button size="sm" onClick={retryNow}>{t('Retry')}</Button></div>
     </div>}
-    {user && me?.enabled && pub.withdrawPending && <div className="card" role="status">
+    {/* G05: an ambiguous historical withdrawal waits for the person — the network cannot
+        resolve whose server the old intent belonged to, so the card asks, and neither choice
+        is made silently. */}
+    {user && pub.withdrawAmbiguous && <div className="card" role="alert" style={{ borderColor: 'var(--danger, #c33)' }}>
+      <h2 style={{ margin: 0 }}>{t('A saved leave-the-leaderboard request needs your confirmation')}</h2>
+      <div className="muted small" style={{ marginTop: 4 }}>
+        {t('An older version of the app saved a leave request without saying which server it was for. Until you decide, nothing is published and nothing is withdrawn.')}
+      </div>
+      <div className="row" style={{ gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+        <Button size="sm" disabled={busy} onClick={async () => { setBusy(true); await resolveAmbiguousWithdraw('leave', me || undefined); setBusy(false) }}>{t('It was for this server — leave it')}</Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={async () => { setBusy(true); await resolveAmbiguousWithdraw('discard'); setBusy(false) }}>{t('It was for another server — discard it')}</Button>
+      </div>
+    </div>}
+    {user && me?.enabled && pub.withdrawPending && !pub.withdrawAmbiguous && <div className="card" role="status">
       <div className="small">{t('Saved. We will finish leaving the leaderboard when you are online.')}</div>
     </div>}
 

@@ -126,13 +126,23 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   function lock() {
     if (refused) throw new StoreError(refused.code, refused.message); // settled: refuse with a clean error
     if (locked) return;
-    // A commit marker is the commit protocol's critical section (G01): fresh, the "dead"
-    // writer may simply be mid-commit — refuse. Silent past the stale window, it is debris
-    // from a crash between rename and cleanup, and the takeover may clear it.
+    // A commit marker is the commit protocol's critical section (G01): fresh, the writer
+    // that owns it may simply be mid-commit — refuse while that writer's LEASE is alive.
+    // A fresh marker over a dead/gone lease is crash debris between the data rename and the
+    // marker cleanup: the commit itself is already atomic (rename), so clearing the marker
+    // and proceeding with the normal takeover loses nothing.
     try {
       const markerAge = now() - fs.statSync(commitMarker).mtimeMs;
-      if (markerAge <= STALE_HOST_MS) throw new StoreError('second-writer', `${file}: a commit is in progress`);
-      fs.unlinkSync(commitMarker);
+      if (markerAge <= STALE_HOST_MS) {
+        const holder = readLock();
+        const leaseAlive = holder && holder.token && (holder.host !== myHost
+          ? (typeof holder.at === 'number' && now() - holder.at <= STALE_HOST_MS)
+          : (holder.pid === process.pid || pidAlive(holder.pid)));
+        if (leaseAlive) throw new StoreError('second-writer', `${file}: a commit is in progress`);
+        fs.unlinkSync(commitMarker);
+      } else {
+        fs.unlinkSync(commitMarker);
+      }
     } catch (e) {
       if (e instanceof StoreError) throw e;
       if (e.code !== 'ENOENT') throw new StoreError('lock', e.message);

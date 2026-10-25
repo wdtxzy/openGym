@@ -16,7 +16,7 @@ const LIKE_BUDGET = 30;      // per account per minute (PRD §15 governance numb
 const LIKE_IP_BUDGET = 120;  // per address per minute across accounts: the bounded anti-abuse
                              // budget the PRD asks for next to the account one (S06)
 
-export function leaderboardRoutes({ domain, json, readBody, readSession, requireAdmin, audit, auditAppendable, personalRevOf, publicRead, addressOf }) {
+export function leaderboardRoutes({ domain, json, readBody, readSession, requireAdmin, audit, personalRevOf, deliverAudits, publicRead, addressOf }) {
   const likeBudget = createWindow({ max: LIKE_BUDGET, windowMs: 60000 });
   const ipBudget = createWindow({ max: LIKE_IP_BUDGET, windowMs: 60000 });
   const ipOf = req => (addressOf ? addressOf(req) : '') || 'unknown';
@@ -135,12 +135,9 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
     'PUT /api/admin/leaderboard/member-status': async (req, res) => {
       const admin = requireAdmin(req, res); if (!admin) return;
       const body = await readBody(req);
-      // Pre-flight (T08): a governance action that cannot be audited durably — neither the
-      // log nor the outbox accepts a write — is refused BEFORE it is applied, rather than
-      // succeeding with no recoverable record of itself.
-      if (auditAppendable && !auditAppendable()) {
-        return json(res, 503, { error: 'the audit log cannot be written; fix it and retry', code: 'audit-unavailable' });
-      }
+      // G06: the disposition and its pending-audit event commit in ONE shared-file
+      // transaction (audited:false); delivery to audit.log is a separate retryable step —
+      // a failure there delays the audit trail but can no longer lose the action itself.
       try {
         const out = await domain.adminStatus({
           actorUid: admin.id, targetUid: body.targetUid,
@@ -157,6 +154,18 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
           msg: String(body.reason || ''),
           meta: { actionId: String(body.actionId || ''), applied: !!out.applied }
         });
+        const flush = domain.flushAudits(({ actionId, actor, targetUid, suspended, reason, at }) =>
+          audit(req, 'leaderboard.admin.status', {
+            ok: true,
+            user: { id: String(actor || '') },
+            target: { id: String(targetUid || '') },
+            act: (suspended ? 'suspend' : 'restore'),
+            msg: String(reason || ''),
+            meta: { actionId, applied: true }
+          }));
+        // Immediate delivery attempt; when anything remains (log or outbox unwritable),
+        // the retry loop takes over so the audit is delayed, never lost (G06/G07).
+        flush.then(f => { if (f.remaining > 0 && deliverAudits) deliverAudits(); }).catch(() => {});
         return json(res, 200, out);
       } catch (e) {
         if (e instanceof LeaderboardError) return fail(res, e);

@@ -2286,4 +2286,8 @@ export default {
   "left": "已退出",
   "Suspend": "暂停",
   "Restore": "恢复",
+  "A saved leave-the-leaderboard request needs your confirmation": "有一条保存过的退出排行榜请求需要你确认",
+  "An older version of the app saved a leave request without saying which server it was for. Until you decide, nothing is published and nothing is withdrawn.": "旧版本应用保存了一条退出请求，但没有说明是针对哪个服务器的。在你决定之前，不会发布任何内容，也不会执行退出。",
+  "It was for this server — leave it": "是针对本服务器的——执行退出",
+  "It was for another server — discard it": "是针对其他服务器的——丢弃该请求",
 }

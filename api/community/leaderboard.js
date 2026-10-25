@@ -345,7 +345,7 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
           m.suspendedReason = null;
           m.suspendedAt = null;
         }
-        const action = { actionId, at: now(), actor: actorUid, targetUid, suspended: !!suspended, reason: suspended ? m.suspendedReason : String(reason || '').slice(0, 500) };
+        const action = { actionId, at: now(), actor: actorUid, targetUid, suspended: !!suspended, reason: suspended ? m.suspendedReason : String(reason || '').slice(0, 500), audited: false };
         data.adminActions = [...(data.adminActions || []), action].slice(-500); // bounded, newest last
         return { ok: true, applied: true, at: action.at };
       }).then(({ out }) => out);
@@ -385,6 +385,39 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
           suspendedReason: m.suspended ? (m.suspendedReason || '') : ''
         }))
         .sort((a, b) => (a.displayName < b.displayName ? -1 : a.displayName > b.displayName ? 1 : 0));
+    },
+
+    /** G06: disposition and its audit event commit together (audited:false above); these
+     *  accessors let the deliverer flush and confirm them as a separate, retryable step. */
+    unauditedActions() {
+      const data = store.peek();
+      return (data.adminActions || []).filter(a => a.audited === false).map(a => ({ ...a }));
+    },
+    /** Deliver pending audits through  (one call per action). Whatever wrote
+     *  successfully is marked audited even when a later one fails, so a partial delivery
+     *  is never replayed wholesale; the caller retries what remains. */
+    flushAudits(write) {
+      const pending = this.unauditedActions();
+      if (!pending.length) return Promise.resolve({ delivered: 0, remaining: 0 });
+      const done = [];
+      try {
+        for (const a of pending) {
+          if (!write(a)) break; // the write reports its own durability (audit() → true/false)
+          done.push(a.actionId);
+        }
+      } finally {
+        if (done.length) return this.markAudited(done).then(() => ({ delivered: done.length, remaining: pending.length - done.length }));
+      }
+      return Promise.resolve({ delivered: 0, remaining: pending.length });
+    },
+
+    markAudited(actionIds) {
+      const ids = new Set(actionIds);
+      return store.txn(data => {
+        let n = 0;
+        for (const a of data.adminActions || []) if (ids.has(a.actionId) && a.audited === false) { a.audited = true; n++ }
+        return n;
+      }).then(({ out }) => out);
     },
 
     /** Account deletion (PRD §17): the shared file keeps nothing of a deleted account — not

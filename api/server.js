@@ -943,16 +943,20 @@ function flushAuditOutbox() {
     else fs.unlinkSync(auditOutbox);
   } catch { /* the outbox itself is unwritable — nothing more to do */ }
 }
-// While records are stranded, retry at a human-imperceptible cadence — an operator who fixes
-// the log gets the gap backfilled within moments, without waiting for the next audited event.
+// While records are stranded, retry with a capped backoff (G07): an operator who repairs the
+// log gets the gap backfilled automatically — after a boot-time failure too, not only when
+// the next audited event happens to fire. Long outages settle at 30 s, not a 50 ms spin.
 let auditRetryTimer = null;
+let auditRetryMs = 250;
 function scheduleAuditRetry() {
   if (auditRetryTimer) return;
+  const wait = auditRetryMs;
+  auditRetryMs = Math.min(auditRetryMs * 2, 30000);
   auditRetryTimer = setTimeout(() => {
     auditRetryTimer = null;
     flushAuditOutbox();
-    try { if (fs.existsSync(auditOutbox)) scheduleAuditRetry(); } catch { /* stat refused */ }
-  }, 50);
+    try { if (fs.existsSync(auditOutbox)) scheduleAuditRetry(); else auditRetryMs = 250; } catch { /* stat refused */ }
+  }, wait);
   auditRetryTimer.unref?.();
 }
 /** Can an audit record be durably placed at all right now — the log, or the outbox that
@@ -1007,8 +1011,57 @@ if (AUDIT_ON) {
   } catch { /* no outbox */ }
   compactAudit();                                // prune on boot, seed auditSeq/auditCount
   flushAuditOutbox();
+  // G07: a boot-time failure (the log still unwritable) must not strand the backlog until
+  // the next admin action — the retry loop resumes on its own, with capped backoff.
+  try { if (fs.existsSync(auditOutbox)) scheduleAuditRetry(); } catch { /* stat refused */ }
   setInterval(compactAudit, 3600000).unref();    // honour AUDIT_DAYS on an idle instance too
 }
+
+/* G06: disposition facts and their audit events are committed together in the shared file
+ * (audited:false); this deliverer is the separate, retryable step that replays them into
+ * audit.log. Replay is deduped by actionId — a crash between the audit append and the
+ * audited flag re-checks the log instead of double-writing. Failures leave the event
+ * pending in the shared file; the interval keeps trying. */
+const AUDIT_DELIVER_INTERVAL_MS = 5000;
+let auditDeliverTimer = null;
+function deliverLeaderboardAudits() {
+  if (!LEADERBOARD || !leaderboardDomain) return true;
+  let pending = [];
+  try { pending = leaderboardDomain.unauditedActions(); } catch (e) { console.error('leaderboard audit delivery read failed:', e.message); return false; }
+  if (!pending.length) return true;
+  const seen = new Set(auditLines().map(r => r.meta && r.meta.actionId).filter(Boolean));
+  const stub = { headers: {}, socket: {} };
+  const done = [];
+  for (const a of pending) {
+    if (seen.has(a.actionId)) { done.push(a.actionId); continue; } // already on disk: just confirm
+    const written = audit(stub, 'leaderboard.admin.status', {
+      ok: true,
+      uid: a.actor,
+      target: { id: a.targetUid },
+      act: a.suspended ? 'suspend' : 'restore',
+      msg: a.reason || '',
+      meta: { actionId: a.actionId, applied: true }
+    });
+    if (!written) break; // still unwritable: the outbox/backoff owns it now
+    done.push(a.actionId);
+  }
+  if (done.length) {
+    leaderboardDomain.markAudited(done).catch(e => console.error('leaderboard audit confirm failed:', e.message));
+    console.log('delivered', done.length, 'pending leaderboard audit event(s)');
+  }
+  return done.length === pending.length;
+}
+function scheduleAuditDelivery() {
+  if (auditDeliverTimer) return;
+  auditDeliverTimer = setInterval(() => {
+    try { if (deliverLeaderboardAudits()) { clearInterval(auditDeliverTimer); auditDeliverTimer = null; } } catch (e) { console.error('leaderboard audit delivery failed:', e.message); }
+  }, AUDIT_DELIVER_INTERVAL_MS);
+  auditDeliverTimer.unref?.();
+}
+
+// Boot delivery (G06/G07): anything stranded by a previous life flushes now; whatever cannot
+// be written keeps its retry loop alive instead of waiting for the next admin action.
+if (LEADERBOARD && !deliverLeaderboardAudits()) scheduleAuditDelivery();
 
 // A graceful stop hands the shared-file lock back, so a recreated container starts clean
 // instead of waiting out the stale-heartbeat window (T04). A crash (SIGKILL, power) skips
@@ -2724,11 +2777,16 @@ const routes = {
   // Only when the instance switched the leaderboard on: an off instance has none of these
   // routes, and unanswered is a plain 404 — no entry point, no information leak (LB-01).
   ...(LEADERBOARD ? leaderboardRoutes({
-    domain: leaderboardDomain, json, readBody, readSession, requireAdmin, audit, auditAppendable, personalRevOf,
+    domain: leaderboardDomain, json, readBody, readSession, requireAdmin, audit, personalRevOf,
     publicRead: LEADERBOARD_PUBLIC_READ,
     // The like budget's address half: the runtime PEER (F10), not the audit record — with
     // AUDIT_IP=off the audit stores nothing, and the budget still counts clients apart.
-    addressOf: req => peerOf(req)
+    addressOf: req => peerOf(req),
+    deliverAudits: () => {
+      const okAll = deliverLeaderboardAudits();
+      if (!okAll) scheduleAuditDelivery(); // keep the retry loop alive until it lands
+      return okAll;
+    }
   }) : {}),
 
   /* ---------- photos & videos ---------- */

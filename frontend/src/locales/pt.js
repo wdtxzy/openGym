@@ -2286,4 +2286,8 @@ export default {
   "left": "left",
   "Suspend": "Suspend",
   "Restore": "Restore",
+  "A saved leave-the-leaderboard request needs your confirmation": "A saved leave-the-leaderboard request needs your confirmation",
+  "An older version of the app saved a leave request without saying which server it was for. Until you decide, nothing is published and nothing is withdrawn.": "An older version of the app saved a leave request without saying which server it was for. Until you decide, nothing is published and nothing is withdrawn.",
+  "It was for this server — leave it": "It was for this server — leave it",
+  "It was for another server — discard it": "It was for another server — discard it",
 }
