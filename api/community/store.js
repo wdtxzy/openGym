@@ -70,18 +70,41 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     finally { fs.closeSync(fd); }
   };
   const iOwn = holder => holder && holder.token === myToken;
-  // While we hold the lock, keep its `at` fresh so a recreated peer can tell a live holder
-  // from a crashed one (T04). One timer per store, only once locked, best-effort — and every
-  // successful persist refreshes it too, so a long write cannot look abandoned mid-flight.
+  // The lease is rewritten ATOMICALLY (temp + rename), never by truncating the lock in place:
+  // a truncating write leaves a moment where the lock reads empty and a peer would take the
+  // file for ownerless (F02). Deposition (F01): a holder whose lease was taken over while it
+  // was paused must not simply write its token back — every refresh is CONDITIONAL on the
+  // lock still naming us, and a holder that finds someone else's token deposes itself: no
+  // further leases, no further commits, until the process restarts.
   let heartbeat = null;
-  const touchLock = () => {
-    try { fs.writeFileSync(lockFile, lockBody()); } catch { /* a hand we will notice elsewhere */ }
+  let deposed = false;      // another writer took the lease from us: refuse everything since
+  const refreshLease = () => {
+    if (!locked || deposed) return false;
+    const holder = readLock();
+    if (!iOwn(holder)) {
+      // Not our lock anymore (a peer recovered it while this process was paused/crashed).
+      // Stop claiming to be the writer: leases stop, commits stop, reads refuse.
+      deposed = true;
+      locked = false;
+      refused = new StoreError('lost-lock', `${file}: another writer owns the lease now`);
+      if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+      return false;
+    }
+    const tmp = lockFile + '.beat.' + crypto.randomBytes(4).toString('hex');
+    try {
+      fs.writeFileSync(tmp, lockBody());
+      fs.renameSync(tmp, lockFile);
+      return true;
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch { /* never got created */ }
+      return false; // a hand we will notice on the next refresh or at commit
+    }
   };
   const beat = () => {
     if (heartbeat || !locked) return;
     heartbeat = setInterval(() => {
-      if (!locked) { clearInterval(heartbeat); heartbeat = null; return; }
-      touchLock();
+      if (!locked || deposed) { clearInterval(heartbeat); heartbeat = null; return; }
+      refreshLease();
     }, HEARTBEAT_MS);
     heartbeat.unref?.();
   };
@@ -95,8 +118,12 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   /* Best-effort single-writer guard (see header). Acquire is the atomic 'wx' create; EEXIST is
    * resolved by the holder's TOKEN, not by guessing from PIDs. Taking over a stale lock re-reads
    * the holder immediately before removing it and gives up (refuses) the moment the lock names
-   * anyone else — a contender that won the stale lock after our judgement is never unseated. */
+   * anyone else — a contender that won the stale lock after our judgement is never unseated.
+   * A lock that exists but does not parse is NOT automatically ownerless (F02): fresh, it is
+   * someone's mid-write or damaged lease and we refuse; only silent past the stale window may
+   * it be recovered, exactly like a crashed foreign holder. */
   function lock() {
+    if (refused) throw new StoreError(refused.code, refused.message); // settled: refuse with a clean error
     if (locked) return;
     try {
       claimLock();
@@ -108,19 +135,26 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     }
     let holder = readLock();
     if (iOwn(holder)) { locked = true; beat(); return; }       // our own, from this store
+    const lockAge = () => {
+      try { return now() - fs.statSync(lockFile).mtimeMs; } catch { return STALE_HOST_MS + 1; }
+    };
     const judge = h => {
-      if (!h || !h.token) return 'gone';                      // unreadable/garbage: free to try
-      if (h.host !== myHost) {
-        // Cross-container: live while the heartbeat is fresh; silent past STALE_HOST_MS, the
-        // holder crashed without a signal and a recreated instance may recover the file (T04).
-        const age = typeof h.at === 'number' ? now() - h.at : Infinity;
-        return age <= STALE_HOST_MS ? 'foreign-host' : 'foreign-stale';
+      if (h && h.token) {
+        if (h.host !== myHost) {
+          // Cross-container: live while the heartbeat is fresh; silent past STALE_HOST_MS, the
+          // holder crashed without a signal and a recreated instance may recover the file (T04).
+          const age = typeof h.at === 'number' ? now() - h.at : Infinity;
+          return age <= STALE_HOST_MS ? 'foreign-host' : 'foreign-stale';
+        }
+        if (h.pid === process.pid) return 'same-pid';         // provably THIS process: may take over
+        return pidAlive(h.pid) ? 'live' : 'dead';
       }
-      if (h.pid === process.pid) return 'same-pid';           // provably THIS process: may take over
-      return pidAlive(h.pid) ? 'live' : 'dead';
+      // Unparseable or token-less: garbage from before this protocol, or a lease damaged in
+      // flight. Fresh, it is not ours to touch (F02); silent, it may be recovered.
+      return lockAge() <= STALE_HOST_MS ? 'unreadable-fresh' : 'gone';
     };
     const verdict = judge(holder);
-    if (verdict === 'live' || verdict === 'foreign-host')
+    if (verdict === 'live' || verdict === 'foreign-host' || verdict === 'unreadable-fresh')
       throw new StoreError('second-writer', `${verdict} holder (${JSON.stringify(holder)}) owns ${file}`);
     // Stale. The takeover is capture-verify-discard against THE HOLDER WE JUDGED (the first
     // read) — never against a fresher re-read, which a live contender could already own (T03):
@@ -164,11 +198,24 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   }
 
   function persist(draft) {
+    // F01: the commit point proves the lease. A writer whose lease was recovered while it was
+    // paused must fail HERE — before any byte of the shared file moves — not overwrite the
+    // new owner's data. (Deposition is usually noticed by the conditional heartbeat first;
+    // this is the backstop that makes 'locked' mean 'allowed to commit'.)
+    if (!locked || deposed) throw new StoreError('lost-lock', `${file}: not the lease owner`);
+    if (!iOwn(readLock())) {
+      deposed = true;
+      locked = false;
+      refused = new StoreError('lost-lock', `${file}: another writer owns the lease now`);
+      if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+      throw refused;
+    }
     try {
       writer(file, JSON.stringify(draft, null, 2) + '\n', 0o600);
       knownMtime = fs.statSync(file).mtimeMs;
-      if (locked) touchLock(); // a long write must not look like an abandoned holder (T04)
+      refreshLease(); // a long write must not look abandoned, and a lost lease surfaces now
     } catch (e) {
+      if (e instanceof StoreError) throw e;
       // atomicWrite leaves the previous file in place on any failure, so the cache still
       // matches what is on disk; the caller's transaction simply did not happen.
       throw new StoreError('write-failed', e.message);
@@ -229,7 +276,8 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     /** Cheap liveness for a deploy probe: false once the store refused (second writer,
      *  damaged file) — the container is up but this feature is not. */
     healthy() {
-      return !refused && data != null;
+      // Ownership, not just cache presence (F01): a deposed writer must read as unavailable.
+      return !refused && data != null && locked && !deposed;
     },
 
     /** The live cached object, NOT copied — for read-only request paths over a large shared
@@ -253,8 +301,10 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
      *  `fn`'s return value is passed back; a throw from `fn` or a failed write leaves file
      *  and cache untouched, and the next transaction runs after a failure — never wedged. */
     txn(fn) {
-      lock();
+      // lock() lives INSIDE the queued run: a refused/deposed store must answer with a
+      // REJECTION, not a synchronous throw out of txn() itself (callers await it).
       const run = async () => {
+        lock();
         const current = load();
         const draft = structuredClone(current);
         const out = fn(draft);

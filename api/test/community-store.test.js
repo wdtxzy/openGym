@@ -163,16 +163,39 @@ test('release() hands the lock back, so a recreated instance starts clean', asyn
   assert.equal(second.warmup().ok, true);
 });
 
-test('a lock that is not readable at all is stale garbage, taken over', () => {
+test('an unreadable lock is refused while fresh, recoverable once silent (F02)', () => {
   const file = path.join(dir(), 'shared.json');
-  // Both flavours of garbage: not JSON at all, and a bare number — which JSON.parse happily
-  // returns, and which must never be mistaken for a live owner's lock.
-  for (const garbage of ['not-a-pid', '99999999']) {
+  // Both flavours of non-lock: not JSON at all, and a bare number — which JSON.parse happily
+  // returns, and which must never be mistaken for a live owner's lock. FRESH, either could be
+  // a holder's damaged lease (a truncating write window): refuse. SILENT past the stale
+  // window, it is recoverable garbage from before the token protocol.
+  for (const garbage of ['not-a-pid', '99999999', '']) {
     fs.writeFileSync(file + '.lock', garbage);
+    const fresh = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+    assert.equal(fresh.warmup().code, 'second-writer', `fresh garbage ${JSON.stringify(garbage)} refused`);
+    const past = new Date(Date.now() - 60000);
+    fs.utimesSync(file + '.lock', past, past);
     const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-    assert.equal(s.warmup().ok, true, `garbage lock ${JSON.stringify(garbage)}`);
+    assert.equal(s.warmup().ok, true, `silent garbage ${JSON.stringify(garbage)} recovered`);
     assert.equal(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')).pid, process.pid);
   }
+});
+
+test('F01: a deposed writer stops leasing, stops committing, and reads unhealthy', async () => {
+  const file = path.join(dir(), 'shared.json');
+  const a = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  assert.equal(a.warmup().ok, true);
+  assert.equal(a.healthy(), true);
+  await a.txn(d => { d.members.before = 1 }); // one committed change
+  // While A is "paused", a peer recovers the silent lease (a fresh foreign token in its place).
+  fs.writeFileSync(file + '.lock', JSON.stringify({ pid: 1, host: 'peer-container', token: 'peer', at: Date.now() }));
+  // A's next commit proves the lease at the commit point — or the conditional heartbeat has
+  // already deposed it; either refusal (lost-lock / second-writer) is the correct outcome.
+  await assert.rejects(a.txn(d => { d.members.after = 1 }), e => e.code === 'lost-lock' || e.code === 'second-writer');
+  assert.equal(a.healthy(), false);
+  assert.equal(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')).token, 'peer', 'the deposed writer never rewrites the lease');
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).members.after, undefined, 'the deposed writer never commits');
+  assert.throws(() => a.read(), e => e.code === 'lost-lock');
 });
 
 test('R07: a file that corrupts after warmup refuses both reads and writes, and survives byte for byte', async () => {
