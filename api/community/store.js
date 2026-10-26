@@ -110,22 +110,48 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   }
 
   /** Isolate every commit marker for this data file — called ONLY while holding the
-   *  lease (K01): each marker's recorded private commit file goes with it, both temp
-   *  layers. That removal is what makes a paused writer's final rename fail ENOENT
-   *  instead of landing over the writer that took over — so a removal that FAILED is
-   *  not a removal (K02): ENOENT is the only error that proves the file gone; anything
-   *  else (EIO, EACCES, …) leaves the old writer armed and REFUSES the acquisition
-   *  rather than promising a success it cannot defend. A marker that does not parse
-   *  cannot arm its writer (a live writer's own commit check re-reads the marker and
-   *  deposes on a mismatch), so unreadable debris is simply deleted. */
+   *  lease (K01). Each marker's recorded private commit file goes with it, both temp
+   *  layers: that removal is what makes a paused writer's final rename fail ENOENT
+   *  instead of landing over the writer that took over.
+   *
+   *  The marker READ is load-bearing (L01): a writer that already passed its final
+   *  review — read its marker, matched token and temp name, checked its lease — and is
+   *  paused just before the rename keeps its rename source no matter what a LATER read
+   *  of that marker returns. A read that fails with EIO, or content that cannot be
+   *  verified to name that private file, therefore means the isolation is UNKNOWN, not
+   *  empty: the acquisition is refused and the marker stays on disk for an operator.
+   *  Only states that PROVE safety proceed:
+   *    - missing (ENOENT): the marker is gone — its writer's own final check (which
+   *      re-reads the marker) fails, or a previous isolation removed the private file
+   *      first; either way nothing is armed under it.
+   *    - valid: parsed, and names a private commit file of THIS data file — delete the
+   *      file (both layers), then the marker. ENOENT on either deletion is the proof
+   *      the target is gone (K02); any other error refuses the acquisition.
+   *  Non-canonical debris — publish '.new' temps (writable torn by a crash mid-write)
+   *  and round-7 capture tombs — never sits at a name any writer verifies against, so
+   *  it cannot arm one whatever it reads like; it is cleaned best-effort. */
   function isolateCommitMarkers() {
+    const base = path.basename(file);
+    const canonicalName = n => n === base + '.committing' || /^[0-9a-f]+$/.test(n.slice((base + '.committing.').length));
+    const ownCommitTemp = t => typeof t === 'string' && t.startsWith(file + '.commit.') && !t.slice((file + '.commit.').length).includes('/');
     for (const m of commitMarkers()) {
-      const body = readAt(m);
-      if (body && body.tmp) {
-        for (const t of [body.tmp, body.tmp + '.tmp']) {
-          try { fs.unlinkSync(t); }
-          catch (e) { if (e.code !== 'ENOENT') throw new StoreError('lock', `cannot isolate ${path.basename(t)}: ${e.message}`); }
-        }
+      const isCanonical = canonicalName(path.basename(m));
+      let body = null;
+      let state = 'valid';
+      try { body = JSON.parse(fs.readFileSync(m, 'utf8')); }
+      catch (e) {
+        if (e.code === 'ENOENT') continue; // missing: proven gone, nothing armed under it
+        state = 'unreadable';
+      }
+      if (state === 'valid' && !(body && typeof body === 'object' && ownCommitTemp(body.tmp))) state = 'invalid';
+      if (state !== 'valid') {
+        if (!isCanonical) { try { fs.unlinkSync(m); } catch { /* debris: never load-bearing */ } continue; }
+        // Unknown state at a name a writer verifies against: refuse, keep the file.
+        throw new StoreError('lock', `cannot verify ${path.basename(m)} (${state}): refusing to take over ${file}`);
+      }
+      for (const t of [body.tmp, body.tmp + '.tmp']) {
+        try { fs.unlinkSync(t); }
+        catch (e) { if (e.code !== 'ENOENT') throw new StoreError('lock', `cannot isolate ${path.basename(t)}: ${e.message}`); }
       }
       try { fs.unlinkSync(m); }
       catch (e) { if (e.code !== 'ENOENT') throw new StoreError('lock', `cannot isolate ${path.basename(m)}: ${e.message}`); }

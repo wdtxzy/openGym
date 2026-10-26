@@ -351,3 +351,95 @@ describe('K03 — replacing a failed intent and completing the new one leaves no
     expect(h.p.publishStatus().withdrawPending).toBe(false)
   })
 })
+
+describe('L02 — a memory-only intent (its storage write failed) survives an older success', () => {
+  const ME0 = { enabled: true, suspended: false, disclosureVersion: 1, currentDisclosureVersion: 1, consentVersion: 1, reportRev: 0 }
+
+  function withdrawFixture() {
+    const h = harness()
+    h.p.start()
+    h.client.fetchMe.mockResolvedValue({ ...ME0 })
+    h.client.publishReport.mockResolvedValue({ ok: true, reportRev: 1, acceptedFingerprint: 'x' })
+    return h
+  }
+  const failStorage = h => {
+    const real = h.storage.setItem
+    let fail = false
+    h.storage.setItem = (k, v) => { if (fail) throw new Error('quota'); real(k, v) }
+    return on => { fail = on }
+  }
+
+  it('an old success cannot sweep away a newer intent whose storage write failed — publishing stays blocked', async () => {
+    const h = withdrawFixture()
+    const setFailing = failStorage(h)
+    let resolveA
+    // Intent A: persisted fine, its response hangs (it may already have executed server-side).
+    h.client.leaveLeaderboard.mockImplementationOnce(() => new Promise(resolve => { resolveA = resolve }))
+    // Intent B: a newer decision (consent 3) — its storage write will fail, so it lives
+    // in memory only, and its own request fails offline.
+    h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('new consent-3 leave offline'))
+    const old = h.p.requestLeave({ ...ME0 })
+    setFailing(true)
+    await h.p.requestLeave({ ...ME0, consentVersion: 3 })
+    expect(h.p.publishStatus().withdrawPending).toBe(true) // B is the current decision
+
+    resolveA({})
+    await old
+    // A's success settles A — never B: no persisted record names B, but B is the KNOWN
+    // newer decision of this session, and only its own confirmation (or an explicit
+    // replacement) may end it.
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+    expect(h.p.publishStatus().lastError).toBe('new consent-3 leave offline')
+
+    // A confirmed personal exchange and a fresh pass: the unfinished withdrawal must
+    // still block publishing — publishReport is never called while B is pending.
+    h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('still offline'))
+    h.merged()
+    await h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+  })
+
+  it('the memory-only intent completes when ITS OWN confirmation finally lands (no storage needed)', async () => {
+    const h = withdrawFixture()
+    const setFailing = failStorage(h)
+    let resolveA
+    h.client.leaveLeaderboard.mockImplementationOnce(() => new Promise(resolve => { resolveA = resolve }))
+    h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('new consent-3 leave offline'))
+    const old = h.p.requestLeave({ ...ME0 })
+    setFailing(true)
+    await h.p.requestLeave({ ...ME0, consentVersion: 3 })
+    resolveA({})
+    await old
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+    // The automatic retry, acting for the memory decision that was current when it
+    // began, confirms the leave — and ends it without any persisted mark.
+    h.client.leaveLeaderboard.mockResolvedValue({})
+    h.merged()
+    await h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.p.publishStatus().withdrawPending).toBe(false)
+    expect(h.p.publishStatus().lastError).toBe(null)
+    expect(h.p.publishStatus().lastOkAt).not.toBe(null)
+    expect(h.client.publishReport).not.toHaveBeenCalled() // the withdrawal branch, not a publish
+  })
+
+  it('repeated failed storage writes do not re-accumulate ghost intents (K03 kept)', async () => {
+    const h = withdrawFixture()
+    const setFailing = failStorage(h)
+    setFailing(true)
+    h.client.leaveLeaderboard.mockRejectedValue(new Error('offline'))
+    await h.p.requestLeave({ ...ME0 })
+    await h.p.requestLeave({ ...ME0, consentVersion: 2 })
+    await h.p.requestLeave({ ...ME0, consentVersion: 3 })
+    expect(h.p.publishStatus().withdrawPending).toBe(true) // exactly one current decision
+    // Storage heals and the current decision's request succeeds: everything completes,
+    // nothing lingers — the old Set-based model would have left the first two ids.
+    setFailing(false)
+    h.client.leaveLeaderboard.mockResolvedValue({})
+    await h.p.requestLeave({ ...ME0, consentVersion: 4 })
+    expect(h.p.publishStatus().withdrawPending).toBe(false)
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw:'))).toHaveLength(0)
+  })
+})

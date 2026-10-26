@@ -12,8 +12,8 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { createSharedStore, StoreError, NO_WRITE } from '../community/store.js';
+import { writerWorld } from './store-writer.mjs';
 
 const dir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'community-store-'));
 
@@ -342,11 +342,7 @@ test('N05: a contender that lands during the takeover is captured, restored and 
  * cross-container recovery path) and a controllable clock file — the takeover windows move by
  * writing the clock, not by sleeping 16 s each. */
 test('I01: a resumed old writer never deletes the current committer’s marker — three takeovers keep the acknowledged commit', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'community-store-i01-'));
-  const file = path.join(root, 'data.json');
-  const clockFile = path.join(root, 'clock');
-  const base = Date.now();
-  fs.writeFileSync(clockFile, String(base));
+  const w = writerWorld('community-store-i01-');
   const childCode = `
 import fs from 'node:fs';
 import os from 'node:os';
@@ -375,73 +371,43 @@ const store = createSharedStore({ file, schemaVersion: 1, init: () => ({ members
 try {
   const r = await store.txn(view => {
     const d = view.edit(); d.members[role] = 1 });
-  console.log(JSON.stringify({ ok: true, revision: r.revision }));
+  console.log('TXN ' + JSON.stringify({ ok: true, revision: r.revision }));
 } catch (e) {
-  console.log(JSON.stringify({ ok: false, code: e.code || 'unexpected' }));
+  console.log('TXN ' + JSON.stringify({ ok: false, code: e.code || 'unexpected' }));
 }
 `;
-  const children = [];
-  const spawnWriter = role => {
-    const child = spawn(process.execPath, ['--input-type=module', '-e', childCode], {
-      env: {
-        ...process.env, ROLE: role, FILE: file, ROOT: root, CLOCK: clockFile,
-        STORE_URL: pathToFileURL(path.join(import.meta.dirname, '../community/store.js')).href
-      },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    let out = '';
-    child.stdout.on('data', d => { out += d; });
-    children.push(child);
-    const answer = new Promise((resolve, reject) => {
-      child.on('exit', () => {
-        const line = out.trim().split('\n').pop();
-        try { resolve(JSON.parse(line)); } catch { reject(new Error(`${role} produced no result: ${out}`)); }
-      });
-      child.on('error', reject);
-    });
-    return answer;
-  };
-  const waitFor = async (what, p) => {
-    for (let i = 0; i < 750 && !fs.existsSync(p); i++) await new Promise(r => setTimeout(r, 20));
-    if (!fs.existsSync(p)) throw new Error('timed out waiting for ' + what);
-  };
-  const advanceClock = ms => fs.writeFileSync(clockFile, String(base + ms));
   try {
     // A: pauses between marker verify and the final rename, holding its marker.
-    const markerFiles = () => fs.readdirSync(root).filter(n => n.startsWith('data.json.committing'));
-    const a = spawnWriter('A');
-    await waitFor('A to reach its rename', path.join(root, 'entered-A'));
+    const markerFiles = () => fs.readdirSync(w.root).filter(n => n.startsWith('data.json.committing'));
+    const a = w.spawnWriter(childCode, 'A');
+    await w.waitFor('A to reach its rename', path.join(w.root, 'entered-A'));
     assert.ok(markerFiles().length > 0, 'A holds a commit marker (per-writer name)');
 
     // B (17 s of clock silence later): recovers A's lease, clears A's marker AND private
     // file, then pauses in the same spot inside its own commit.
-    advanceClock(17000);
-    const b = spawnWriter('B');
-    await waitFor('B to reach its rename', path.join(root, 'entered-B'));
+    w.advanceClock(17000);
+    const b = w.spawnWriter(childCode, 'B');
+    await w.waitFor('B to reach its rename', path.join(w.root, 'entered-B'));
     assert.ok(markerFiles().length > 0, 'B holds a commit marker (per-writer name)');
 
     // A resumes and fails: its private file is gone, its abort must leave B's marker alone.
-    fs.writeFileSync(path.join(root, 'release-A'), '1');
-    assert.deepEqual(await a, { ok: false, code: 'write-failed' });
+    fs.writeFileSync(path.join(w.root, 'release-A'), '1');
+    assert.deepEqual(await a.done, { ok: false, code: 'write-failed' });
     assert.ok(markerFiles().length > 0, 'J01/I01: A\'s abort left B\'s marker intact — the current committer stays protected');
 
     // C (another 17 s): recovers B's silence — B's marker names B's private file, so the
     // takeover removes both — and commits. The acknowledged answer must survive B resuming.
-    advanceClock(34000);
-    const c = spawnWriter('C');
-    assert.deepEqual(await c, { ok: true, revision: 1 });
+    w.advanceClock(34000);
+    const c = w.spawnWriter(childCode, 'C');
+    assert.deepEqual(await c.done, { ok: true, revision: 1 });
 
-    fs.writeFileSync(path.join(root, 'release-B'), '1');
-    assert.deepEqual(await b, { ok: false, code: 'write-failed' });
+    fs.writeFileSync(path.join(w.root, 'release-B'), '1');
+    assert.deepEqual(await b.done, { ok: false, code: 'write-failed' });
 
-    const final = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const final = JSON.parse(fs.readFileSync(w.file, 'utf8'));
     assert.deepEqual(final.members, { seed: 1, C: 1 }, 'C\'s acknowledged commit survives every resumed old writer');
     assert.equal(final.revision, 1);
-  } finally {
-    for (const child of children) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
-    await new Promise(r => setTimeout(r, 50));
-    fs.rmSync(root, { recursive: true, force: true });
-  }
+  } finally { await w.teardown(); }
 });
 
 test('the view (round-7 NO_WRITE cost): a no-op plans without a clone; the first mutation clones once', async () => {
@@ -555,11 +521,7 @@ test('J06: marker publication failures leave no private commit files or marker d
  * which ended the moment this store captured it). Real child processes, distinct
  * hostnames, a controllable clock. */
 test('K01: a takeover ignores the stale listing — the post-lease isolation disarms the late-committing old writer', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'community-store-k01-'));
-  const file = path.join(root, 'data.json');
-  const clockFile = path.join(root, 'clock');
-  const base = Date.now();
-  fs.writeFileSync(clockFile, String(base));
+  const w = writerWorld('community-store-k01-');
   const childCode = `
 import fs from 'node:fs';
 import os from 'node:os';
@@ -597,70 +559,30 @@ try {
   console.log('TXN ' + JSON.stringify({ ok: false, code: e.code || 'unexpected' }));
 }
 `;
-  const children = [];
-  const spawnWriter = role => {
-    const child = spawn(process.execPath, ['--input-type=module', '-e', childCode], {
-      env: {
-        ...process.env, ROLE: role, FILE: file, ROOT: root, CLOCK: clockFile,
-        STORE_URL: pathToFileURL(path.join(import.meta.dirname, '../community/store.js')).href
-      },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    let out = '';
-    child.stdout.on('data', d => { out += d; });
-    children.push(child);
-    const lines = () => out.trim().split('\n').filter(Boolean);
-    const answer = new Promise((resolve, reject) => {
-      child.on('close', () => {
-        const txn = lines().map(l => /^TXN /.test(l) ? JSON.parse(l.slice(4)) : null).filter(Boolean).pop();
-        txn ? resolve(txn) : reject(new Error(`${role} produced no txn result: ${out}`));
-      });
-      child.on('error', reject);
-    });
-    answer.catch(() => {}); // killed children must not mask the real failure (finally SIGKILLs)
-    const warmup = () => new Promise((resolve, reject) => {
-      const seen = () => { const l = lines().find(x => x.startsWith('WARMUP ')); return l ? JSON.parse(l.slice(7)) : null; };
-      const iv = setInterval(() => {
-        const w = seen();
-        if (w) { clearInterval(iv); resolve(w); }
-      }, 5);
-      child.on('close', () => { clearInterval(iv); const w = seen(); w ? resolve(w) : reject(new Error(`${role} exited before warmup: ${out}`)); });
-    });
-    return { answer, warmup };
-  };
-  const waitFor = async (what, p) => {
-    for (let i = 0; i < 750 && !fs.existsSync(p); i++) await new Promise(r => setTimeout(r, 20));
-    if (!fs.existsSync(p)) throw new Error('timed out waiting for ' + what);
-  };
-  const advanceClock = ms => fs.writeFileSync(clockFile, String(base + ms));
   try {
     // A is up first and holds the lease.
-    const a = spawnWriter('A');
+    const a = w.spawnWriter(childCode, 'A');
     assert.deepEqual(await a.warmup(), { ok: true, revision: 0 });
     // B boots, captures its (empty) marker listing, and pauses before returning it.
-    const b = spawnWriter('B');
-    await waitFor('B to capture its inventory', path.join(root, 'entered-inventory'));
+    const b = w.spawnWriter(childCode, 'B');
+    await w.waitFor('B to capture its inventory', path.join(w.root, 'entered-inventory'));
     // NOW A enters the commit section: marker published, lease check passed, paused
     // before the final rename — after B's listing was taken.
-    fs.writeFileSync(path.join(root, 'go-A'), '1');
-    const aAnswer = a.answer;
-    await waitFor('A to reach its rename', path.join(root, 'entered-A'));
+    fs.writeFileSync(path.join(w.root, 'go-A'), '1');
+    const aAnswer = a.done;
+    await w.waitFor('A to reach its rename', path.join(w.root, 'entered-A'));
     // A's heartbeat is frozen (the pause blocks its event loop): the lease goes silent.
-    advanceClock(17000);
+    w.advanceClock(17000);
     // B resumes with the stale empty listing — and must still not let A's rename land:
     // the post-acquisition isolation re-scans, sees A's marker, deletes A's private file.
-    fs.writeFileSync(path.join(root, 'release-inventory'), '1');
-    assert.deepEqual(await b.answer, { ok: true, revision: 1 }, 'B commits');
-    fs.writeFileSync(path.join(root, 'release-A'), '1');
+    fs.writeFileSync(path.join(w.root, 'release-inventory'), '1');
+    assert.deepEqual(await b.done, { ok: true, revision: 1 }, 'B commits');
+    fs.writeFileSync(path.join(w.root, 'release-A'), '1');
     assert.deepEqual(await aAnswer, { ok: false, code: 'write-failed' }, 'A is disarmed');
-    const final = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const final = JSON.parse(fs.readFileSync(w.file, 'utf8'));
     assert.deepEqual(final.members, { seed: 1, B: 1 }, 'K01: B\'s acknowledged commit survives the late-committing old writer');
     assert.equal(final.revision, 1);
-  } finally {
-    for (const child of children) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
-    await new Promise(r => setTimeout(r, 50));
-    fs.rmSync(root, { recursive: true, force: true });
-  }
+  } finally { await w.teardown(); }
 });
 
 /* K02, the round-9 "swallowed fencing error" reproduction: the takeover DID see A's
@@ -672,11 +594,7 @@ try {
  * it cannot defend. A persistent EIO here means B never commits and A — the legitimate
  * lease holder, never successfully deposed — completes. */
 test('K02: a fencing unlink that fails with EIO refuses the takeover — no success is promised it cannot defend', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'community-store-k02-'));
-  const file = path.join(root, 'data.json');
-  const clockFile = path.join(root, 'clock');
-  const base = Date.now();
-  fs.writeFileSync(clockFile, String(base));
+  const w = writerWorld('community-store-k02-');
   const childCode = `
 import fs from 'node:fs';
 import os from 'node:os';
@@ -715,63 +633,26 @@ if (role === 'A') {
   catch (e) { console.log('TXN ' + JSON.stringify({ ok: false, code: e.code || 'unexpected' })) }
 }
 `;
-  const children = [];
-  const spawnWriter = role => {
-    const child = spawn(process.execPath, ['--input-type=module', '-e', childCode], {
-      env: {
-        ...process.env, ROLE: role, FILE: file, ROOT: root, CLOCK: clockFile,
-        STORE_URL: pathToFileURL(path.join(import.meta.dirname, '../community/store.js')).href
-      },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    let out = '';
-    child.stdout.on('data', d => { out += d; });
-    children.push(child);
-    const lines = () => out.trim().split('\n').filter(Boolean);
-    const pick = prefix => lines().map(l => l.startsWith(prefix + ' ') ? JSON.parse(l.slice(prefix.length + 1)) : null).filter(Boolean).pop();
-    const done = new Promise((resolve, reject) => {
-      child.on('close', () => { const txn = pick('TXN'); txn ? resolve(txn) : reject(new Error(`${role}: ${out}`)); });
-      child.on('error', reject);
-    });
-    done.catch(() => {}); // killed children must not mask the real failure (finally SIGKILLs)
-    const warmup = () => new Promise((resolve, reject) => {
-      const seen = () => { const l = lines().find(x => x.startsWith('WARMUP ')); return l ? JSON.parse(l.slice(7)) : null; };
-      const iv = setInterval(() => {
-        const w = seen();
-        if (w) { clearInterval(iv); resolve(w); }
-      }, 5);
-      child.on('close', () => { clearInterval(iv); const w = seen(); w ? resolve(w) : reject(new Error(`${role} exited before warmup: ${out}`)); });
-    });
-    return { done, warmup };
-  };
-  const waitFor = async (what, p) => {
-    for (let i = 0; i < 750 && !fs.existsSync(p); i++) await new Promise(r => setTimeout(r, 20));
-    if (!fs.existsSync(p)) throw new Error('timed out waiting for ' + what);
-  };
   try {
     // A commits and pauses before the final rename; its heartbeat freezes.
-    const a = spawnWriter('A');
+    const a = w.spawnWriter(childCode, 'A');
     assert.deepEqual(await a.warmup(), { ok: true, revision: 0 });
-    fs.writeFileSync(path.join(root, 'go-A'), '1');
-    await waitFor('A to reach its rename', path.join(root, 'entered-A'));
-    fs.writeFileSync(clockFile, String(base + 17000)); // the lease goes silent
+    fs.writeFileSync(path.join(w.root, 'go-A'), '1');
+    await w.waitFor('A to reach its rename', path.join(w.root, 'entered-A'));
+    w.advanceClock(17000); // the lease goes silent
     // B boots under a PERSISTENT fencing fault: the takeover is refused, loudly, every
     // time — B never commits and never promises a success an old writer can overwrite.
-    const b = spawnWriter('B');
+    const b = w.spawnWriter(childCode, 'B');
     const bWarmup = await b.warmup();
     assert.equal(bWarmup.ok, false);
     assert.equal(bWarmup.code, 'lock', 'the boot takeover refuses on the fencing EIO');
     assert.deepEqual(await b.done, { ok: false, code: 'lock' }, 'the transaction refuses too — no swallowed success');
     // A, the legitimate holder never successfully deposed, completes its commit.
-    fs.writeFileSync(path.join(root, 'release-A'), '1');
+    fs.writeFileSync(path.join(w.root, 'release-A'), '1');
     assert.deepEqual(await a.done, { ok: true, revision: 1 });
-    const final = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const final = JSON.parse(fs.readFileSync(w.file, 'utf8'));
     assert.deepEqual(final.members, { seed: 1, A: 1 }, 'K02: no acknowledged write was lost — A completes, B never pretended');
-  } finally {
-    for (const child of children) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
-    await new Promise(r => setTimeout(r, 50));
-    fs.rmSync(root, { recursive: true, force: true });
-  }
+  } finally { await w.teardown(); }
 });
 
 /* K02's benign twin: an ENOENT during isolation IS the proof the file is gone — a marker
@@ -788,4 +669,154 @@ test('K02: an ENOENT while isolating a marker is the safe answer — the acquisi
     const { revision } = await s.txn(view => { view.edit().members.a = 1; });
     assert.equal(revision, 1);
   } finally { s.release(); }
+});
+
+/* L01, the round-10 "swallowed marker read" family. A writer that already passed its
+ * final review (read its marker, matched, checked its lease) and paused before the
+ * rename keeps its rename source whatever a LATER read of that marker returns — so the
+ * isolation read is load-bearing and must distinguish its outcomes instead of folding
+ * every failure into "no marker". Unit level first; the full paused-writer sequence is
+ * the child-process test at the end. */
+test('L01: an unreadable canonical marker refuses the acquisition and stays on disk', async () => {
+  const file = path.join(dir(), 'shared.json');
+  const marker = file + '.committing.' + 'a'.repeat(32);
+  const tmp = file + '.commit.abcdef123456';
+  fs.writeFileSync(tmp, JSON.stringify({ schemaVersion: 1, revision: 9 }));
+  fs.writeFileSync(marker, JSON.stringify({ pid: 99999999, host: 'elsewhere', token: 'a'.repeat(32), at: Date.now() - 60000, tmp }));
+  const realRead = fs.readFileSync;
+  fs.readFileSync = function (p, ...args) {
+    if (p === marker) { const e = new Error('injected EIO'); e.code = 'EIO'; throw e; }
+    return realRead(p, ...args);
+  };
+  let s;
+  try {
+    s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+    const w = s.warmup();
+    assert.equal(w.ok, false);
+    assert.equal(w.code, 'lock');
+    assert.ok(/cannot verify/.test(w.detail), 'the refusal names the marker and the state: ' + w.detail);
+    assert.equal(fs.existsSync(marker), true, 'the marker is kept for diagnosis');
+    assert.equal(fs.existsSync(tmp), true, 'the private commit file is kept too — nothing was pretended');
+  } finally {
+    fs.readFileSync = realRead;
+    s?.release();
+  }
+  // The read works again: the same acquisition proceeds and isolates both files.
+  const s2 = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  try {
+    assert.equal(s2.warmup().ok, true);
+    assert.equal(fs.existsSync(marker), false);
+    assert.equal(fs.existsSync(tmp), false);
+    const { revision } = await s2.txn(view => { view.edit().members.a = 1; });
+    assert.equal(revision, 1);
+  } finally { s2.release(); }
+});
+
+test('L01: invalid marker content — unparseable, or naming a file that is not ours — refuses and is kept', async () => {
+  const file = path.join(dir(), 'shared.json');
+  const garbage = file + '.committing.' + 'b'.repeat(32);
+  fs.writeFileSync(garbage, '{not json');
+  let s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  const w1 = s.warmup();
+  assert.equal(w1.ok, false);
+  assert.equal(w1.code, 'lock');
+  assert.equal(fs.existsSync(garbage), true, 'kept for diagnosis');
+  s.release();
+  fs.unlinkSync(garbage);
+  const alien = file + '.committing.' + 'c'.repeat(32);
+  fs.writeFileSync(alien, JSON.stringify({ pid: 1, host: 'x', token: 'c'.repeat(32), at: 1, tmp: '/etc/passwd' }));
+  s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  const w2 = s.warmup();
+  assert.equal(w2.ok, false);
+  assert.equal(w2.code, 'lock');
+  assert.equal(fs.existsSync(alien), true);
+  assert.equal(fs.existsSync('/etc/passwd'), true, 'nothing outside our directory was touched');
+  s.release();
+});
+
+test('L01: a marker that vanished mid-isolation (ENOENT) and non-canonical debris both proceed', async () => {
+  const file = path.join(dir(), 'shared.json');
+  const vanished = file + '.committing.' + 'd'.repeat(32);
+  fs.writeFileSync(vanished, JSON.stringify({ tmp: file + '.commit.000000000000' }));
+  const realRead = fs.readFileSync;
+  fs.readFileSync = function (p, ...args) {
+    if (p === vanished) { const e = new Error('gone'); e.code = 'ENOENT'; throw e; }
+    return realRead(p, ...args);
+  };
+  let s;
+  try {
+    s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+    assert.equal(s.warmup().ok, true);
+  } finally { fs.readFileSync = realRead; s?.release(); }
+  const torn = file + '.committing.' + 'e'.repeat(32) + '.new.' + 'f'.repeat(8);
+  fs.writeFileSync(torn, '{partial');
+  const s2 = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  try {
+    assert.equal(s2.warmup().ok, true);
+    assert.equal(fs.existsSync(torn), false, 'the debris was cleaned');
+    const { revision } = await s2.txn(view => { view.edit().members.a = 1; });
+    assert.equal(revision, 1);
+  } finally { s2.release(); }
+});
+
+/* L01, the full round-10 reproduction: A passed its final review and is paused before
+ * the data rename; B's takeover hits a PERSISTENT read error on A's marker. The old
+ * code folded the EIO into "no marker", deleted it without disarming A, and committed —
+ * A's resumed rename then overwrote B's acknowledged data. The isolation must refuse
+ * instead: B never promises a success it cannot defend, A (the legitimate holder,
+ * never successfully deposed) completes. */
+test('L01: a paused, fully-reviewed old writer plus a marker-read EIO — the takeover refuses, the acknowledged write survives', async () => {
+  const w = writerWorld('community-store-l01-');
+  const childCode = `
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+os.hostname = () => 'l01-writer-' + process.env.ROLE;
+const clock = () => { try { return Number(fs.readFileSync(process.env.CLOCK, 'utf8')) } catch { return Date.now() } };
+const { createSharedStore } = await import(process.env.STORE_URL);
+const role = process.env.ROLE, file = process.env.FILE, root = process.env.ROOT;
+const waitFor = f => { while (!fs.existsSync(f)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20); };
+const pause = name => { fs.writeFileSync(path.join(root, 'entered-' + name), '1'); waitFor(path.join(root, 'release-' + name)); };
+if (role === 'A') {
+  const rename = fs.renameSync; let paused = false;
+  fs.renameSync = function (from, to) {
+    if (!paused && to === file && String(from).includes('.commit.') && JSON.parse(fs.readFileSync(from, 'utf8')).members.A) {
+      paused = true; pause('A');
+    }
+    return rename(from, to);
+  };
+} else {
+  // B: every read of a canonical commit marker fails — the isolation cannot verify.
+  const readFile = fs.readFileSync;
+  fs.readFileSync = function (p, ...args) {
+    const n = path.basename(String(p));
+    if (n.startsWith('data.json.committing.') && (n === 'data.json.committing' || /^[0-9a-f]+$/.test(n.slice('data.json.committing.'.length))))
+      throw Object.assign(new Error('injected marker read EIO'), { code: 'EIO' });
+    return readFile(p, ...args);
+  };
+}
+const store = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: { seed: 1 } }), now: clock });
+console.log('WARMUP ' + JSON.stringify(store.warmup()));
+if (role === 'A') waitFor(path.join(root, 'go-A'));
+try { const r = await store.txn(v => { v.edit().members[role] = 1 }); console.log('TXN ' + JSON.stringify({ ok: true, revision: r.revision })) }
+catch (e) { console.log('TXN ' + JSON.stringify({ ok: false, code: e.code || 'unexpected' })) }
+`;
+  try {
+    const a = w.spawnWriter(childCode, 'A');
+    assert.equal((await a.warmup()).ok, true);
+    fs.writeFileSync(path.join(w.root, 'go-A'), '1');
+    await w.waitFor('A to reach its rename', path.join(w.root, 'entered-A'));
+    w.advanceClock(17000); // A's heartbeat goes silent
+    const b = w.spawnWriter(childCode, 'B');
+    const bWarmup = await b.warmup();
+    assert.equal(bWarmup.ok, false);
+    assert.equal(bWarmup.code, 'lock', 'the takeover refuses on the unreadable marker');
+    assert.ok(/cannot verify/.test(bWarmup.detail || ''), 'the refusal is diagnosable: ' + bWarmup.detail);
+    assert.deepEqual(await b.done, { ok: false, code: 'lock' }, 'the transaction refuses too — no swallowed success');
+    fs.writeFileSync(path.join(w.root, 'release-A'), '1');
+    assert.deepEqual(await a.done, { ok: true, revision: 1 });
+    const final = JSON.parse(fs.readFileSync(w.file, 'utf8'));
+    assert.deepEqual(final.members, { seed: 1, A: 1 }, 'L01: no acknowledged write was lost — A completes, B never pretended');
+    assert.equal(fs.readdirSync(w.root).filter(n => n.startsWith('data.json.committing.')).length, 0, 'A cleaned its own marker on the success path');
+  } finally { await w.teardown(); }
 });

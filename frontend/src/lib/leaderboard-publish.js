@@ -101,34 +101,19 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   const acknowledgeMarks = captured => {
     for (const { key, raw } of captured) if (rawMark(key) === raw) clearMark(key)
   }
-  /** Settle the intents a completed leave acted on: acknowledge the captured marks, then
-   *  drop every in-memory id whose mark was actually cleared. Ids whose key now holds a
-   *  NEWER intent's mark survive — that intent is the current decision (I05).
-   *
-   *  The closing sweep (K03): an id that NO readable mark records is memory-only — the
-   *  mark it was written under was replaced before its id could be captured (the
-   *  pre-round-9 order) or the storage cannot hold marks at all. Nothing persisted can
-   *  name a newer intent it might still protect, and a confirmed leave for this
-   *  account+instance fulfills exactly that decision — so it settles here instead of
-   *  wedging the pending state forever. */
-  function settleIntents(sess, captured) {
+  /** Settle the outcome of a confirmed leave: acknowledge the captured marks (each only
+   *  while still byte-for-byte the mark it was sent against — I05), and end the
+   *  in-memory intent this outcome may speak for. `endableId` is the id the COMPLETED
+   *  request represents: a direct request's own id, or the id that was current when an
+   *  automatic retry captured it. An intent that has since been REPLACED by a newer one
+   *  is never ended by an older outcome — and crucially, an intent is ended by IDENTITY,
+   *  never by "no persisted mark records it" (L02): a decision whose storage write
+   *  failed lives in memory and stays pending until its own confirmation, an explicit
+   *  replacement, or a later leave confirmed for this account+instance while it was
+   *  still the current decision. */
+  function settleIntents(sess, captured, endableId) {
     acknowledgeMarks(captured)
-    for (const { key, raw } of captured) {
-      // acknowledged away ⇒ the exact intent this mark recorded is done; a key that now
-      // holds a NEWER intent's mark was never cleared — that id stays tracked (I05).
-      if (rawMark(key) === null) {
-        const id = intentIdOf(raw)
-        if (id) sess.withdrawIntentIds.delete(id)
-      }
-    }
-    const hist = historicalKeys(sess)
-    const persisted = new Set()
-    for (const k of [...hist.here, ...hist.ambiguous]) {
-      const id = intentIdOf(rawMark(k))
-      if (id) persisted.add(id)
-    }
-    for (const id of [...sess.withdrawIntentIds]) if (!persisted.has(id)) sess.withdrawIntentIds.delete(id)
-    sess.withdrawMarked = sess.withdrawIntentIds.size > 0
+    if (endableId != null && sess.currentIntentId === endableId) sess.currentIntentId = null
   }
 
   /* ---------- withdrawal marks, resolved per session (G04) ----------
@@ -170,7 +155,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   function withdrawalState(sess) {
     const hist = historicalKeys(sess)
     return {
-      pending: hist.here.length > 0 || hist.ambiguous.length > 0 || sess.withdrawIntentIds.size > 0,
+      pending: hist.here.length > 0 || hist.ambiguous.length > 0 || sess.currentIntentId != null,
       ambiguous: hist.here.length === 0 && hist.ambiguous.length > 0
     }
   }
@@ -184,24 +169,21 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     if (!sess) return { ok: false, error: new Error('not signed in') }
     const key = KEY_V3(sess.instance, sess.uid)
     const intentId = newIntentId()
-    // K03: capture what the key holds BEFORE replacing it. Reading after the overwrite
-    // only ever sees the new id — the previous intent's id would stay tracked forever
-    // with no mark left to settle it, and a completed replacement could never clear
-    // the pending state. The previous intent is superseded HERE, explicitly: its request
-    // may still land server-side (same account, same effect), but it is no longer the
-    // outstanding decision.
-    const prevId = intentIdOf(rawMark(key))
+    // The decision is current from the moment it is made (K03/L02): the in-memory intent
+    // is this one — explicitly replacing whatever was current, so no ghost can
+    // accumulate — and the persisted mark is a best-effort copy, not the decision
+    // itself. A storage that cannot hold marks leaves the decision alive in memory:
+    // its pending state and its protection against publishing survive, and its own
+    // confirmation ends it without ever needing the mark.
+    sess.currentIntentId = intentId
     setMark(key, intentId)
-    if (prevId && prevId !== intentId) sess.withdrawIntentIds.delete(prevId)
-    sess.withdrawIntentIds.add(intentId)
-    sess.withdrawMarked = true
     const captured = [{ key, raw: rawMark(key) }].filter(c => c.raw !== null)
     status.withdrawPending = true
     status.withdrawAmbiguous = false
     emit()
     try {
       await client.leaveLeaderboard(me)
-      settleIntents(sess, captured)       // clears only this intent's unchanged mark (I05/J04)
+      settleIntents(sess, captured, intentId) // its own marks, its own intent (I05/J04/L02)
       if (session === sess) {
         const wd = withdrawalState(sess)
         status.withdrawPending = wd.pending
@@ -235,11 +217,12 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       }
       return { ok: true }
     }
+    const intentAtCapture = sess.currentIntentId // the memory decision this resolution acts for (L02)
     try {
       await client.leaveLeaderboard(me || sess.me)
       // The leave landed for the captured marks' account and instance — they are resolved
       // wherever they are still the marks this resolution captured (I05/J04).
-      settleIntents(sess, captured)
+      settleIntents(sess, captured, intentAtCapture)
       if (session === sess) {
         const wd = withdrawalState(sess)
         status.withdrawAmbiguous = wd.ambiguous
@@ -284,16 +267,19 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       status.withdrawAmbiguous = wd.ambiguous
       if (wd.pending) {
         if (wd.ambiguous) { emit(); return } // F06: unprovable — the person resolves it
-        // I05/J04: the marks this automatic retry may act on are captured BEFORE the me
-        // fetch and the request — its outcome settles exactly these intents, never the
-        // marks a newer request made while it was in flight.
+        // I05/J04/L02: the marks this automatic retry may act on are captured BEFORE
+        // the me fetch and the request — and so is the id of the memory decision that
+        // was current when the retry began. Its outcome settles exactly these, never
+        // the marks or the newer intent a request made while it was in flight.
         const captured = captureMarks(sess)
+        const intentAtCapture = sess.currentIntentId
         const m = await me(sess, true)
         if (!stillUs()) return
         if (!m?.enabled) {
           // Already out server-side: the captured marks' goal is the server's state, not
-          // this request — they are resolved wherever they are still the captured ones.
-          settleIntents(sess, captured)
+          // this request — they are resolved wherever they are still the captured ones,
+          // and so is the memory decision this retry captured (unchanged).
+          settleIntents(sess, captured, intentAtCapture)
           sess.me = null // the member's state just changed: never pin the "out" answer
           const wd2 = withdrawalState(sess)
           status.withdrawPending = wd2.pending
@@ -305,7 +291,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         try {
           await client.leaveLeaderboard(m)
           if (!stillUs()) return
-          settleIntents(sess, captured)
+          settleIntents(sess, captured, intentAtCapture)
           const wd2 = withdrawalState(sess)
           status.withdrawPending = wd2.pending
           status.withdrawAmbiguous = wd2.ambiguous
@@ -469,8 +455,10 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         meAt: 0,
         lastAcceptedReportRev: null,
         lastSeenReportRev: null,
-        withdrawIntentIds: new Set(),   // J04: outstanding leave intents BY ID, not one boolean
-        withdrawMarked: false,
+        currentIntentId: null,          // the CURRENT leave decision's id — one slot, replaced
+                                        // explicitly by every newer request (K03), ended only by
+                                        // its own confirmation (L02); persisted marks are a
+                                        // best-effort copy of it, never the decision itself
         lastPublished: ''
       }
       const wd = withdrawalState(session)
