@@ -72,7 +72,8 @@ test('consent: joining under an old disclosure text is refused with the current 
   const { lb: lb2, store } = domainFixture();
   await join(lb2, 'u1');
   await lb2.report('u1', reportBody({}));
-  await store.txn(d => { d.members.u1.disclosureVersion = 0; });
+  await store.txn(view => {
+    const d = view.edit(); d.members.u1.disclosureVersion = 0; });
   assert.equal(lb2.board('week', null).rows.length, 0);
 });
 
@@ -407,7 +408,8 @@ test('S07: expired week/month cheers are pruned past a working-set size; current
   await lb.report('u1', reportBody({}));
   const target = lb.me('u1').publicMemberId;
   // 2000 expired cheers (last week / last month), plus the ones that must survive.
-  await store.txn(d => {
+  await store.txn(view => {
+    const d = view.edit();
     for (let i = 0; i < 1000; i++) d.likes[`actor${i}|u1|week|2026-10-12`] = { createdAt: 1 };
     for (let i = 1000; i < 2000; i++) d.likes[`actor${i}|u1|month|2026-09`] = { createdAt: 1 };
   });
@@ -446,7 +448,8 @@ test('S06: a burst of accounts from one address hits the IP budget, not just the
 
 test('R06: 500 members and 100k cheers answer a board read in well under a second', async () => {
   const { lb, store } = domainFixture(bj(2026, 10, 22, 10));
-  await store.txn(d => {
+  await store.txn(view => {
+    const d = view.edit();
     for (let i = 0; i < 500; i++) {
       const uid = 'm' + i;
       d.members[uid] = {
@@ -507,13 +510,15 @@ test('I03: legacy adminActions[].audited=false migrate into the pending queue �
   await join(lb, 'u1');
   // A file from the pre-pendingAudits build: the accepted-but-undelivered event sits in the
   // reviewed history with audited:false, and there is no pendingAudits at all.
-  await store.txn(d => {
+  await store.txn(view => {
+    const d = view.edit();
     d.adminActions = [{ actionId: 'legacy-1', at: 1, actor: 'admin', targetUid: 'u1', suspended: true, reason: 'old build', audited: false }];
     delete d.pendingAudits;
   });
   // The deliverer of that build only read the queue — it saw nothing. The migration moves
   // the event in, never duplicating one that is already queued.
-  await store.txn(d => { d.pendingAudits = [{ actionId: 'legacy-2', at: 2, actor: 'admin', targetUid: 'u1', suspended: false, reason: '', audited: false }]; });
+  await store.txn(view => {
+    const d = view.edit(); d.pendingAudits = [{ actionId: 'legacy-2', at: 2, actor: 'admin', targetUid: 'u1', suspended: false, reason: '', audited: false }]; });
   assert.equal(await lb.migrateLegacyAudits(), 1); // only legacy-1: legacy-2 was already queued
   let pending = lb.unauditedActions().map(a => a.actionId);
   assert.deepEqual(pending.sort(), ['legacy-1', 'legacy-2']);
@@ -534,7 +539,8 @@ test('I03: legacy adminActions[].audited=false migrate into the pending queue �
 test('I03: an interrupted migration simply had not happened — the next boot picks it up', async () => {
   const { lb, store, file } = domainFixture();
   await join(lb, 'u1');
-  await store.txn(d => {
+  await store.txn(view => {
+    const d = view.edit();
     d.adminActions = [
       { actionId: 'k1', at: 1, actor: 'admin', targetUid: 'u1', suspended: true, reason: 'r', audited: false },
       { actionId: 'k2', at: 2, actor: 'admin', targetUid: 'u1', suspended: false, reason: '', audited: true }
@@ -560,7 +566,8 @@ test('I04: a pending action that fell out of the capped history is still idempot
   // adminStatus calls would leave): the reviewed history keeps the newest 500, so
   // pending-0 and pending-1 live ONLY in the pending queue. The audit log is deliberately
   // unwritable for the whole stretch.
-  await store.txn(d => {
+  await store.txn(view => {
+    const d = view.edit();
     const events = Array.from({ length: 502 }, (_, i) => ({
       actionId: 'pending-' + i, at: 1000 + i, actor: 'admin', targetUid: 'u1',
       suspended: i % 2 === 0, reason: 'backlog', audited: false
@@ -587,4 +594,39 @@ test('the reviewed history keeps ONE entry per action across delivery (round-7 d
   assert.equal(store.peek().adminActions.filter(a => a.actionId === 'one-1').length, 1, 'delivery confirms, it does not append a second copy');
   assert.equal(store.peek().adminActions.find(a => a.actionId === 'one-1').audited, true);
   assert.equal(lb.unauditedActions().length, 0);
+});
+
+test('the board cache: every mutation invalidates it; the viewer column is overlaid per caller', async () => {
+  const { lb } = domainFixture();
+  await join(lb, 'u1');
+  await join(lb, 'u2');
+  await lb.report('u1', reportBody({}));
+  const w = lb.board('week', null).window; // the cache is built here
+  // A cheer lands — the cached counts must not outlive the mutation.
+  await lb.like({ actorUid: 'u2', targetPublicId: lb.me('u1').publicMemberId, windowType: 'week', windowKey: w.windowKey, on: true });
+  let board = lb.board('week', 'u2');
+  assert.equal(board.rows.find(r => r.displayName === 'u1').likeCount, 1);
+  assert.equal(board.rows.find(r => r.displayName === 'u1').viewerLiked, true);
+  // The same answer through another viewer's eyes: the column is overlaid, never baked in.
+  board = lb.board('week', 'u1');
+  assert.equal(board.rows.find(r => r.displayName === 'u1').viewerLiked, false);
+  // A guest view's rows are fresh copies — the route deletes the viewer field on them, and
+  // that must not corrupt the next member's answer.
+  const guest = lb.board('week', null);
+  for (const r of guest.rows) delete r.viewerLiked;
+  assert.equal(lb.board('week', 'u2').rows.find(r => r.displayName === 'u1').viewerLiked, true);
+  // Withdrawal, rejoin, suspension, restore and a rename all move the epoch — the rows
+  // reflect each one without any cache being stale.
+  await lb.consent('u1', { enabled: false, baseConsentVersion: lb.me('u1').consentVersion });
+  assert.equal(lb.board('week', null).rows.length, 1); // u2 alone
+  await lb.consent('u1', { enabled: true, disclosureVersion: DISCLOSURE_VERSION, baseConsentVersion: lb.me('u1').consentVersion });
+  assert.equal(lb.board('week', null).rows.length, 2);
+  await lb.adminStatus({ actorUid: 'admin', targetUid: 'u1', suspended: true, reason: 'cache check', actionId: 'cc-1' });
+  assert.equal(lb.board('week', null).rows.length, 1);
+  await lb.adminStatus({ actorUid: 'admin', targetUid: 'u1', suspended: false, reason: '', actionId: 'cc-2' });
+  assert.equal(lb.board('week', null).rows.length, 2);
+  await lb.profile('u1', { displayName: 'Renamed' });
+  assert.ok(lb.board('week', null).rows.some(r => r.displayName === 'Renamed'));
+  await lb.forget('u2');
+  assert.equal(lb.board('week', null).rows.length, 1);
 });

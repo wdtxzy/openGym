@@ -117,6 +117,15 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
   const PRUNE_AT_LIKES = 2000; // amortized: pruned inside a like transaction past this size
   let prunedAtSize = 0;        // …but at most once per 25% growth, never on every like (N07)
 
+  /* The board's public result, cached per (epoch, window) — the round-7 read optimization.
+   *  Every mutation moves the store's epoch, so joins, withdrawals, suspensions, restores,
+   *  deletions, renames and every cheer invalidate it; the window key rolls the cache at
+   * week/month edges even when nothing was written. The cached rows carry NO viewer field:
+   *  each caller's own column is overlaid on fresh copies — a shared DTO is never mutated
+   *  per viewer, and the guest path (which deletes the field outright) cannot damage the
+   *  cache for members. */
+  let boardCache = null;
+
   return {
     DISCLOSURE_VERSION,
 
@@ -144,7 +153,8 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
      *  sequence — the stale-device guard. Joining requires confirming the CURRENT disclosure
      *  text; withdrawing keeps identity and received cheers, drops the published facts. */
     consent(uid, { enabled, disclosureVersion, baseConsentVersion, displayName }) {
-      return store.txn(data => {
+      return store.txn(view => {
+        const data = view.edit();
         const m = data.members[uid] || (data.members[uid] = {
           publicMemberId: crypto.randomBytes(8).toString('base64url'),
           // null = never chosen. An empty string is the member's explicit anonymous choice and
@@ -183,7 +193,8 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
      *  by requestId; optimistic by baseReportRev; bound to the current consent sequence. */
     report(uid, body) {
       const today = beijingDayKey(now());
-      return store.txn(data => {
+      return store.txn(view => {
+        const data = view.edit();
         const m = requireMember(data, uid);
         if (!m.enabled) throw new LeaderboardError(403, 'not-participating');
         if (m.suspended) throw new LeaderboardError(403, 'suspended');
@@ -266,24 +277,40 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
       const w = windowFor(windowType, now());
       if (!w) throw new LeaderboardError(400, 'window');
       const data = store.peek ? store.peek() : store.read(); // read-only path: no per-request clone (N07)
-      const counts = likeCounts(data, w);
-      const rows = [];
-      for (const [uid, m] of Object.entries(data.members)) {
-        if (!visible(m)) continue;
-        const t = totalsFor(m, w);
-        rows.push({
-          publicMemberId: m.publicMemberId,
-          displayName: m.displayName || '',
-          emoji: m.emoji,
-          gymMs: t.gymMs, syncedMs: t.syncedMs,
-          gymSessions: t.gymSessions, syncedSessions: t.syncedSessions,
-          totalMs: t.gymMs + t.syncedMs,
-          likeCount: counts.get(uid) || 0,
-          viewerLiked: viewerUid ? !!data.likes[`${viewerUid}|${uid}|${w.windowType}|${w.windowKey}`] : false,
-          dataAsOf: m.dataAsOf
-        });
+      const epoch = typeof store.epoch === 'function' ? store.epoch() : -1;
+      if (!boardCache || boardCache.epoch !== epoch || boardCache.windowType !== windowType || boardCache.windowKey !== w.windowKey) {
+        const counts = likeCounts(data, w);
+        const uidByPublicId = new Map();
+        const rows = [];
+        for (const [uid, m] of Object.entries(data.members)) {
+          if (!visible(m)) continue;
+          uidByPublicId.set(m.publicMemberId, uid);
+          const t = totalsFor(m, w);
+          rows.push({
+            publicMemberId: m.publicMemberId,
+            displayName: m.displayName || '',
+            emoji: m.emoji,
+            gymMs: t.gymMs, syncedMs: t.syncedMs,
+            gymSessions: t.gymSessions, syncedSessions: t.syncedSessions,
+            totalMs: t.gymMs + t.syncedMs,
+            likeCount: counts.get(uid) || 0,
+            dataAsOf: m.dataAsOf
+          });
+        }
+        boardCache = {
+          epoch, windowType, windowKey: w.windowKey,
+          window: { windowType: w.windowType, windowKey: w.windowKey, startKey: w.startKey, endKey: w.endKey, startMs: w.startMs, endMs: w.endMs, timezone: w.timezone, weekStart: w.weekStart, calendarVersion: w.calendarVersion },
+          uidByPublicId,
+          rows: rankRows(rows)
+        };
       }
-      return { window: { windowType: w.windowType, windowKey: w.windowKey, startKey: w.startKey, endKey: w.endKey, startMs: w.startMs, endMs: w.endMs, timezone: w.timezone, weekStart: w.weekStart, calendarVersion: w.calendarVersion }, rows: rankRows(rows) };
+      // The viewer's own column, overlaid on fresh row copies from the LIVE like table —
+      // a like added a moment ago shows even while the cached counts are a revision old.
+      const rows = boardCache.rows.map(row => {
+        const uid = boardCache.uidByPublicId.get(row.publicMemberId);
+        return { ...row, viewerLiked: !!(viewerUid && uid && data.likes[`${viewerUid}|${uid}|${w.windowType}|${w.windowKey}`]) };
+      });
+      return { window: boardCache.window, rows };
     },
 
     /** Set or clear a cheer (FR-1.13R). The window key is judged by the server's clock: a
@@ -294,7 +321,10 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
       if (!w) throw new LeaderboardError(400, 'window');
       if (windowKey !== w.windowKey) throw new LeaderboardError(409, 'window-expired', { windowKey: w.windowKey });
       let noopTarget = null;
-      const r = await store.txn(data => {
+      const r = await store.txn(view => {
+        // The plan phase reads the live snapshot — the common no-op (a repeated cheer or
+        // the removal of an absent one) returns before any clone is paid for.
+        const data = view.state;
         let targetUid = null;
         let target = null;
         for (const [uid, m] of Object.entries(data.members)) {
@@ -307,19 +337,20 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
         const sizeBefore = Object.keys(data.likes).length;
         if (on) {
           if (data.likes[key]) return NO_WRITE; // a repeat cheer changes nothing: no rewrite, no fsync
-          data.likes[key] = { createdAt: now() };
         } else {
           if (!data.likes[key]) return NO_WRITE; // removing an absent cheer is a no-op too
-          delete data.likes[key];
         }
+        const draft = view.edit(); // first mutation: the clone happens here and only here
+        if (on) draft.likes[key] = { createdAt: now() };
+        else delete draft.likes[key];
         // Amortized lifecycle: expired week/month cheers go once the table has both passed the
         // working set AND grown a quarter since the last pass — never on every single like
         // (N07). The current period and the all-time counter always survive.
         if (sizeBefore > PRUNE_AT_LIKES && sizeBefore > prunedAtSize * 1.25) {
-          pruneLikes(data, now());
-          prunedAtSize = Object.keys(data.likes).length;
+          pruneLikes(draft, now());
+          prunedAtSize = Object.keys(draft.likes).length;
         }
-        const after = likeCounts(data, w).get(targetUid) || 0;
+        const after = likeCounts(draft, w).get(targetUid) || 0;
         return { liked: on, likeCount: after };
       });
       if (r.out === undefined) {
@@ -333,17 +364,19 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
     /** Admin suspension (Q20): reasoned, audited by the caller, idempotent by actionId, and
      *  immune to withdraw/rejoin — the member row is never deleted. */
     adminStatus({ actorUid, targetUid, suspended, reason, actionId }) {
-      return store.txn(data => {
-        const m = memberOf(data, targetUid);
-        if (!m) throw new LeaderboardError(404, 'no-such-member');
+      return store.txn(view => {
+        const state = view.state; // guards and the idempotency lookup plan without a clone
+        if (!memberOf(state, targetUid)) throw new LeaderboardError(404, 'no-such-member');
         if (typeof actionId !== 'string' || !actionId || actionId.length > 64) throw new LeaderboardError(400, 'action-id');
         // I04: the idempotency index covers EVERY still-valid accepted action — the pending
         // queue first (an action can fall out of the 500-entry reviewed history long before
         // its audit line is deliverable; replaying it must answer "already applied", never
         // re-apply it or enqueue a second copy), then the reviewed history.
-        const prior = list(data.pendingAudits).find(a => a.actionId === actionId)
-          || list(data.adminActions).find(a => a.actionId === actionId);
+        const prior = list(state.pendingAudits).find(a => a.actionId === actionId)
+          || list(state.adminActions).find(a => a.actionId === actionId);
         if (prior) return { ok: true, applied: false, at: prior.at };
+        const data = view.edit();
+        const m = requireMember(data, targetUid);
         if (suspended) {
           const why = String(reason || '').trim();
           if (!why) throw new LeaderboardError(400, 'reason-required');
@@ -372,7 +405,8 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
      *  fallback text) and one of the controlled emoji. Same identity on every device — it
      *  lives in the shared file, not the client. */
     profile(uid, { displayName, emoji } = {}) {
-      return store.txn(data => {
+      return store.txn(view => {
+        const data = view.edit();
         const m = requireMember(data, uid);
         if (!m.enabled) throw new LeaderboardError(403, 'not-participating');
         if (displayName !== undefined) {
@@ -437,10 +471,11 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
      *  so a rerun — on every boot, after an interrupted one — is a no-op. One transaction:
      *  atomic, so an interrupted migration simply had not happened. */
     migrateLegacyAudits() {
-      return store.txn(data => {
-        if (data.auditQueueVersion >= 2) return false;
-        const pendingIds = new Set(list(data.pendingAudits).map(a => a.actionId));
-        const legacy = list(data.adminActions).filter(a => a && a.audited === false && !pendingIds.has(a.actionId));
+      return store.txn(view => {
+        if (view.state.auditQueueVersion >= 2) return false;
+        const pendingIds = new Set(list(view.state.pendingAudits).map(a => a.actionId));
+        const legacy = list(view.state.adminActions).filter(a => a && a.audited === false && !pendingIds.has(a.actionId));
+        const data = view.edit();
         data.pendingAudits = [...list(data.pendingAudits), ...legacy.map(a => ({ ...a, audited: false }))];
         // The history keeps every action, but never again as "undelivered" — the pending
         // queue is now the only place an unconfirmed event lives.
@@ -452,19 +487,20 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
 
     markAudited(actionIds) {
       const ids = new Set(actionIds);
-      return store.txn(data => {
-        const pending = list(data.pendingAudits);
+      return store.txn(view => {
+        const pending = list(view.state.pendingAudits);
         const delivered = pending.filter(a => ids.has(a.actionId));
         // The pending queue only shrinks by actual delivery — never by the history window
         // (H04). The reviewed history already holds the action from the disposition itself;
         //  a delivered event joins it only when it is missing (an action that fell out of
         //  the capped history while still pending, or a legacy one), and always as
         //  reviewed — one action, one history entry (the round-7 duplicate-history fix).
-        data.pendingAudits = pending.filter(a => !ids.has(a.actionId));
-        const known = new Set(list(data.adminActions).map(a => a.actionId));
+        const known = new Set(list(view.state.adminActions).map(a => a.actionId));
         const additions = delivered
           .filter(a => !known.has(a.actionId))
           .map(a => { const { audited, ...rest } = a; return { ...rest, audited: true }; });
+        const data = view.edit();
+        data.pendingAudits = pending.filter(a => !ids.has(a.actionId));
         data.adminActions = [...list(data.adminActions), ...additions].slice(-500);
         return delivered.length;
       }).then(({ out }) => out);
@@ -475,7 +511,8 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
      *  of, in either direction. Unlike a withdrawal this is a real removal: there is no
      *  account left to rejoin. Admin action records stay (audit trail, bounded). */
     forget(uid) {
-      return store.txn(data => {
+      return store.txn(view => {
+        const data = view.edit();
         const had = !!data.members[uid];
         delete data.members[uid];
         for (const key of Object.keys(data.likes)) {

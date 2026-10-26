@@ -99,8 +99,13 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     let fd = null;
     try {
       fd = fs.openSync(mtmp, 'wx');
+      // No fsync here, by measurement and by analysis: the marker is recovery ADVICE, not
+      // data — a marker lost to a power cut means the crashed writer's private temp file
+      // survives as harmless debris (it never renamed), and a marker that DID land is
+      // cleared with its temp file by the takeover. Durability is not what the takeover
+      // depends on; atomic APPEARANCE (below) is. The extra fsync cost every write ~35 ms
+      // on container filesystems (verify7 capacity re-run).
       fs.writeSync(fd, JSON.stringify({ pid: process.pid, host: myHost, token: myToken, at: now(), tmp: tmpData }));
-      fs.fsyncSync(fd);
       fs.closeSync(fd);
       fd = null;
       try { fs.linkSync(mtmp, commitMarker); }
@@ -192,6 +197,7 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   let data = null;        // the parsed cache; null until the first successful load
   let refused = null;     // a StoreError once the file proved unusable — sticky until restart
   let knownMtime = 0;     // our own writes update it; a different mtime means an external hand
+  let epoch = 0;          // moves every time `data` is (re)assigned: a commit, the init, an external adopt — the cheap "did anything change" key a read cache can hang off (revision alone cannot: an adopted external file may carry the same number)
   let locked = false;
   let queue = Promise.resolve();
 
@@ -403,6 +409,7 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
           const reparsed = JSON.parse(fs.readFileSync(file, 'utf8'));
           if (!reparsed || reparsed.schemaVersion !== schemaVersion) throw new Error('schema');
           data = reparsed;
+          epoch++;
           knownMtime = mtime;
         } catch (e) {
           refused = new StoreError('corrupt', `external change is not readable (${e.message})`);
@@ -422,6 +429,7 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
       const fresh = { schemaVersion, revision: 0, updatedAt: now(), ...init() };
       persist(fresh);
       data = fresh;
+      epoch++;
       return data;
     }
     let parsed;
@@ -432,12 +440,19 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
       throw refused;
     }
     data = parsed;
+    epoch++;
     return data;
   }
 
   return {
     /** Graceful shutdown: hand the lock back so a recreated instance starts clean (T04). */
     release,
+
+    /** How many times the cached state object was (re)assigned — a commit, the initial
+     *  load, an adopted external change. A read cache keyed on this plus its own natural
+     *  key can never serve a row across a state change, even one whose revision number
+     *  an external edit happened to reuse. */
+    epoch() { return epoch; },
 
     /** Cheap liveness for a deploy probe: false once the store refused (second writer,
      *  damaged file) — the container is up but this feature is not. */
@@ -461,26 +476,41 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
       return structuredClone(load());
     },
 
-    /** Run `fn(draft)` against a private draft and persist the result. `fn` may be async:
+    /** Run `fn(view)` against the file's state and persist the result. `fn` may be async:
      *  the queue awaits it before anything is written, so a mutation made after an await
-     *  lands on disk too, and the next transaction still starts only after this one settles.
-     *  `fn`'s return value is passed back; a throw from `fn` or a failed write leaves file
-     *  and cache untouched, and the next transaction runs after a failure — never wedged. */
+     *  lands on disk too, and the next transaction still starts only after this one
+     *  settles. `fn`'s return value is passed back; a throw from `fn` or a failed write
+     *  leaves file and cache untouched, and the next transaction runs after a failure —
+     *  never wedged.
+     *
+     *  THE VIEW (the round-7 NO_WRITE cost fix): `view.state` is the live snapshot for the
+     *  read/plan phase; `view.edit()` clones it ONCE, lazily, the first time the callback
+     *  is about to mutate — a repeated cheer or the removal of an absent one (the common
+     *  no-op) never pays the structuredClone of a 100k-entry table. After edit() the draft
+     *  is the ONLY object to touch: reads from a `view.state` reference taken before the
+     *  edit see the pre-clone state. `NO_WRITE` from a callback that also called edit() is
+     *  a broken promise — honored as before (nothing persists), same as it ever was. */
     txn(fn) {
       // lock() lives INSIDE the queued run: a refused/deposed store must answer with a
       // REJECTION, not a synchronous throw out of txn() itself (callers await it).
       const run = async () => {
         lock();
         const current = load();
-        const draft = structuredClone(current);
-        const out = fn(draft);
+        let draft = null;
+        const view = {
+          get state() { return draft ?? current; },
+          edit() { if (!draft) draft = structuredClone(current); return draft; }
+        };
+        const out = fn(view);
         const value = (out && typeof out.then === 'function') ? await out : out;
         if (value === NO_WRITE) return { revision: current.revision || 0, out: undefined };
-        draft.revision = (current.revision || 0) + 1;
-        draft.updatedAt = now();
-        persist(draft);
-        data = draft;
-        return { revision: draft.revision, out: value };
+        const target = draft ?? current;
+        target.revision = (current.revision || 0) + 1;
+        target.updatedAt = now();
+        persist(target);
+        data = target;
+        epoch++;
+        return { revision: target.revision, out: value };
       };
       const p = queue.then(run, run);
       queue = p.catch(() => {});

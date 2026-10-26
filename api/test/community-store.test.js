@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { createSharedStore, StoreError } from '../community/store.js';
+import { createSharedStore, StoreError, NO_WRITE } from '../community/store.js';
 
 const dir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'community-store-'));
 
@@ -41,7 +41,8 @@ test('a missing file is initialized with the given shape and revision 0', () => 
 test('a txn mutates, bumps the revision, persists, and read() returns a private copy', async () => {
   const file = path.join(dir(), 'shared.json');
   const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  const { revision, out } = await s.txn(d => { d.members.alice = { likes: 1 }; return 'done'; });
+  const { revision, out } = await s.txn(view => {
+    const d = view.edit(); d.members.alice = { likes: 1 }; return 'done'; });
   assert.equal(out, 'done');
   assert.equal(revision, 1);
   assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).members.alice.likes, 1);
@@ -56,7 +57,8 @@ test('interleaved transactions serialize — no update is lost between awaits', 
   const s = makeStore();
   // Every transaction awaits inside fn: without the queue, two of them would clone the same
   // base and the slower write would erase the faster one's increment.
-  const bump = n => s.txn(async d => {
+  const bump = n => s.txn(async view => {
+    const d = view.edit();
     d.members.n = (d.members.n || 0) + 1;
     await new Promise(r => setTimeout(r, Math.random() * 3));
     return n;
@@ -69,12 +71,15 @@ test('interleaved transactions serialize — no update is lost between awaits', 
 test('a throwing fn writes nothing, keeps the revision, and does not wedge the queue', async () => {
   const file = path.join(dir(), 'shared.json');
   const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  await s.txn(d => { d.members.a = 1; });
+  await s.txn(view => {
+    const d = view.edit(); d.members.a = 1; });
   const bytesBefore = fs.readFileSync(file, 'utf8');
-  await assert.rejects(s.txn(d => { throw new Error('validation failed'); }));
+  await assert.rejects(s.txn(view => {
+    const d = view.edit(); throw new Error('validation failed'); }));
   assert.equal(fs.readFileSync(file, 'utf8'), bytesBefore);
   assert.equal(s.read().revision, 1);
-  const { revision } = await s.txn(d => { d.members.b = 2; });
+  const { revision } = await s.txn(view => {
+    const d = view.edit(); d.members.b = 2; });
   assert.equal(revision, 2, 'the queue survived the rejected transaction');
 });
 
@@ -88,14 +93,17 @@ test('a failed write leaves file and cache untouched, and the next txn still run
       fs.writeFileSync(f, content);
     }
   });
-  await s.txn(d => { d.members.a = 1; });
+  await s.txn(view => {
+    const d = view.edit(); d.members.a = 1; });
   const bytesBefore = fs.readFileSync(file, 'utf8');
   failWrites = 1;
-  await assert.rejects(s.txn(d => { d.members.a = 2; }), e => e instanceof StoreError && e.code === 'write-failed');
+  await assert.rejects(s.txn(view => {
+    const d = view.edit(); d.members.a = 2; }), e => e instanceof StoreError && e.code === 'write-failed');
   assert.equal(fs.readFileSync(file, 'utf8'), bytesBefore, 'the failed write changed nothing on disk');
   assert.equal(s.read().members.a, 1, 'the cache still matches the disk');
   assert.equal(s.read().revision, 1);
-  const { revision } = await s.txn(d => { d.members.a = 3; });
+  const { revision } = await s.txn(view => {
+    const d = view.edit(); d.members.a = 3; });
   assert.equal(revision, 2);
   assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).members.a, 3);
 });
@@ -106,7 +114,8 @@ test('a corrupt file is refused, byte for byte, by both read and txn', async () 
   const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   assert.equal(s.warmup().code, 'corrupt');
   assert.throws(() => s.read(), e => e.code === 'corrupt');
-  await assert.rejects(s.txn(d => { d.members.a = 1; }), e => e.code === 'corrupt');
+  await assert.rejects(s.txn(view => {
+    const d = view.edit(); d.members.a = 1; }), e => e.code === 'corrupt');
   assert.equal(fs.readFileSync(file, 'utf8'), '{ this is not json', 'the damaged original survives');
 });
 
@@ -187,12 +196,14 @@ test('F01: a deposed writer stops leasing, stops committing, and reads unhealthy
   const a = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   assert.equal(a.warmup().ok, true);
   assert.equal(a.healthy(), true);
-  await a.txn(d => { d.members.before = 1 }); // one committed change
+  await a.txn(view => {
+    const d = view.edit(); d.members.before = 1 }); // one committed change
   // While A is "paused", a peer recovers the silent lease (a fresh foreign token in its place).
   fs.writeFileSync(file + '.lock', JSON.stringify({ pid: 1, host: 'peer-container', token: 'peer', at: Date.now() }));
   // A's next commit proves the lease at the commit point — or the conditional heartbeat has
   // already deposed it; either refusal (lost-lock / second-writer) is the correct outcome.
-  await assert.rejects(a.txn(d => { d.members.after = 1 }), e => e.code === 'lost-lock' || e.code === 'second-writer');
+  await assert.rejects(a.txn(view => {
+    const d = view.edit(); d.members.after = 1 }), e => e.code === 'lost-lock' || e.code === 'second-writer');
   assert.equal(a.healthy(), false);
   assert.equal(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')).token, 'peer', 'the deposed writer never rewrites the lease');
   assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).members.after, undefined, 'the deposed writer never commits');
@@ -202,13 +213,15 @@ test('F01: a deposed writer stops leasing, stops committing, and reads unhealthy
 test('R07: a file that corrupts after warmup refuses both reads and writes, and survives byte for byte', async () => {
   const file = path.join(dir(), 'shared.json');
   const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  await s.txn(d => { d.members.a = 1; });
+  await s.txn(view => {
+    const d = view.edit(); d.members.a = 1; });
   const damaged = '{ this is not json';
   fs.writeFileSync(file, damaged);
   const future = new Date(Date.now() + 5000);
   fs.utimesSync(file, future, future); // mtime must move, or the change is invisible
   assert.throws(() => s.read(), e => e.code === 'corrupt');
-  await assert.rejects(s.txn(d => { d.members.b = 2; }), e => e.code === 'corrupt');
+  await assert.rejects(s.txn(view => {
+    const d = view.edit(); d.members.b = 2; }), e => e.code === 'corrupt');
   assert.equal(fs.readFileSync(file, 'utf8'), damaged, 'the damaged original is never overwritten from cache');
   assert.equal(s.warmup().ok, false, 'the refusal is sticky, not a one-shot');
   assert.equal(s.warmup().code, 'corrupt');
@@ -217,7 +230,8 @@ test('R07: a file that corrupts after warmup refuses both reads and writes, and 
 test('R08: an async callback is awaited — mutations after an await reach the disk', async () => {
   const file = path.join(dir(), 'shared.json');
   const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  await s.txn(async d => {
+  await s.txn(async view => {
+    const d = view.edit();
     d.members.before = 1;
     await new Promise(r => setTimeout(r, 5));
     d.members.afterAwait = 1; // before this fix, the disk was already written without it
@@ -230,14 +244,17 @@ test('R08: an async callback is awaited — mutations after an await reach the d
 test('R08: an async rejection writes nothing and does not wedge the queue', async () => {
   const file = path.join(dir(), 'shared.json');
   const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  await s.txn(d => { d.members.a = 1; });
-  await assert.rejects(s.txn(async d => {
+  await s.txn(view => {
+    const d = view.edit(); d.members.a = 1; });
+  await assert.rejects(s.txn(async view => {
+    const d = view.edit();
     d.members.b = 2;
     await new Promise(r => setTimeout(r, 5));
     throw new Error('async validation failed');
   }));
   assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).members.b, undefined);
-  const { revision } = await s.txn(d => { d.members.c = 3; });
+  const { revision } = await s.txn(view => {
+    const d = view.edit(); d.members.c = 3; });
   assert.equal(revision, 2);
 });
 
@@ -262,7 +279,8 @@ test('R09: a failed first initialization is retried honestly, never cached as ok
 test('an external rewrite of the file (operator edit) is picked up by read()', async () => {
   const file = path.join(dir(), 'shared.json');
   const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  await s.txn(d => { d.members.a = 1; });
+  await s.txn(view => {
+    const d = view.edit(); d.members.a = 1; });
   // Supported only while stopped, in practice — this just keeps a long-lived cache from
   // answering from a snapshot the operator already replaced before this process saw it.
   fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, revision: 50, members: { b: 2 } }));
@@ -274,10 +292,13 @@ test('an external rewrite of the file (operator edit) is picked up by read()', a
 test('a restart continues the revision from what is on disk', async () => {
   const file = path.join(dir(), 'shared.json');
   const first = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  await first.txn(d => { d.members.a = 1; });
-  await first.txn(d => { d.members.b = 2; });
+  await first.txn(view => {
+    const d = view.edit(); d.members.a = 1; });
+  await first.txn(view => {
+    const d = view.edit(); d.members.b = 2; });
   const second = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  const { revision } = await second.txn(d => { d.members.c = 3; });
+  const { revision } = await second.txn(view => {
+    const d = view.edit(); d.members.c = 3; });
   assert.equal(revision, 3);
 });
 
@@ -352,7 +373,8 @@ fs.renameSync = function (from, to) {
 };
 const store = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: { seed: 1 } }), now: clock });
 try {
-  const r = await store.txn(d => { d.members[role] = 1 });
+  const r = await store.txn(view => {
+    const d = view.edit(); d.members[role] = 1 });
   console.log(JSON.stringify({ ok: true, revision: r.revision }));
 } catch (e) {
   console.log(JSON.stringify({ ok: false, code: e.code || 'unexpected' }));
@@ -418,5 +440,34 @@ try {
     for (const child of children) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
     await new Promise(r => setTimeout(r, 50));
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the view (round-7 NO_WRITE cost): a no-op plans without a clone; the first mutation clones once', async () => {
+  const s = makeStore();
+  await s.txn(view => { const d = view.edit(); d.members.a = 1; });
+  const realClone = structuredClone;
+  let clones = 0;
+  globalThis.structuredClone = v => { clones++; return realClone(v); };
+  try {
+    // The plan phase reads the live snapshot; a NO_WRITE answer costs no copy at all.
+    const out = await s.txn(view => {
+      assert.equal(view.state.members.a, 1);
+      return NO_WRITE;
+    });
+    assert.deepEqual(out, { revision: 1, out: undefined });
+    assert.equal(clones, 0, 'a no-op transaction never pays the clone');
+    // The first mutation clones exactly once, and every later edit() hands back the same draft.
+    await s.txn(view => {
+      const d1 = view.edit();
+      const d2 = view.edit();
+      assert.equal(d1, d2, 'one clone per transaction, however many edits');
+      d1.members.b = 2;
+    });
+    assert.equal(clones, 1);
+    assert.deepEqual(s.read().members, { a: 1, b: 2 });
+    assert.equal(s.read().revision, 2, 'only the mutating transaction moved the revision');
+  } finally {
+    globalThis.structuredClone = realClone;
   }
 });

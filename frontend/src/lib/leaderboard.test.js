@@ -172,3 +172,45 @@ describe('windowTotals — the same buckets, summed per period', () => {
 })
 
 function now0() { return bj(2026, 10, 24, 12) }
+
+describe('the merged-interval fast path (round-7 optimization)', () => {
+  // A tiny seeded PRNG so the comparison is reproducible on every run.
+  const rng = seed => () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff
+
+  it('counts exactly what the clip-then-union reference counts, on random inputs', () => {
+    const rand = rng(20261026)
+    for (let round = 0; round < 300; round++) {
+      const training = Array.from({ length: 1 + Math.floor(rand() * 8) }, () => {
+        const a = Math.floor(rand() * 600000000)
+        return [a, a + Math.floor(rand() * 3600000)]
+      })
+      const start = Math.floor(rand() * 600000000)
+      const end = start + Math.floor(rand() * 7200000)
+      const reference = Math.max(0, (end - start) - unionLength(
+        training.map(([s, e]) => [Math.max(s, start), Math.min(e, end)])
+      ))
+      expect(remainingMs(start, end, training)).toBe(reference)
+    }
+  })
+
+  it('an aggregate of 4000 workouts and 4000 activities answers without the quadratic pass', () => {
+    const workouts = Array.from({ length: 4000 }, (_, i) => ({
+      id: 'w' + i, d: '2026-10-20', start: 1000 + i * 60000, end: 1400 + i * 60000
+    }))
+    const activities = Array.from({ length: 4000 }, (_, i) => ({
+      id: 'a' + i, startMs: 1200 + i * 60000, endMs: 5900 + i * 60000
+    }))
+    const t0 = performance.now()
+    const { days, lifetime } = aggregate(workouts, activities)
+    const ms = performance.now() - t0
+    expect(lifetime.gymSessions).toBe(4000)
+    expect(lifetime.syncedSessions).toBe(4000)
+    // Each activity (4700 ms) loses exactly its 200 ms overlap with its own workout.
+    expect(lifetime.syncedMs).toBe(4000 * 4500)
+    expect(Object.keys(days).length).toBeGreaterThan(0)
+    // The round-7 measurement had the quadratic pass at ~180 ms for this size; the merged
+    // path runs in a few. A generous ceiling keeps the test honest on slow machines without
+    // letting the old complexity back in unnoticed.
+    expect(ms).toBeLessThan(150)
+  })
+})

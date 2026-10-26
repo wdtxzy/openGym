@@ -30,7 +30,10 @@ const isMs = v => Number.isFinite(v) && v >= 0 && Number.isSafeInteger(v);
 
 /* ---------- interval arithmetic (Q11: subtract the training union, once) ---------- */
 
-/** Total length of the union of [start, end) intervals — overlapping pieces counted once. */
+/** Total length of the union of [start, end) intervals — overlapping pieces counted once.
+ *  Kept as the reference implementation the merged-interval fast path is randomized
+ *  against (the round-7 aggregate optimization must not change what is counted, only how
+ *  fast it is found). */
 export function unionLength(intervals) {
   const spans = intervals
     .filter(([s, e]) => isMs(s) && isMs(e) && e > s)
@@ -44,14 +47,51 @@ export function unionLength(intervals) {
   return total;
 }
 
+/** Training intervals, pre-merged for the per-activity pass: validated, sorted, overlapping
+ *  and touching spans fused into disjoint order. Once merged, the overlap with any activity
+ *  window is located by binary search and one forward sweep — O(log T + hits) per activity
+ *  instead of re-clipping and re-sorting every training interval for every activity (the
+ *  round-7 aggregate optimization: 4000+4000 went from ~180 ms to a few).
+ *  Fusing TOUCHING spans is safe for lengths: the union of [1,2) and [2,3) counts 2 either
+ *  way, and intersection distributes over union, so clip-then-union and union-then-clip
+ *  remove exactly the same milliseconds (the property the randomized test pins). */
+export function mergedIntervals(intervals) {
+  const spans = (intervals || [])
+    .filter(([s, e]) => isMs(s) && isMs(e) && e > s)
+    .sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const [s, e] of spans) {
+    const last = out[out.length - 1];
+    if (last && s <= last[1]) { if (e > last[1]) last[1] = e; }
+    else out.push([s, e]);
+  }
+  return out;
+}
+
+/** The milliseconds of [start, end) that lie inside the merged spans — with the guards the
+ *  activity path needs (invalid or empty windows overlap nothing). */
+export function overlapWithMerged(merged, start, end) {
+  if (!isMs(start) || !isMs(end) || end <= start) return 0;
+  let lo = 0, hi = merged.length;                 // first span whose end is past start
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (merged[mid][1] <= start) lo = mid + 1; else hi = mid;
+  }
+  let removed = 0;
+  for (let i = lo; i < merged.length && merged[i][0] < end; i++) {
+    removed += Math.min(merged[i][1], end) - Math.max(merged[i][0], start);
+  }
+  return removed;
+}
+
 /** An activity's remaining milliseconds: its own length minus whatever overlaps formal
- *  training. Two workouts that overlap each other by 5 min still remove their union, not their
- *  sum — the PRD's own example (60 − 45 = 15; 20 + 15 with 5 shared removes 30, not 35). */
+ *  training. Two workouts that overlap each other by 5 min still remove their union, not
+ *  their sum — the PRD's own example (60 − 45 = 15; 20 + 15 with 5 shared removes 30, not
+ *  35). */
 export function remainingMs(activityStart, activityEnd, workoutIntervals) {
   if (!isMs(activityStart) || !isMs(activityEnd) || activityEnd <= activityStart) return 0;
-  return Math.max(0, (activityEnd - activityStart) - unionLength(
-    workoutIntervals.map(([s, e]) => [Math.max(s, activityStart), Math.min(e, activityEnd)])
-  ));
+  return Math.max(0, (activityEnd - activityStart)
+    - overlapWithMerged(mergedIntervals(workoutIntervals), activityStart, activityEnd));
 }
 
 /* ---------- aggregation: personal facts → day buckets + lifetime ---------- */
@@ -81,15 +121,18 @@ export function gymBuckets(workouts = []) {
 
 /** Health activities: excluded, source-deleted or converted ones never count; an activity
  *  counts once, for its remaining (post-overlap) time, on the Beijing day it started on —
- *  remaining fragments that cross midnight are not split out of that day (PRD FR-1.6R). */
+ *  remaining fragments that cross midnight are not split out of that day (PRD FR-1.6R).
+ *  The training intervals are merged ONCE for the whole pass (the round-7 optimization);
+ *  what is counted is exactly what the per-activity remainingMs computes. */
 export function syncedBuckets(activities = [], workouts = []) {
-  const training = (workouts || [])
+  const merged = mergedIntervals((workouts || [])
     .filter(w => Number.isFinite(w?.start) && Number.isFinite(w?.end))
-    .map(w => [w.start, w.end]);
+    .map(w => [w.start, w.end]));
   const days = {};
   for (const a of activities || []) {
     if (!a || a.userExcluded || a.sourceDeleted || a.linkedWorkoutId) continue;
-    const left = remainingMs(a.startMs, a.endMs, training);
+    if (!isMs(a.startMs) || !isMs(a.endMs) || a.endMs <= a.startMs) continue; // no time, no session
+    const left = (a.endMs - a.startMs) - overlapWithMerged(merged, a.startMs, a.endMs);
     if (left <= 0) continue; // fully overlapping or timeless: no time, and no session either
     const b = bucket(days, beijingDayKey(a.startMs));
     b.syncedMs += left;
