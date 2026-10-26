@@ -1,5 +1,6 @@
 import { useStore } from '../store/useStore.js'
 import { fingerprintOf } from './leaderboard.js'
+import { syncFingerprint } from './sync-changes.js'
 import { fetchMe, leaveLeaderboard, publishReport } from './leaderboard-client.js'
 
 // The leaderboard's global publisher — a session machine, not a pile of module globals.
@@ -79,18 +80,50 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     return String(clock()) + '-' + Math.random().toString(36).slice(2)
   }
 
-  /* I05 — the one rule every withdrawal path shares: a response may clear only the exact
-   * marks it was sent against, captured (key + stored value) BEFORE the request, and only
-   * while the stored value is still byte-for-byte the same one. A newer intent that
+  /* I05/J04 — the one rule every withdrawal path shares: a response may clear only the
+   * exact marks it was sent against, captured (key + stored value) BEFORE the request, and
+   * only while the stored value is still byte-for-byte the same one. A newer intent that
    * replaced a mark while the request was in flight survives; the pending state is always
-   * re-derived from the marks that remain, never asserted from this one answer. */
+   * re-derived from the marks that remain, never asserted from this one answer.
+   *
+   * The in-memory half (J04): a session tracks its outstanding leave intents BY ID, not by
+   * one boolean — the boolean could only be cleared under a condition the old derivation
+   * made unsatisfiable (withdrawalState folded it into pending before the check), so an
+   * automatic withdrawal that had succeeded kept the UI in "leaving" forever. Ids settle
+   * individually: superseded when a newer request replaces the mark, deleted when the
+   * captured mark they stand for is acknowledged away. */
   const rawMark = key => { try { return storage.getItem(key) } catch { return null } }
+  const intentIdOf = raw => { try { const p = JSON.parse(raw); return p && typeof p.i === 'string' ? p.i : null } catch { return null } }
   const captureMarks = sess => {
     const hist = historicalKeys(sess)
     return [...hist.here, ...hist.ambiguous].map(key => ({ key, raw: rawMark(key) })).filter(c => c.raw !== null)
   }
   const acknowledgeMarks = captured => {
     for (const { key, raw } of captured) if (rawMark(key) === raw) clearMark(key)
+  }
+  /** Register a fresh leave intent: whatever intent the key held is superseded (its request
+   *  may still land server-side — same account, same effect — but it is no longer the
+   *  outstanding decision), and the new id is tracked until its mark is settled. */
+  function registerIntent(sess, key, intentId) {
+    const prev = intentIdOf(rawMark(key))
+    if (prev) sess.withdrawIntentIds.delete(prev)
+    sess.withdrawIntentIds.add(intentId)
+    sess.withdrawMarked = true
+  }
+  /** Settle the intents a completed leave acted on: acknowledge the captured marks, then
+   *  drop every in-memory id whose mark was actually cleared. Ids whose key now holds a
+   *  NEWER intent's mark survive — that intent is the current decision (I05). */
+  function settleIntents(sess, captured) {
+    acknowledgeMarks(captured)
+    for (const { key, raw } of captured) {
+      // acknowledged away ⇒ the exact intent this mark recorded is done; a key that now
+      // holds a NEWER intent's mark was never cleared — that id stays tracked (I05).
+      if (rawMark(key) === null) {
+        const id = intentIdOf(raw)
+        if (id) sess.withdrawIntentIds.delete(id)
+      }
+    }
+    sess.withdrawMarked = sess.withdrawIntentIds.size > 0
   }
 
   /* ---------- withdrawal marks, resolved per session (G04) ----------
@@ -132,7 +165,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   function withdrawalState(sess) {
     const hist = historicalKeys(sess)
     return {
-      pending: hist.here.length > 0 || hist.ambiguous.length > 0 || sess.withdrawMarked,
+      pending: hist.here.length > 0 || hist.ambiguous.length > 0 || sess.withdrawIntentIds.size > 0,
       ambiguous: hist.here.length === 0 && hist.ambiguous.length > 0
     }
   }
@@ -147,15 +180,14 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     const key = KEY_V3(sess.instance, sess.uid)
     const intentId = newIntentId()
     setMark(key, intentId)
+    registerIntent(sess, key, intentId)   // supersedes whatever intent the key held
     const captured = [{ key, raw: rawMark(key) }].filter(c => c.raw !== null)
-    sess.withdrawMarked = true
     status.withdrawPending = true
     status.withdrawAmbiguous = false
     emit()
     try {
       await client.leaveLeaderboard(me)
-      acknowledgeMarks(captured)
-      sess.withdrawMarked = false
+      settleIntents(sess, captured)       // clears only this intent's unchanged mark (I05/J04)
       if (session === sess) {
         const wd = withdrawalState(sess)
         status.withdrawPending = wd.pending
@@ -192,9 +224,8 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     try {
       await client.leaveLeaderboard(me || sess.me)
       // The leave landed for the captured marks' account and instance — they are resolved
-      // wherever they are still the marks this resolution captured (I05).
-      acknowledgeMarks(captured)
-      sess.withdrawMarked = false
+      // wherever they are still the marks this resolution captured (I05/J04).
+      settleIntents(sess, captured)
       if (session === sess) {
         const wd = withdrawalState(sess)
         status.withdrawAmbiguous = wd.ambiguous
@@ -239,31 +270,34 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       status.withdrawAmbiguous = wd.ambiguous
       if (wd.pending) {
         if (wd.ambiguous) { emit(); return } // F06: unprovable — the person resolves it
-        // I05: the marks this automatic retry may act on are captured BEFORE the me fetch
-        // and the request — its late success can clear only these, only while unchanged.
+        // I05/J04: the marks this automatic retry may act on are captured BEFORE the me
+        // fetch and the request — its outcome settles exactly these intents, never the
+        // marks a newer request made while it was in flight.
         const captured = captureMarks(sess)
         const m = await me(sess, true)
         if (!stillUs()) return
         if (!m?.enabled) {
           // Already out server-side: the captured marks' goal is the server's state, not
           // this request — they are resolved wherever they are still the captured ones.
-          acknowledgeMarks(captured)
+          settleIntents(sess, captured)
+          sess.me = null // the member's state just changed: never pin the "out" answer
           const wd2 = withdrawalState(sess)
           status.withdrawPending = wd2.pending
           status.withdrawAmbiguous = wd2.ambiguous
-          if (!wd2.pending) sess.withdrawMarked = false
-          emit()
+          if (!wd2.pending) ok()
+          else emit()
           return
         }
         try {
           await client.leaveLeaderboard(m)
           if (!stillUs()) return
-          acknowledgeMarks(captured)
+          settleIntents(sess, captured)
           const wd2 = withdrawalState(sess)
           status.withdrawPending = wd2.pending
           status.withdrawAmbiguous = wd2.ambiguous
           sess.me = null
-          if (!wd2.pending) { sess.withdrawMarked = false; ok() } else emit()
+          if (!wd2.pending) ok()
+          else emit()
         } catch (e) {
           // I06: the inner catch checks the session too — a withdrawal started under A that
           // fails after the switch must not paint B's error state (the outer catch's H09
@@ -330,19 +364,27 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       if (!m.reportRev) sess.lastPublished = ''
       if (fingerprint === sess.lastPublished) { setPending(false); return }
 
-      /* I02: the facts and the personal-state revision they were confirmed at, captured in
-       * ONE read. The report's pairing can never name a rev from a different moment than its
-       * facts — not the session's memory of an older sync, and not the newest me label. A
-       * 409 recovery re-captures the whole snapshot after the merge (passed to the client
-       * below); a response-time re-sync cannot pollute what was accepted either, because
-       * the success path records the fingerprint and rev the answer names. */
+      /* I02/J02: the facts, the personal-state revision they were confirmed at, and the
+       * PROOF they were confirmed — captured in ONE read. A snapshot is sendable only when
+       * the local copy IS the copy the server holds: sync healthy, and (when the store
+       * publishes one — it does since the J02 wiring) the confirmed fingerprint matches the
+       * current state. The round-8 hole: during a 409 recovery's fresh me fetch, a local
+       * edit made the facts newer than the last sync while the rev still matched the
+       * server's, and the unconfirmed hour was published ahead of its own personal save —
+       * against the PRD's order (personal sync first, then aggregate). 'unconfirmed' means
+       * "wait for the personal sync, then take a fresh snapshot"; null means "this session
+       * is gone". */
       const snapshotOf = () => {
         if (!(active && session === sess)) return null
         const st = get()
+        if (st.sync?.status !== 'ok') return 'unconfirmed'
+        const fp = st.sync?.confirmedFp   // the store's proof: a JSON string (J02 wiring)
+        if (typeof fp === 'string' && JSON.stringify(syncFingerprint(st.S)) !== fp) return 'unconfirmed'
         return { facts: st.S, rev: Number.isFinite(st.sync?.rev) ? st.sync.rev : null }
       }
       const snapshot = snapshotOf()
-      if (!snapshot) return
+      if (snapshot === null) return
+      if (snapshot === 'unconfirmed') { setPending(true); return } // owed to the personal sync first
       const r = await client.publishReport(snapshot, m, {
         // N03: the pull wrapper answers whether the merge actually landed healthy.
         pull: async () => {
@@ -369,6 +411,10 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       } else if (r.reason === 'disabled') {
         sess.me = null
         setPending(false)
+      } else if (r.reason === 'needs-sync') {
+        // J02: the recovery found local facts the server has not confirmed — owed to the
+        // personal sync, not an error. The next confirmed exchange re-runs this pass.
+        setPending(true)
       } else {
         fail(r.error || new Error('publication failed'))
       }
@@ -409,6 +455,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         meAt: 0,
         lastAcceptedReportRev: null,
         lastSeenReportRev: null,
+        withdrawIntentIds: new Set(),   // J04: outstanding leave intents BY ID, not one boolean
         withdrawMarked: false,
         lastPublished: ''
       }

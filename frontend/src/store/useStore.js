@@ -461,10 +461,15 @@ export const useStore = create((set, get) => {
     const at = Date.now()
     try {
       localStorage.setItem(SYNCED_AT_KEY, String(at))
-      if (fpOf !== S) { localStorage.setItem(SYNCED_FP_KEY, JSON.stringify(syncFingerprint(S))); fpOf = S }
+      if (fpOf !== S) { lastConfirmedFp = JSON.stringify(syncFingerprint(S)); localStorage.setItem(SYNCED_FP_KEY, lastConfirmedFp); fpOf = S }
     } catch { /* storage refused — only the count is lost */ }
-    reached({ pending: false, lastSynced: at })
+    // J02: the fingerprint of the copy the server actually holds — the SENT copy (S), never
+    // whatever the store holds by response time — published on the sync object, where the
+    // leaderboard publisher's snapshot gate reads it atomically with the rest of the sync
+    // state: a report may only be built from facts this fingerprint still matches.
+    reached({ pending: false, lastSynced: at, confirmedFp: lastConfirmedFp })
   }
+  let lastConfirmedFp = null
   const readFingerprint = () => { try { return JSON.parse(localStorage.getItem(SYNCED_FP_KEY)) } catch { return null } }
 
   // The server this device syncs with: the paired address on a phone, the page's own origin and

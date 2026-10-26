@@ -408,21 +408,22 @@ try {
   const advanceClock = ms => fs.writeFileSync(clockFile, String(base + ms));
   try {
     // A: pauses between marker verify and the final rename, holding its marker.
+    const markerFiles = () => fs.readdirSync(root).filter(n => n.startsWith('data.json.committing'));
     const a = spawnWriter('A');
     await waitFor('A to reach its rename', path.join(root, 'entered-A'));
-    assert.ok(fs.existsSync(file + '.committing'), 'A holds a commit marker');
+    assert.ok(markerFiles().length > 0, 'A holds a commit marker (per-writer name)');
 
     // B (17 s of clock silence later): recovers A's lease, clears A's marker AND private
     // file, then pauses in the same spot inside its own commit.
     advanceClock(17000);
     const b = spawnWriter('B');
     await waitFor('B to reach its rename', path.join(root, 'entered-B'));
-    assert.ok(fs.existsSync(file + '.committing'), 'B holds a commit marker');
+    assert.ok(markerFiles().length > 0, 'B holds a commit marker (per-writer name)');
 
     // A resumes and fails: its private file is gone, its abort must leave B's marker alone.
     fs.writeFileSync(path.join(root, 'release-A'), '1');
     assert.deepEqual(await a, { ok: false, code: 'write-failed' });
-    assert.ok(fs.existsSync(file + '.committing'), 'I01: A\'s cleanup kept B\'s marker — the current committer stays protected');
+    assert.ok(markerFiles().length > 0, 'J01/I01: A\'s abort left B\'s marker intact — the current committer stays protected');
 
     // C (another 17 s): recovers B's silence — B's marker names B's private file, so the
     // takeover removes both — and commits. The acknowledged answer must survive B resuming.
@@ -469,5 +470,76 @@ test('the view (round-7 NO_WRITE cost): a no-op plans without a clone; the first
     assert.equal(s.read().revision, 2, 'only the mutating transaction moved the revision');
   } finally {
     globalThis.structuredClone = realClone;
+  }
+});
+
+/* J05: the transaction's third outcome. A callback that returns a plain result without
+ * calling edit() changed nothing — its answer is read-only and must never reach the write
+ * path. The old code fell through with `target = current` (the LIVE cache) and mutated
+ * revision/updatedAt on it before persisting, so an injected writer failure left memory
+ * ahead of disk (peek().revision 3 on a revision-2 file) with healthy() still true. */
+test('J05: a no-edit result is read-only — nothing persists, nothing mutates, even with a failing writer', async () => {
+  const file = path.join(dir(), 'shared.json');
+  let failWrites = false;
+  let writes = 0;
+  const realWrite = (dst, content, mode) => { if (failWrites) throw Object.assign(new Error('injected EIO'), { code: 'EIO' }); writes++; return fs.writeFileSync(dst, content, { mode }); };
+  const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }), writer: realWrite });
+  await s.txn(view => { view.edit().members.a = 1; });               // init + the commit itself
+  const writesBefore = writes;
+  const before = { disk: JSON.parse(fs.readFileSync(file, 'utf8')), cache: s.read(), epoch: s.epoch() };
+  failWrites = true;
+  // The replay-shaped call: a business result, no edit, with the writer set to fail. It
+  // must SUCCEED (there is nothing to write), never reach the writer, and change nothing.
+  const out = await s.txn(view => ({ ok: true, applied: false, at: 1 }));
+  assert.deepEqual(out, { revision: 1, out: { ok: true, applied: false, at: 1 } });
+  assert.equal(writes, writesBefore, 'the read-only path never calls the writer');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), before.disk);
+  assert.deepEqual(s.read(), before.cache);
+  assert.equal(s.epoch(), before.epoch);
+  // A real edit under the same failure: refused, and file, cache and epoch stay put.
+  await assert.rejects(s.txn(view => { view.edit().members.b = 2; }), e => e instanceof StoreError && e.code === 'write-failed');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), before.disk);
+  assert.deepEqual(s.read(), before.cache);
+  assert.equal(s.epoch(), before.epoch);
+  // The queue is not wedged: with the writer back, the next transaction proceeds.
+  failWrites = false;
+  const { revision } = await s.txn(view => { view.edit().members.b = 2; });
+  assert.equal(revision, 2);
+  s.release();
+});
+
+/* J06: the marker publication step's failure exits. The writer has already produced the
+ * full private data file when the marker link fails — every failure exit from that point
+ * must clean the private file; ten consecutive failures must leave no complete data temp
+ * and no marker debris behind. */
+test('J06: marker publication failures leave no private commit files or marker debris', async () => {
+  const file = path.join(dir(), 'shared.json');
+  const realLink = fs.linkSync;
+  let failures = 0;
+  fs.linkSync = function (from, to) {
+    if (String(to).includes('.committing.')) { failures++; throw Object.assign(new Error('injected link EIO'), { code: 'EIO' }); }
+    return realLink(from, to);
+  };
+  const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  try {
+    let rejected = 0;
+    for (let i = 0; i < 10; i++) {
+      try { await s.txn(view => { view.edit().members['m' + i] = i; }); }
+      catch (e) { assert.equal(e.code, 'write-failed'); rejected++; }
+    }
+    assert.equal(rejected, 10);
+    assert.equal(failures, 10);
+    const debris = fs.readdirSync(path.dirname(file))
+      .filter(n => n.includes('.commit.') || n.includes('.committing'));
+    assert.deepEqual(debris, [], 'no private data temp, no marker temp, no marker');
+    assert.equal(fs.existsSync(file), false, 'the shared file was never created');
+    // The writer works again once the link does: a normal commit goes through.
+    fs.linkSync = realLink;
+    const { revision } = await s.txn(view => { view.edit().members.ok = 1; });
+    assert.equal(revision, 1);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).members.ok, 1);
+  } finally {
+    fs.linkSync = realLink;
+    s.release();
   }
 });

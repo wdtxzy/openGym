@@ -117,6 +117,19 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
   const PRUNE_AT_LIKES = 2000; // amortized: pruned inside a like transaction past this size
   let prunedAtSize = 0;        // …but at most once per 25% growth, never on every like (N07)
 
+  /** The legacy-audit fold itself (I03/J03) — see migrateLegacyAudits. Mutates `data`. */
+  function foldLegacyAudits(data) {
+    if (data.auditQueueVersion >= 2) return 0;
+    const pendingIds = new Set(list(data.pendingAudits).map(a => a.actionId));
+    const legacy = list(data.adminActions).filter(a => a && a.audited === false && !pendingIds.has(a.actionId));
+    data.pendingAudits = [...list(data.pendingAudits), ...legacy.map(a => ({ ...a, audited: false }))];
+    // The history keeps every action, but never again as "undelivered" — the pending
+    // queue is now the only place an unconfirmed event lives.
+    data.adminActions = list(data.adminActions).map(a => (a && a.audited === false ? { ...a, audited: true } : a));
+    data.auditQueueVersion = 2;
+    return legacy.length;
+  }
+
   /* The board's public result, cached per (epoch, window) — the round-7 read optimization.
    *  Every mutation moves the store's epoch, so joins, withdrawals, suspensions, restores,
    *  deletions, renames and every cheer invalidate it; the window key rolls the cache at
@@ -125,6 +138,23 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
    *  per viewer, and the guest path (which deletes the field outright) cannot damage the
    *  cache for members. */
   let boardCache = null;
+
+  /** A member's current cheer count for the window — from the warm board cache when it
+   *  names this exact (epoch, window), else one honest pass over the like table. The cache
+   *  is built from the same table at the same epoch, so its counts ARE the table's; the
+   *  round-8 no-op like used to pay the full pass every time (its last remaining ~29 ms). */
+  function countFor(w, targetUid, targetPublicId) {
+    if (boardCache
+      && boardCache.epoch === (typeof store.epoch === 'function' ? store.epoch() : -1)
+      && boardCache.windowType === w.windowType && boardCache.windowKey === w.windowKey) {
+      if (targetPublicId) {
+        const row = boardCache.rows.find(r => r.publicMemberId === targetPublicId);
+        if (row) return row.likeCount;
+      }
+    }
+    const data = store.peek ? store.peek() : store.read();
+    return likeCounts(data, w).get(targetUid) || 0;
+  }
 
   return {
     DISCLOSURE_VERSION,
@@ -323,7 +353,8 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
       let noopTarget = null;
       const r = await store.txn(view => {
         // The plan phase reads the live snapshot — the common no-op (a repeated cheer or
-        // the removal of an absent one) returns before any clone is paid for.
+        // the removal of an absent one) returns before any clone, any count and any table
+        // walk are paid for (the round-8 tail-latency fix).
         const data = view.state;
         let targetUid = null;
         let target = null;
@@ -334,12 +365,13 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
         if (targetUid === actorUid) throw new LeaderboardError(403, 'self');
         noopTarget = targetUid;
         const key = `${actorUid}|${targetUid}|${w.windowType}|${w.windowKey}`;
+        const already = on ? !!data.likes[key] : !data.likes[key];
+        if (already) return NO_WRITE; // a repeat cheer changes nothing: no rewrite, no fsync
+        // A real change: the pre-change count comes from the warm cache when it names this
+        // window (the epoch has not moved — this transaction has not committed), and the
+        // table size is counted only now, for the prune decision alone.
+        const before = countFor(w, targetUid, targetPublicId);
         const sizeBefore = Object.keys(data.likes).length;
-        if (on) {
-          if (data.likes[key]) return NO_WRITE; // a repeat cheer changes nothing: no rewrite, no fsync
-        } else {
-          if (!data.likes[key]) return NO_WRITE; // removing an absent cheer is a no-op too
-        }
         const draft = view.edit(); // first mutation: the clone happens here and only here
         if (on) draft.likes[key] = { createdAt: now() };
         else delete draft.likes[key];
@@ -349,14 +381,14 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
         if (sizeBefore > PRUNE_AT_LIKES && sizeBefore > prunedAtSize * 1.25) {
           pruneLikes(draft, now());
           prunedAtSize = Object.keys(draft.likes).length;
+          return { liked: on, likeCount: likeCounts(draft, w).get(targetUid) || 0 }; // others may have moved: recount
         }
-        const after = likeCounts(draft, w).get(targetUid) || 0;
-        return { liked: on, likeCount: after };
+        return { liked: on, likeCount: before + (on ? 1 : -1) };
       });
       if (r.out === undefined) {
-        // The no-op path: the answer is still the member's current count, read without a write.
-        const data = store.peek ? store.peek() : store.read();
-        return { liked: on, likeCount: likeCounts(data, w).get(noopTarget) || 0 };
+        // The no-op path: the count is unchanged — the warm cache names it, or one honest
+        // pass computes it.
+        return { liked: on, likeCount: countFor(w, noopTarget, targetPublicId) };
       }
       return r.out;
     },
@@ -376,6 +408,10 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
           || list(state.adminActions).find(a => a.actionId === actionId);
         if (prior) return { ok: true, applied: false, at: prior.at };
         const data = view.edit();
+        // J03: a disposition appends to the capped history — fold any legacy undelivered
+        // events into the pending queue first, so the new backlog can never evict them
+        // out of history before they are delivered.
+        foldLegacyAudits(data);
         const m = requireMember(data, targetUid);
         if (suspended) {
           const why = String(reason || '').trim();
@@ -462,26 +498,16 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
       return Promise.resolve({ delivered: 0, remaining: pending.length });
     },
 
-    /** I03: the re-entrant, persisted migration from the pre-pendingAudits format. Before
-     *  the dedicated queue existed, undelivered audit events lived in the reviewed history
-     *  as `adminActions[].audited === false`; a file from that build loads fine here (same
-     *  schemaVersion) but its events were invisible to the new deliverer and stranded
-     *  forever. The migration merges them into pendingAudits by actionId (never
-     *  duplicated), flips the history copies to reviewed, and stamps `auditQueueVersion: 2`
-     *  so a rerun — on every boot, after an interrupted one — is a no-op. One transaction:
-     *  atomic, so an interrupted migration simply had not happened. */
+    /** I03/J03: fold legacy undelivered events — `adminActions[].audited === false` from
+     *  the pre-pendingAudits build — into the pending queue, by actionId, never
+     *  duplicated, and stamp `auditQueueVersion: 2` in the SAME transaction. Shared by the
+     *  boot migration and by every new disposition: a backlog of new actions appends to the
+     *  capped history and could otherwise evict legacy events before they are ever
+     *  delivered. */
     migrateLegacyAudits() {
       return store.txn(view => {
-        if (view.state.auditQueueVersion >= 2) return false;
-        const pendingIds = new Set(list(view.state.pendingAudits).map(a => a.actionId));
-        const legacy = list(view.state.adminActions).filter(a => a && a.audited === false && !pendingIds.has(a.actionId));
-        const data = view.edit();
-        data.pendingAudits = [...list(data.pendingAudits), ...legacy.map(a => ({ ...a, audited: false }))];
-        // The history keeps every action, but never again as "undelivered" — the pending
-        // queue is now the only place an unconfirmed event lives.
-        data.adminActions = list(data.adminActions).map(a => (a && a.audited === false ? { ...a, audited: true } : a));
-        data.auditQueueVersion = 2;
-        return legacy.length;
+        if (view.state.auditQueueVersion >= 2) return false; // stamped: nothing to fold (read-only)
+        return foldLegacyAudits(view.edit());
       }).then(({ out }) => out);
     },
 
@@ -490,6 +516,7 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
       return store.txn(view => {
         const pending = list(view.state.pendingAudits);
         const delivered = pending.filter(a => ids.has(a.actionId));
+        if (!delivered.length) return 0; // nothing to confirm: read-only, no write (J05)
         // The pending queue only shrinks by actual delivery — never by the history window
         // (H04). The reviewed history already holds the action from the disposition itself;
         //  a delivered event joins it only when it is missing (an action that fell out of

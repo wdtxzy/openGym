@@ -116,3 +116,32 @@ test('I07: a delivered line whose confirmation failed is confirmed by the retry,
   assert.equal(rows.length, 1, 'exactly one audit event for the action: ' + JSON.stringify(rows));
   assert.equal(rows[0].meta.applied, true);
 });
+
+/* J03: a first-write migration failure must recover IN THE SAME PROCESS. The round-8
+   failure: the boot catch armed a delivery-only retry loop; the migration never re-ran,
+   the new queue stayed empty, the deliverer declared itself done and cleared its timer.
+   One-shot EIO on the migration's final rename, then the disk heals — no restart, no new
+   admin action: the unified recovery pipeline (migrate → deliver → confirm) has to finish
+   the job on its own. */
+test('J03: after a one-shot migration failure the running process recovers on its own', async t => {
+  const dir = fixture();
+  const data = sharedFile(dir);
+  data.adminActions = [{ actionId: 'legacy-j03', at: Date.now(), actor: ADMIN, targetUid: 'b', suspended: true, reason: 'accepted before upgrade', audited: false }];
+  delete data.pendingAudits;
+  fs.writeFileSync(path.join(dir, 'leaderboard.json'), JSON.stringify(data));
+  const inject = path.join(dir, 'migration-failure.mjs');
+  fs.writeFileSync(inject, `import fs from 'node:fs';import path from 'node:path';let fired=false;const original=fs.renameSync;fs.renameSync=function(a,b){if(!fired&&b===path.join(process.env.DATA_DIR,'leaderboard.json')&&String(a).includes('.commit.')&&JSON.parse(fs.readFileSync(a)).auditQueueVersion===2){fired=true;throw Object.assign(new Error('injected first migration EIO'),{code:'EIO'})}return original(a,b)};`);
+  const h = await startServer(t, dir, { NODE_OPTIONS: '--import=' + inject });
+  // The first migration attempt failed: logged, nothing migrated, nothing delivered yet.
+  await waitFor(() => h.log.includes('leaderboard audit migration failed'), 'the migration failure to be logged');
+  // The same process retries the FULL pipeline — migration included — and finishes it.
+  // (The queue confirmation is its own retryable transaction after the line lands, so both
+  // are awaited, in order, the way a real operator would observe them.)
+  await waitFor(() => auditRows(dir).some(r => r.meta?.actionId === 'legacy-j03'), 'the legacy event to be delivered');
+  await waitFor(() => sharedFile(dir).pendingAudits?.length === 0, 'the delivered event to be confirmed off the queue');
+  const after = sharedFile(dir);
+  assert.equal(after.auditQueueVersion, 2, 'the migration stamped in the same process');
+  assert.equal(after.pendingAudits.length, 0, 'the queue drained');
+  assert.equal(after.adminActions.some(a => a.audited === false), false, 'no undelivered events remain in the history');
+  assert.equal(auditRows(dir).filter(r => r.meta?.actionId === 'legacy-j03').length, 1, 'exactly one audit line');
+});

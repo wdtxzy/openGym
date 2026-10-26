@@ -247,3 +247,63 @@ describe('the coordinator factory', () => {
     expect(h.client.publishReport).not.toHaveBeenCalled()
   })
 })
+
+describe('J04 — an offline withdrawal finishes after automatic recovery', () => {
+  const ME0 = { enabled: true, suspended: false, disclosureVersion: 1, currentDisclosureVersion: 1, consentVersion: 1, reportRev: 0 }
+
+  function withdrawFixture() {
+    const h = harness()
+    h.p.start()
+    h.client.fetchMe.mockResolvedValue({ ...ME0 })
+    return h
+  }
+
+  it.each([[true, 'the leave request succeeds'], [false, 'the server already shows the member out']])('me.enabled=%s — %s', async enabled => {
+    const h = withdrawFixture()
+    h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('initial offline'))
+    if (enabled) h.client.leaveLeaderboard.mockResolvedValue({})
+    await h.p.requestLeave({ ...ME0 })
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw:'))).toHaveLength(1)
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+
+    // Back online: the automatic pass settles the intent — no keys, no pending, no stale error.
+    h.client.fetchMe.mockResolvedValue({ ...ME0, enabled })
+    await h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(1)
+
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw:'))).toHaveLength(0)
+    expect(h.p.publishStatus().withdrawPending).toBe(false)
+    expect(h.p.publishStatus().lastError).toBe(null)
+    expect(h.p.publishStatus().lastOkAt).not.toBe(null)
+    // After the withdrawal the member is out — and a REJOIN in the same session publishes
+    // again (the stuck intent never returns to undo it): the me cache reads enabled, a
+    // confirmed exchange of its own, then a changed fact.
+    h.client.fetchMe.mockResolvedValue({ ...ME0, enabled: true, reportRev: 0 })
+    h.client.publishReport.mockResolvedValue({ ok: true, reportRev: 1, acceptedFingerprint: 'x' })
+    h.merged()
+    h.state.S = facts('after-withdrawal')
+    h.fire()
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(h.client.publishReport).toHaveBeenCalled()
+    expect(h.p.publishStatus().withdrawPending).toBe(false)
+  })
+
+  it('a newer intent made while the automatic retry is in flight still survives (I05 kept)', async () => {
+    const h = withdrawFixture()
+    let done
+    h.client.leaveLeaderboard
+      .mockRejectedValueOnce(new Error('offline intent A'))
+      .mockImplementationOnce(() => new Promise(resolve => { done = resolve }))
+      .mockRejectedValueOnce(new Error('offline intent B'))
+    await h.p.requestLeave({ ...ME0 })            // intent A, persisted, fails offline
+    const retry = h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(1)
+    await h.p.requestLeave({ ...ME0, consentVersion: 3 }) // intent B replaces the mark
+    const key = 'lb-withdraw:https://alpha.example:a'
+    const newRaw = h.storage[key]
+    done({})                                       // intent A's late success lands
+    await retry
+    expect(h.storage[key]).toBe(newRaw)            // B's mark untouched
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+  })
+})

@@ -114,8 +114,13 @@ export async function publishReport(snapshot, me, opts = {}) {
     }
     const fresh = await fetchMe();
     if (!fresh || !fresh.enabled || fresh.suspended) return { ok: false, reason: 'disabled' };
-    const snap = opts.snapshotOf(); // facts and rev, re-captured together — or null on a switch
-    if (!snap) return { ok: false, reason: 'account-switched', error: e };
+    const snap = opts.snapshotOf(); // facts and rev, re-captured together — see below
+    if (snap === null) return { ok: false, reason: 'account-switched', error: e };
+    // J02: the await above (the fresh me fetch) is exactly where a local edit can land and
+    // make the facts newer than anything the server has confirmed. The re-captured snapshot
+    // refuses to send it: the publish waits for the personal sync to land, then a fresh
+    // pass takes a new snapshot. Sending here would publish ahead of the personal save.
+    if (snap === 'unconfirmed') return { ok: false, reason: 'needs-sync', error: e };
     try {
       return { ok: true, ...(await send(snap, fresh, uid())) };
     } catch (e2) {

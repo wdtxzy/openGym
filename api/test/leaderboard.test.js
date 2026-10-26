@@ -630,3 +630,113 @@ test('the board cache: every mutation invalidates it; the viewer column is overl
   await lb.forget('u2');
   assert.equal(lb.board('week', null).rows.length, 1);
 });
+
+/* ------------------- round-8: the audit fold guard, J05 replay, cache counts ------------------- */
+
+test('J03: a new disposition folds legacy undelivered events first — a backlog cannot evict them', async () => {
+  const { lb, store } = domainFixture();
+  await join(lb, 'u1');
+  // A pre-pendingAudits file: the accepted-but-undelivered event sits in the history.
+  await store.txn(view => {
+    const d = view.edit();
+    d.adminActions = [
+      { actionId: 'legacy-guard', at: 1, actor: 'admin', targetUid: 'u1', suspended: true, reason: 'old build', audited: false },
+      ...Array.from({ length: 499 }, (_, i) => ({ actionId: 'hist-' + i, at: 2 + i, actor: 'admin', targetUid: 'u1', suspended: false, reason: '', audited: true }))
+    ];
+    delete d.pendingAudits;
+  });
+  // One new disposition: without the fold, its append would push 'legacy-guard' out of the
+  // capped history (still newest-500? it is the OLDEST, so yes — evicted) and the event
+  // would be lost before ever being deliverable.
+  const out = await lb.adminStatus({ actorUid: 'admin', targetUid: 'u1', suspended: false, reason: '', actionId: 'new-1' });
+  assert.equal(out.applied, true);
+  const data = store.peek();
+  assert.deepEqual(data.pendingAudits.map(a => a.actionId).sort(), ['legacy-guard', 'new-1'], 'the legacy event is in the queue before any eviction');
+  assert.equal(data.auditQueueVersion, 2);
+  assert.equal(data.adminActions.some(a => a.actionId === 'legacy-guard' && a.audited === false), false, 'the history copy is reviewed');
+  // And it delivers.
+  const written = [];
+  await lb.flushAudits(a => { written.push(a.actionId); return true; });
+  assert.deepEqual(written.sort(), ['legacy-guard', 'new-1']);
+});
+
+test('J05: an idempotent replay is read-only — no revision bump, no write, nothing moves', async () => {
+  const { lb, store, file } = domainFixture();
+  await join(lb, 'u1');
+  await lb.adminStatus({ actorUid: 'admin', targetUid: 'u1', suspended: true, reason: 'first', actionId: 'a-1' });
+  const before = { disk: JSON.parse(fs.readFileSync(file, 'utf8')), cache: store.read(), epoch: store.epoch() };
+  // The replay of an ACCEPTED action returns applied:false. Under the old txn contract it
+  // fell through to the write path (mutating the live cache's revision even when the
+  // writer then failed — the round-8 memory-ahead-of-disk break); on the read-only path it
+  // cannot write at all, which is what the store-level J05 test proves with a failing
+  // writer installed. Here the domain contract: no bump, no epoch move, byte-identical.
+  const replay = await lb.adminStatus({ actorUid: 'admin', targetUid: 'u1', suspended: false, reason: 'replay', actionId: 'a-1' });
+  assert.deepEqual(replay, { ok: true, applied: false, at: before.cache.adminActions.find(a => a.actionId === 'a-1').at });
+  assert.equal(store.peek().revision, before.cache.revision, 'no revision bump for a replay');
+  assert.deepEqual(store.read().adminActions, before.cache.adminActions);
+  assert.equal(store.epoch(), before.epoch);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), before.disk);
+  // The member state never moved either: still suspended, and a fresh disposition works.
+  assert.equal(lb.me('u1').suspended, true);
+  const next = await lb.adminStatus({ actorUid: 'admin', targetUid: 'u1', suspended: false, reason: 'off', actionId: 'a-2' });
+  assert.equal(next.applied, true);
+  assert.equal(store.peek().revision, before.cache.revision + 1, 'a real change still writes and bumps');
+});
+
+test('round-8 cache counts: no-op and changed likes answer from the warm board cache exactly', async () => {
+  const { lb } = domainFixture();
+  await join(lb, 'u1');
+  await join(lb, 'u2');
+  await join(lb, 'u3');
+  const ids = { u1: lb.me('u1').publicMemberId, u2: lb.me('u2').publicMemberId, u3: lb.me('u3').publicMemberId };
+  const w = lb.board('week', null).window; // the cache is warm from here on
+  await lb.like({ actorUid: 'u2', targetPublicId: ids.u1, windowType: 'week', windowKey: w.windowKey, on: true });
+  await lb.like({ actorUid: 'u3', targetPublicId: ids.u1, windowType: 'week', windowKey: w.windowKey, on: true });
+  // The cache path: a no-op repeat and a fresh add both answer the table's honest count.
+  const noop = await lb.like({ actorUid: 'u2', targetPublicId: ids.u1, windowType: 'week', windowKey: w.windowKey, on: true });
+  assert.deepEqual(noop, { liked: true, likeCount: 2 });
+  const third = await lb.like({ actorUid: 'u2', targetPublicId: ids.u3, windowType: 'week', windowKey: w.windowKey, on: true });
+  assert.deepEqual(third, { liked: true, likeCount: 1 });
+  // And a removal, then another no-op, all through the cache epoch.
+  const off = await lb.like({ actorUid: 'u3', targetPublicId: ids.u1, windowType: 'week', windowKey: w.windowKey, on: false });
+  assert.deepEqual(off, { liked: false, likeCount: 1 });
+  const noopOff = await lb.like({ actorUid: 'u3', targetPublicId: ids.u1, windowType: 'week', windowKey: w.windowKey, on: false });
+  assert.deepEqual(noopOff, { liked: false, likeCount: 1 });
+  // The board agrees with every one of those counts (it rebuilt on the new epoch).
+  const row = lb.board('week', 'u2').rows.find(r => r.publicMemberId === ids.u1);
+  assert.equal(row.likeCount, 1);
+  assert.equal(row.viewerLiked, true); // u2's cheer is the one that remains
+});
+
+test('round-8 cache boundaries: a window rollover with no writes still zeroes the board and keeps old cheers out (LB-03/LB-06)', async () => {
+  const { lb, setClock, clock } = domainFixture(bj(2026, 10, 22, 10)); // Thursday, week of 2026-10-19
+  await join(lb, 'u1');
+  await join(lb, 'u2');
+  await lb.report('u1', reportBody({ days: [{ date: '2026-10-20', gymMs: 60 * MIN, syncedMs: 0, gymSessions: 1, syncedSessions: 0 }] }));
+  await lb.report('u2', reportBody({
+    requestId: 'r-u2', days: [{ date: '2026-10-20', gymMs: 30 * MIN, syncedMs: 0, gymSessions: 1, syncedSessions: 0 }]
+  }));
+  await lb.like({ actorUid: 'u2', targetPublicId: lb.me('u1').publicMemberId, windowType: 'week', windowKey: lb.board('week', null).window.windowKey, on: true });
+  const before = lb.board('week', 'u2');
+  assert.equal(before.rows.length, 2);
+  assert.equal(before.rows.find(r => r.displayName === 'u1').likeCount, 1);
+  const epochBefore = lb.board('week', null); // the cache is warm
+
+  // A week passes with NO writes at all: the cached window key rolls, the old week zeroes,
+  // and the old week's cheer neither migrates into the new week nor disappears from 'all'.
+  setClock(clock() + 7 * DAY + 2 * 3600000);
+  const after = lb.board('week', 'u2');
+  assert.equal(after.window.windowKey, '2026-10-26');
+  assert.deepEqual(after.rows.map(r => r.totalMs), [0, 0], 'the new week starts at zero for everyone');
+  assert.equal(after.rows.find(r => r.displayName === 'u1').likeCount, 0, 'last week\'s cheer does not follow into the new week');
+  const all = lb.board('all', 'u2');
+  assert.equal(all.rows.find(r => r.displayName === 'u1').likeCount, 0, 'a week cheer never leaks into the all-time count (FR-1.13R: separate interactions)');
+  assert.equal(all.rows.find(r => r.displayName === 'u1').totalMs, 3.5 * 60 * MIN); // the declared lifetime is untouched by any rollover
+
+  // The month edge behaves the same way (2026-11-01 is a Sunday inside that same week):
+  // the window key rolls and the members show their November totals — zero.
+  setClock(bj(2026, 11, 1, 12));
+  const nov = lb.board('month', null);
+  assert.equal(nov.window.windowKey, '2026-11');
+  assert.deepEqual(nov.rows.map(r => r.totalMs), [0, 0], 'November starts at zero (members may show with zero, per the PRD)');
+});

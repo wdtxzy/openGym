@@ -1059,23 +1059,37 @@ function deliverLeaderboardAudits() {
   }
   return done.length === pending.length;
 }
+/* J03: ONE recovery pipeline — verify/migrate → deliver → confirm — shared by boot, the
+ * periodic retry and the admin route's flush. The round-8 failure mode: the boot catch
+ * armed a retry loop whose interval ran ONLY the delivery half; a first-write migration
+ * failure left the legacy events in adminActions.audited=false with an empty NEW queue,
+ * the deliverer concluded "nothing pending" and cleared its timer — the events stayed
+ * stranded until a restart. The migration is idempotent and re-entrant (stamped in the
+ * same transaction that moves the events), so the honest retry is the whole pipeline. */
+function runLeaderboardAuditRecovery() {
+  if (!LEADERBOARD || !leaderboardDomain) return Promise.resolve(true);
+  return leaderboardDomain.migrateLegacyAudits()
+    .then(moved => { if (moved) console.log('migrated', moved, 'legacy undelivered audit event(s) into the pending queue'); })
+    .then(() => deliverLeaderboardAudits())
+    .catch(e => { console.error('leaderboard audit migration failed:', e.message); return false; });
+}
 function scheduleAuditDelivery() {
   if (auditDeliverTimer) return;
   auditDeliverTimer = setInterval(() => {
-    try { if (deliverLeaderboardAudits()) { clearInterval(auditDeliverTimer); auditDeliverTimer = null; } } catch (e) { console.error('leaderboard audit delivery failed:', e.message); }
+    runLeaderboardAuditRecovery()
+      .then(done => { if (done) { clearInterval(auditDeliverTimer); auditDeliverTimer = null; } })
+      .catch(e => { console.error('leaderboard audit recovery failed:', e.message); });
   }, AUDIT_DELIVER_INTERVAL_MS);
   auditDeliverTimer.unref?.();
 }
 
-// Boot delivery (G06/G07/I03): legacy-format undelivered events migrate into the pending
-// queue FIRST — only then can the delivery pass see them instead of concluding the queue is
-// empty. Whatever cannot be written keeps its retry loop alive instead of waiting for the
-// next admin action; a failed migration logs loudly and still arms the retry loop.
+// Boot recovery (G06/G07/J03): anything stranded by a previous life migrates and flushes
+// now; whatever cannot land keeps the FULL pipeline's retry loop alive instead of waiting
+// for the next admin action or a restart.
 if (LEADERBOARD) {
-  leaderboardDomain.migrateLegacyAudits()
-    .then(moved => { if (moved) console.log('migrated', moved, 'legacy undelivered audit event(s) into the pending queue'); })
-    .then(() => { if (!deliverLeaderboardAudits()) scheduleAuditDelivery(); })
-    .catch(e => { console.error('leaderboard audit migration failed:', e.message); scheduleAuditDelivery(); });
+  runLeaderboardAuditRecovery()
+    .then(done => { if (!done) scheduleAuditDelivery(); })
+    .catch(e => { console.error('leaderboard audit recovery failed:', e.message); scheduleAuditDelivery(); });
 }
 
 // A graceful stop hands the shared-file lock back, so a recreated container starts clean
@@ -2797,10 +2811,13 @@ const routes = {
     // The like budget's address half: the runtime PEER (F10), not the audit record — with
     // AUDIT_IP=off the audit stores nothing, and the budget still counts clients apart.
     addressOf: req => peerOf(req),
+    // J03: the route's immediate flush runs the same full recovery pipeline (migrate →
+    // deliver → confirm); anything that cannot land now keeps the loop alive.
     deliverAudits: () => {
-      const okAll = deliverLeaderboardAudits();
-      if (!okAll) scheduleAuditDelivery(); // keep the retry loop alive until it lands
-      return okAll;
+      runLeaderboardAuditRecovery()
+        .then(done => { if (!done) scheduleAuditDelivery(); })
+        .catch(() => scheduleAuditDelivery());
+      return true;
     }
   }) : {}),
 
