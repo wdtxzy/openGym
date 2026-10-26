@@ -329,8 +329,31 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     const capturedToken = captured && typeof captured === 'object' && captured.token ? captured.token : null;
     const safeToDiscard = judgedToken ? capturedToken === judgedToken : !capturedToken;
     if (!safeToDiscard) {
-      // What the tombstone captured is not what we judged: a contender owns the lock now.
-      try { fs.renameSync(tomb, lockFile); } catch { try { fs.unlinkSync(tomb); } catch { /* gone */ } }
+      // What the tombstone captured is not what we judged: a contender's lease moved
+      // between our judgement and our capture. Refuse — and putting the captured lease
+      // back is itself a write to the shared path, with its own race (M01): while we
+      // held the tomb the public path stood EMPTY, and a third writer may legitimately
+      // have claimed it. A plain rename-over would unseat that claim and resurrect the
+      // deposed token as the authority — its writer would pass the lease check on it,
+      // commit, and the resumed writer holding the REAL current lease would then land
+      // its final rename over that acknowledged data. The restore is therefore
+      // EXCLUSIVE: link fails with EEXIST on any existing target, no check-then-act
+      // window. Contended, the captured lease stays superseded — its owner deposes
+      // itself on the next refresh or commit, and the CURRENT holder stays the
+      // authority; uncontended, the lease goes back to exactly where its owner left it.
+      try {
+        fs.linkSync(tomb, lockFile);
+        try { fs.unlinkSync(tomb); } catch { /* the link owns the inode now */ }
+      } catch (e) {
+        if (e.code !== 'EEXIST') {
+          // The exclusive restore itself failed (permissions, I/O). Keep the tomb on
+          // disk — it is the captured lease's only remaining copy, and its owner may
+          // still be alive; refuse loudly and let a later takeover or the operator
+          // resolve it. Never unlink it blind here.
+          throw new StoreError('lock', `cannot restore ${path.basename(tomb)}: ${e.message}`);
+        }
+        try { fs.unlinkSync(tomb); } catch { /* gone */ }
+      }
       throw new StoreError('second-writer', `lost the takeover race for ${file}`);
     }
     try { fs.unlinkSync(tomb); } catch { /* already gone */ }

@@ -820,3 +820,134 @@ catch (e) { console.log('TXN ' + JSON.stringify({ ok: false, code: e.code || 'un
     assert.equal(fs.readdirSync(w.root).filter(n => n.startsWith('data.json.committing.')).length, 0, 'A cleaned its own marker on the success path');
   } finally { await w.teardown(); }
 });
+
+/* M01, the round-11 takeover-restore race: a refused contender used to put the captured
+ * lease back with a plain rename — which OVERWRITES whatever claimed the emptied public
+ * path while the capture held it. Here B judges the dead fixture's stale lease, pauses
+ * around its capture; C takes over for real and pauses; B's capture then grabs C's lease
+ * (the public path stands empty); D claims the empty path, commits D1 and pauses inside
+ * D2's final rename. The old restore wrote C's lease OVER D's: C's own token sat on the
+ * public path again, C passed its lease check and committed, and D's resumed rename
+ * erased C's acknowledged data. Now the restore is exclusive (link, EEXIST on any
+ * existing target): B refuses, D's lease stays the authority, C — deposed — refuses, and
+ * D's acknowledged commits survive. */
+test('M01: a refused takeover never restores the captured lease over the current holder — the acknowledged commits survive', async () => {
+  const w = writerWorld('community-store-m01-');
+  // A dead holder's stale lease, as a crash would leave it: foreign host, silent way
+  // past the takeover window. The clock file stays at `base` the whole scenario, so
+  // only this fixture is ever stale.
+  fs.writeFileSync(w.file, JSON.stringify({ schemaVersion: 1, revision: 0, updatedAt: Date.now(), members: { seed: 1 } }));
+  fs.writeFileSync(w.file + '.lock', JSON.stringify({ pid: 99999999, host: 'dead-fixture', token: '0'.repeat(32), at: Date.now() - 60000 }));
+  const childCode = `
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+os.hostname = () => 'm01-writer-' + process.env.ROLE;
+const clock = () => { try { return Number(fs.readFileSync(process.env.CLOCK, 'utf8')) } catch { return Date.now() } };
+const { createSharedStore } = await import(process.env.STORE_URL);
+const role = process.env.ROLE, file = process.env.FILE, root = process.env.ROOT;
+const waitFor = f => { while (!fs.existsSync(f)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20); };
+const pause = name => { fs.writeFileSync(path.join(root, 'entered-' + name), '1'); waitFor(path.join(root, 'release-' + name)); };
+const rename = fs.renameSync;
+let intercepted = false;
+fs.renameSync = function (from, to) {
+  if (role === 'B' && !intercepted && from === file + '.lock' && String(to).startsWith(file + '.lock.take.')) {
+    intercepted = true;
+    pause('B-before-capture');
+    const out = rename(from, to);
+    pause('B-after-capture');
+    return out;
+  }
+  if (role === 'D' && to === file && String(from).includes('.commit.') && JSON.parse(fs.readFileSync(from, 'utf8')).members.D2) pause('D2-verified');
+  return rename(from, to);
+};
+const store = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: { seed: 1 } }), now: clock });
+const warmup = store.warmup();
+console.log('WARMUP ' + JSON.stringify(warmup));
+if (role === 'C' && warmup.ok) pause('C-ready');
+if (role !== 'B') {
+  const txn = async key => {
+    try { const r = await store.txn(v => { v.edit().members[key] = 1 }); console.log('TXN ' + JSON.stringify({ key, ok: true, revision: r.revision })) }
+    catch (e) { console.log('TXN ' + JSON.stringify({ key, ok: false, code: e.code || 'unexpected' })) }
+  };
+  if (role === 'D') { await txn('D1'); await txn('D2') } else await txn('C');
+}
+`;
+  const lockToken = () => { try { return JSON.parse(fs.readFileSync(w.file + '.lock', 'utf8')).token } catch { return null } };
+  try {
+    // B judges the dead fixture stale and pauses right before its capture.
+    const b = w.spawnWriter(childCode, 'B');
+    await w.waitFor('B to reach its capture', path.join(w.root, 'entered-B-before-capture'));
+    // C takes the stale lease over for real and holds it, paused before any business write.
+    const c = w.spawnWriter(childCode, 'C');
+    await w.waitFor('C to hold its lease', path.join(w.root, 'entered-C-ready'));
+    const cToken = lockToken();
+    assert.ok(cToken && cToken !== '0'.repeat(32), 'C owns the lease now');
+    // B's capture moves the PUBLIC lock — C's lease — into B's private tombstone.
+    fs.writeFileSync(path.join(w.root, 'release-B-before-capture'), '1');
+    await w.waitFor('B to finish its capture', path.join(w.root, 'entered-B-after-capture'));
+    assert.equal(lockToken(), null, 'the public path stands empty while the capture holds the lease');
+    // D claims the emptied path, commits D1, and pauses inside D2's final rename —
+    // marker published, lease review passed.
+    const d = w.spawnWriter(childCode, 'D');
+    await w.waitFor('D to reach its D2 rename', path.join(w.root, 'entered-D2-verified'));
+    const dToken = lockToken();
+    assert.ok(dToken && dToken !== cToken, 'D claimed the path while B held the tomb');
+    const afterD1 = JSON.parse(fs.readFileSync(w.file, 'utf8'));
+    assert.deepEqual(afterD1.members, { seed: 1, D1: 1 }, 'D1 is acknowledged before the race resolves');
+    // B resumes, sees it captured C instead of the judged fixture, and refuses — the
+    // restore must not be able to unseat D.
+    fs.writeFileSync(path.join(w.root, 'release-B-after-capture'), '1');
+    const bWarmup = await b.warmup();
+    assert.equal(bWarmup.ok, false);
+    assert.equal(bWarmup.code, 'second-writer', 'B refuses the race it lost');
+    assert.equal(lockToken(), dToken, 'M01: the refused contender did not restore C\u2019s lease over D\u2019s');
+    assert.equal(fs.readdirSync(w.root).filter(n => n.includes('.lock.take.')).length, 0, 'the tombstone went with the refusal');
+    // C resumes: its token is nowhere — the deposed writer refuses instead of committing.
+    fs.writeFileSync(path.join(w.root, 'release-C-ready'), '1');
+    const cResult = await c.done;
+    assert.equal(cResult.ok, false, 'the deposed writer refuses (a deposed commit would be the resurrection)');
+    // D completes D2: the acknowledged data survives every resumed writer.
+    fs.writeFileSync(path.join(w.root, 'release-D2-verified'), '1');
+    const dResult = await d.done;
+    assert.deepEqual(dResult, { key: 'D2', ok: true, revision: 2 });
+    const final = JSON.parse(fs.readFileSync(w.file, 'utf8'));
+    assert.deepEqual(final.members, { seed: 1, D1: 1, D2: 1 }, 'M01: D\u2019s acknowledged commits are all still there');
+  } finally { await w.teardown(); }
+});
+
+/* The heartbeat is the other way a dead token could come back: a holder that lost its
+ * lease while paused must not write its lease over the public path when it resumes. The
+ * refresh is conditional on the path still naming us — a foreign token there deposes the
+ * paused holder instead of being clobbered. */
+test('M01: a deposed holder\u2019s heartbeat never rewrites the lease that replaced it', async () => {
+  const file = path.join(dir(), 'beaten.json');
+  const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  try {
+    assert.equal(s.warmup().ok, true);
+    const own = JSON.parse(fs.readFileSync(file + '.lock', 'utf8'));
+    assert.equal(own.pid, process.pid);
+    // Another host legitimately took the lease over while this process "paused" — its
+    // own heartbeat already silent long enough for the takeover to be honest.
+    const foreign = { pid: 424242, host: 'recovered-elsewhere', token: 'f'.repeat(32), at: Date.now() - 60000 };
+    fs.writeFileSync(file + '.lock', JSON.stringify(foreign));
+    // The deposed holder notices at its next LEASED commit (a no-edit result is
+    // read-only and never checks the lease, J05) — and stops claiming.
+    await assert.rejects(s.txn(view => { view.edit().members.x = 1; }), e => e.code === 'lost-lock');
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).members, {}, 'the deposed commit wrote nothing');
+    // Give the (1 s) heartbeat two chances to run if it were still alive.
+    await new Promise(r => setTimeout(r, 2300));
+    const after = JSON.parse(fs.readFileSync(file + '.lock', 'utf8'));
+    assert.equal(after.token, foreign.token, 'the foreign lease is untouched — no resurrection by heartbeat');
+    // The control: a live holder's own lease survives its beats (still its token).
+    const s2 = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+    try {
+      assert.equal(s2.warmup().ok, true);
+      const token2 = JSON.parse(fs.readFileSync(file + '.lock', 'utf8')).token;
+      await new Promise(r => setTimeout(r, 2300));
+      assert.equal(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')).token, token2, 'a live holder keeps beating under its own token');
+      const { revision } = await s2.txn(view => { view.edit().members.a = 1; });
+      assert.equal(revision, 1);
+    } finally { s2.release(); }
+  } finally { s.release(); }
+});

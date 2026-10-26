@@ -39,8 +39,6 @@ const sessionKeyOf = st => `${st.user?.id || ''}|${instanceOf(st)}`
 // v2:           lb-withdraw:<origin>:<uid>        — provable only while serving that origin.
 // v1:           lb-withdraw:<uid>                 — no instance proof at all.
 const KEY_V3 = (inst, uid) => `lb-withdraw:${inst}:${uid}`
-const KEY_V2 = (origin, uid) => `lb-withdraw:${origin}:${uid}`
-const KEY_V1 = uid => `lb-withdraw:${uid}`
 
 export function createPublisher({ store = useStore, client = { fetchMe, leaveLeaderboard, publishReport }, clock = Date.now, storage = globalThis.localStorage } = {}) {
   const get = () => store.getState()
@@ -93,10 +91,17 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
    * individually: superseded when a newer request replaces the mark, deleted when the
    * captured mark they stand for is acknowledged away. */
   const rawMark = key => { try { return storage.getItem(key) } catch { return null } }
-  const intentIdOf = raw => { try { const p = JSON.parse(raw); return p && typeof p.i === 'string' ? p.i : null } catch { return null } }
-  const captureMarks = sess => {
+  /** Capture the marks a withdrawal outcome may act on, SCOPED to a provenance group (M02):
+   *  'here' — only keys that provably belong to the current instance (the only ones an
+   *  automatic flow may ever settle); 'ambiguous' — only keys whose instance ownership
+   *  nobody here can prove (the person's explicit discard acts on these); no group — both,
+   *  for the explicit confirm whose leave covers everything the person just attested to.
+   *  A current-instance success must never acknowledge a mark it cannot attribute — the
+   *  old blanket capture silently deleted another instance's pending decision. */
+  const captureMarks = (sess, group) => {
     const hist = historicalKeys(sess)
-    return [...hist.here, ...hist.ambiguous].map(key => ({ key, raw: rawMark(key) })).filter(c => c.raw !== null)
+    const keys = group === 'here' ? hist.here : group === 'ambiguous' ? hist.ambiguous : [...hist.here, ...hist.ambiguous]
+    return keys.map(key => ({ key, raw: rawMark(key) })).filter(c => c.raw !== null)
   }
   const acknowledgeMarks = captured => {
     for (const { key, raw } of captured) if (rawMark(key) === raw) clearMark(key)
@@ -156,7 +161,13 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     const hist = historicalKeys(sess)
     return {
       pending: hist.here.length > 0 || hist.ambiguous.length > 0 || sess.currentIntentId != null,
-      ambiguous: hist.here.length === 0 && hist.ambiguous.length > 0
+      // M02: ANY unproven mark demands the person — also when a provable mark sits next
+      // to it. The old "only when nothing provable exists" rule let a current-instance
+      // success ride over an unknown instance's pending decision (the mixed capture
+      // acknowledged both). The automatic flow stays gated off until the person says
+      // what the unproven mark was; the provable part either resolves with that same
+      // explicit confirmation or auto-completes once the unknown side is decided.
+      ambiguous: hist.ambiguous.length > 0
     }
   }
 
@@ -179,7 +190,9 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     setMark(key, intentId)
     const captured = [{ key, raw: rawMark(key) }].filter(c => c.raw !== null)
     status.withdrawPending = true
-    status.withdrawAmbiguous = false
+    // Marks of unknown provenance that already sat in storage keep demanding the person
+    // (M02) — this new decision for the current instance does not speak for them.
+    status.withdrawAmbiguous = historicalKeys(sess).ambiguous.length > 0
     emit()
     try {
       await client.leaveLeaderboard(me)
@@ -202,11 +215,15 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   /** Resolve an ambiguous historical mark (G04/G05): 'here' — the person confirms the intent
    *  belongs to THIS server, so leave and clear the captured marks; 'discard' — the person
    *  says the intent belongs elsewhere, so drop them. Either way the marks that were
-   *  recognized are the ones acted on, and only while unchanged (I05). */
+   *  recognized are the ones acted on, and only while unchanged (I05). The person's
+   *  decision is scoped to what they actually decided (M02): a discard attests that the
+   *  UNPROVABLE marks are not ours — provable marks next to them are still this
+   *  instance's outstanding decision and stay pending; a confirm attests that
+   *  everything captured belongs here, so its leave may settle all of it. */
   async function resolveAmbiguousWithdraw(action, me) {
     const sess = session
     if (!sess) return { ok: false }
-    const captured = captureMarks(sess) // every mark this resolution may act on
+    const captured = captureMarks(sess, action === 'discard' ? 'ambiguous' : undefined)
     if (action === 'discard') {
       acknowledgeMarks(captured)
       if (session === sess) {
@@ -267,11 +284,13 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       status.withdrawAmbiguous = wd.ambiguous
       if (wd.pending) {
         if (wd.ambiguous) { emit(); return } // F06: unprovable — the person resolves it
-        // I05/J04/L02: the marks this automatic retry may act on are captured BEFORE
+        // I05/J04/L02/M02: the marks this automatic retry may act on are captured BEFORE
         // the me fetch and the request — and so is the id of the memory decision that
         // was current when the retry began. Its outcome settles exactly these, never
-        // the marks or the newer intent a request made while it was in flight.
-        const captured = captureMarks(sess)
+        // the marks or the newer intent a request made while it was in flight — and
+        // only PROVABLY-current-instance marks at that: an unattributable mark is the
+        // person's decision, never this request's to acknowledge.
+        const captured = captureMarks(sess, 'here')
         const intentAtCapture = sess.currentIntentId
         const m = await me(sess, true)
         if (!stillUs()) return
@@ -440,9 +459,10 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     const st = get()
     const key = sessionKeyOf(st)
     if (!session || session.key !== key) {
-      // F04: the WHOLE session object is replaced — credentials, caches, fingerprints, marks
-      // — and the generation moves, so every in-flight task of the old session dies on its
-      // next stillUs().
+      // F04: the WHOLE session object is replaced — credentials, caches, fingerprints, marks.
+      // The isolation is the IDENTITY swap: in-flight tasks hold the old object and die on
+      // their next stillUs(), which compares session objects, not this counter. The
+      // generation is diagnostic bookkeeping for logs/tests, never a gate.
       generation++
       session = {
         key,

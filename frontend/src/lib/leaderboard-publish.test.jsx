@@ -443,3 +443,109 @@ describe('L02 — a memory-only intent (its storage write failed) survives an ol
     expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw:'))).toHaveLength(0)
   })
 })
+
+describe('M02 — provenance-scoped withdrawal resolution', () => {
+  // A v2 mark for a server this device does not serve (the harness origin is not this URL)
+  // is unprovable; the v3 mark for the connected instance is provably here.
+  const UNKNOWN = 'lb-withdraw:https://older-server.example:a'
+  const HERE = 'lb-withdraw:https://alpha.example:a'
+
+  it('the automatic flow never touches an unproven mark beside a provable one', async () => {
+    const h = harness()
+    h.storage[UNKNOWN] = JSON.stringify({ v: 2, i: 'older-intent' })
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent' })
+    h.client.fetchMe.mockResolvedValue({ ...ME })
+    h.client.leaveLeaderboard.mockResolvedValue({})
+    h.p.start()
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    // The mixed state is the person's to resolve (F06): no automatic leave, no publish,
+    // and BOTH marks exactly as they were.
+    expect(h.client.leaveLeaderboard).not.toHaveBeenCalled()
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    expect(JSON.parse(h.storage[UNKNOWN]).i).toBe('older-intent')
+    expect(JSON.parse(h.storage[HERE]).i).toBe('here-intent')
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+    expect(h.p.publishStatus().withdrawAmbiguous).toBe(true)
+    h.p.stop()
+  })
+
+  it('a discard attests only the unproven marks; the provable part then auto-completes', async () => {
+    const h = harness()
+    h.storage[UNKNOWN] = JSON.stringify({ v: 2, i: 'older-intent' })
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent' })
+    h.client.fetchMe.mockResolvedValue({ ...ME })
+    h.client.leaveLeaderboard.mockResolvedValue({})
+    h.p.start()
+    await vi.advanceTimersByTimeAsync(10)
+    await h.p.resolveAmbiguousWithdraw('discard')
+    // The person said the unproven intents are not ours: they go — and ONLY them.
+    expect(UNKNOWN in h.storage).toBe(false)
+    expect(JSON.parse(h.storage[HERE]).i).toBe('here-intent') // still this instance's decision
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+    // With the unknown side decided, the automatic flow may finish the provable one.
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.client.leaveLeaderboard).toHaveBeenCalledTimes(1)
+    expect(HERE in h.storage).toBe(false)
+    expect(h.p.publishStatus().withdrawPending).toBe(false)
+    h.p.stop()
+  })
+
+  it('a confirm attests everything captured belongs here: its leave settles all of it', async () => {
+    const h = harness()
+    h.storage[UNKNOWN] = JSON.stringify({ v: 1, i: 'legacy-intent' }) // v1: no instance proof
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent' })
+    h.client.fetchMe.mockResolvedValue({ ...ME })
+    h.client.leaveLeaderboard.mockResolvedValue({})
+    h.p.start()
+    await vi.advanceTimersByTimeAsync(10)
+    await h.p.resolveAmbiguousWithdraw('leave')
+    expect(h.client.leaveLeaderboard).toHaveBeenCalledTimes(1)
+    expect(UNKNOWN in h.storage).toBe(false)
+    expect(HERE in h.storage).toBe(false)
+    expect(h.p.publishStatus().withdrawPending).toBe(false)
+    h.p.stop()
+  })
+
+  it('a leave response settles only the provable marks it captured — an unproven mark written mid-flight survives', async () => {
+    const h = harness()
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent' })
+    h.client.fetchMe.mockResolvedValue({ ...ME })
+    let resolveLeave
+    h.client.leaveLeaderboard.mockImplementationOnce(() => new Promise(r => { resolveLeave = r }))
+    h.p.start()
+    const leaving = h.p.requestLeave({ ...ME })
+    // While the request is in flight, an unproven mark appears (another device's record
+    // synced into this storage).
+    h.storage[UNKNOWN] = JSON.stringify({ v: 1, i: 'late-legacy' })
+    resolveLeave({})
+    await leaving
+    // The response speaks for the current instance only: the unproven mark is untouched
+    // and still demands the person.
+    expect(UNKNOWN in h.storage).toBe(true)
+    expect(HERE in h.storage).toBe(false)
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+    expect(h.p.publishStatus().withdrawAmbiguous).toBe(true)
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    h.p.stop()
+  })
+
+  it('multiple unproven formats (v1 and foreign-origin v2) are discarded together, the provable mark stays', async () => {
+    const h = harness()
+    h.storage['lb-withdraw:a'] = '1'                                             // v1: no proof
+    h.storage['lb-withdraw:https://paired-elsewhere.example:3000:a'] = '1'       // v2, foreign origin
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent' })
+    h.client.fetchMe.mockResolvedValue({ ...ME })
+    h.client.leaveLeaderboard.mockResolvedValue({})
+    h.p.start()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.p.publishStatus().withdrawAmbiguous).toBe(true)
+    await h.p.resolveAmbiguousWithdraw('discard')
+    expect('lb-withdraw:a' in h.storage).toBe(false)
+    expect('lb-withdraw:https://paired-elsewhere.example:3000:a' in h.storage).toBe(false)
+    expect(JSON.parse(h.storage[HERE]).i).toBe('here-intent')
+    h.p.stop()
+  })
+})
