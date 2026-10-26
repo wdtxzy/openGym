@@ -459,14 +459,19 @@ export const useStore = create((set, get) => {
   // that nothing moved on either side. The fingerprint is what signing out counts changes against.
   const confirmed = S => {
     const at = Date.now()
-    try {
-      localStorage.setItem(SYNCED_AT_KEY, String(at))
-      if (fpOf !== S) { lastConfirmedFp = JSON.stringify(syncFingerprint(S)); localStorage.setItem(SYNCED_FP_KEY, lastConfirmedFp); fpOf = S }
-    } catch { /* storage refused — only the count is lost */ }
-    // J02: the fingerprint of the copy the server actually holds — the SENT copy (S), never
-    // whatever the store holds by response time — published on the sync object, where the
-    // leaderboard publisher's snapshot gate reads it atomically with the rest of the sync
-    // state: a report may only be built from facts this fingerprint still matches.
+    // K04: the in-memory proof updates FIRST, from the copy the server actually confirmed
+    // (S — the SENT copy, never whatever the store holds by response time), and never
+    // conditional on an auxiliary localStorage write succeeding: a refused key used to
+    // skip the update, leaving the gate comparing fresh facts against a stale proof and
+    // blocking data that IS synced from ever publishing. The persisted copies below are
+    // best-effort and independently retried on the next confirmation — their failure
+    // costs the next boot a recompute, never the running session its proof.
+    if (fpOf !== S || lastConfirmedFp == null) { lastConfirmedFp = JSON.stringify(syncFingerprint(S)); fpOf = S }
+    try { localStorage.setItem(SYNCED_AT_KEY, String(at)) } catch { /* auxiliary key */ }
+    try { localStorage.setItem(SYNCED_FP_KEY, lastConfirmedFp) } catch { /* auxiliary key */ }
+    // J02: published on the sync object, where the leaderboard publisher's snapshot gate
+    // reads it atomically with the rest of the sync state: a report may only be built
+    // from facts this fingerprint still matches.
     reached({ pending: false, lastSynced: at, confirmedFp: lastConfirmedFp })
   }
   let lastConfirmedFp = null

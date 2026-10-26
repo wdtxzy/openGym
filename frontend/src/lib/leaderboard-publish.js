@@ -101,18 +101,16 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   const acknowledgeMarks = captured => {
     for (const { key, raw } of captured) if (rawMark(key) === raw) clearMark(key)
   }
-  /** Register a fresh leave intent: whatever intent the key held is superseded (its request
-   *  may still land server-side — same account, same effect — but it is no longer the
-   *  outstanding decision), and the new id is tracked until its mark is settled. */
-  function registerIntent(sess, key, intentId) {
-    const prev = intentIdOf(rawMark(key))
-    if (prev) sess.withdrawIntentIds.delete(prev)
-    sess.withdrawIntentIds.add(intentId)
-    sess.withdrawMarked = true
-  }
   /** Settle the intents a completed leave acted on: acknowledge the captured marks, then
    *  drop every in-memory id whose mark was actually cleared. Ids whose key now holds a
-   *  NEWER intent's mark survive — that intent is the current decision (I05). */
+   *  NEWER intent's mark survive — that intent is the current decision (I05).
+   *
+   *  The closing sweep (K03): an id that NO readable mark records is memory-only — the
+   *  mark it was written under was replaced before its id could be captured (the
+   *  pre-round-9 order) or the storage cannot hold marks at all. Nothing persisted can
+   *  name a newer intent it might still protect, and a confirmed leave for this
+   *  account+instance fulfills exactly that decision — so it settles here instead of
+   *  wedging the pending state forever. */
   function settleIntents(sess, captured) {
     acknowledgeMarks(captured)
     for (const { key, raw } of captured) {
@@ -123,6 +121,13 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         if (id) sess.withdrawIntentIds.delete(id)
       }
     }
+    const hist = historicalKeys(sess)
+    const persisted = new Set()
+    for (const k of [...hist.here, ...hist.ambiguous]) {
+      const id = intentIdOf(rawMark(k))
+      if (id) persisted.add(id)
+    }
+    for (const id of [...sess.withdrawIntentIds]) if (!persisted.has(id)) sess.withdrawIntentIds.delete(id)
     sess.withdrawMarked = sess.withdrawIntentIds.size > 0
   }
 
@@ -179,8 +184,17 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     if (!sess) return { ok: false, error: new Error('not signed in') }
     const key = KEY_V3(sess.instance, sess.uid)
     const intentId = newIntentId()
+    // K03: capture what the key holds BEFORE replacing it. Reading after the overwrite
+    // only ever sees the new id — the previous intent's id would stay tracked forever
+    // with no mark left to settle it, and a completed replacement could never clear
+    // the pending state. The previous intent is superseded HERE, explicitly: its request
+    // may still land server-side (same account, same effect), but it is no longer the
+    // outstanding decision.
+    const prevId = intentIdOf(rawMark(key))
     setMark(key, intentId)
-    registerIntent(sess, key, intentId)   // supersedes whatever intent the key held
+    if (prevId && prevId !== intentId) sess.withdrawIntentIds.delete(prevId)
+    sess.withdrawIntentIds.add(intentId)
+    sess.withdrawMarked = true
     const captured = [{ key, raw: rawMark(key) }].filter(c => c.raw !== null)
     status.withdrawPending = true
     status.withdrawAmbiguous = false

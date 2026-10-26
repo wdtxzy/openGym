@@ -307,3 +307,47 @@ describe('J04 — an offline withdrawal finishes after automatic recovery', () =
     expect(h.p.publishStatus().withdrawPending).toBe(true)
   })
 })
+
+describe('K03 — replacing a failed intent and completing the new one leaves no phantom intent', () => {
+  const ME0 = { enabled: true, suspended: false, disclosureVersion: 1, currentDisclosureVersion: 1, consentVersion: 1, reportRev: 0 }
+
+  function withdrawFixture() {
+    const h = harness()
+    h.p.start()
+    h.client.fetchMe.mockResolvedValue({ ...ME0 })
+    return h
+  }
+
+  it.each([[false, 'the replacement succeeds directly'], [true, 'the replacement fails, then the automatic retry succeeds']])('automatic=%s — %s', async automatic => {
+    const h = withdrawFixture()
+    // Intent A: persisted, request fails offline.
+    h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('A offline'))
+    await h.p.requestLeave({ ...ME0 })
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+    if (automatic) h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('B offline'))
+    h.client.leaveLeaderboard.mockResolvedValue({})
+    // Intent B replaces the mark for the same account/instance — A is superseded, not
+    // accumulated: the old code read the "previous" id from the mark AFTER overwriting
+    // it, so A's id survived as a phantom and no completion could ever clear pending.
+    await h.p.requestLeave({ ...ME0 })
+    if (automatic) {
+      await h.p.retryNow()
+      await vi.advanceTimersByTimeAsync(1)
+    }
+    const key = 'lb-withdraw:https://alpha.example:a'
+    expect(key in h.storage).toBe(false)            // the persisted mark settled
+    expect(h.p.publishStatus().withdrawPending).toBe(false) // and so did the in-memory intents
+    expect(h.p.publishStatus().lastError).toBe(null)
+    expect(h.p.publishStatus().lastOkAt).not.toBe(null)
+    // A triple replacement chain settles the same way.
+    h.client.leaveLeaderboard.mockReset()
+    h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('C offline'))
+    h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('D offline'))
+    h.client.leaveLeaderboard.mockResolvedValue({})
+    await h.p.requestLeave({ ...ME0 }) // C, fails
+    await h.p.requestLeave({ ...ME0 }) // D replaces C, fails
+    await h.p.requestLeave({ ...ME0 }) // E replaces D, succeeds
+    expect('lb-withdraw:https://alpha.example:a' in h.storage).toBe(false)
+    expect(h.p.publishStatus().withdrawPending).toBe(false)
+  })
+})

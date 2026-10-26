@@ -90,31 +90,45 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   const myMarker = () => file + '.committing.' + myToken;
 
   /** Every commit marker for THIS data file — the per-token ones plus the pre-round-8
-   *  shared name and the round-7 tomb/new temps, all of which match the same prefix and
-   *  are debris a fresh lock acquisition may clear. */
+   *  shared name and the round-7 tomb/new temps, all of which match the same prefix.
+   *  A directory that cannot be read is NOT an empty set (K02): an unreadable listing
+   *  means the markers — and the private commit files they name — are unknown, and
+   *  unknown is not "isolated". Only a directory that truly does not exist reads empty. */
   function commitMarkers() {
     const dir = path.dirname(file);
     const base = path.basename(file);
     const prefix = base + '.committing.';
-    try {
-      return fs.readdirSync(dir)
-        .filter(n => n === base + '.committing' || n.startsWith(prefix))
-        .map(n => path.join(dir, n));
-    } catch { return []; }
+    let names;
+    try { names = fs.readdirSync(dir); }
+    catch (e) {
+      if (e.code === 'ENOENT') return [];
+      throw new StoreError('lock', `cannot list commit markers: ${e.message}`);
+    }
+    return names
+      .filter(n => n === base + '.committing' || n.startsWith(prefix))
+      .map(n => path.join(dir, n));
   }
 
-  /** Clear commit markers whose writer cannot be legitimate (called only while holding no
-   *  lease): each marker's recorded private commit file goes with it, both temp layers —
-   *  that removal is what makes the paused writer's final rename fail ENOENT instead of
-   *  landing over the writer that took over. */
-  function clearCommitMarkers(markers) {
-    for (const m of markers) {
+  /** Isolate every commit marker for this data file — called ONLY while holding the
+   *  lease (K01): each marker's recorded private commit file goes with it, both temp
+   *  layers. That removal is what makes a paused writer's final rename fail ENOENT
+   *  instead of landing over the writer that took over — so a removal that FAILED is
+   *  not a removal (K02): ENOENT is the only error that proves the file gone; anything
+   *  else (EIO, EACCES, …) leaves the old writer armed and REFUSES the acquisition
+   *  rather than promising a success it cannot defend. A marker that does not parse
+   *  cannot arm its writer (a live writer's own commit check re-reads the marker and
+   *  deposes on a mismatch), so unreadable debris is simply deleted. */
+  function isolateCommitMarkers() {
+    for (const m of commitMarkers()) {
       const body = readAt(m);
       if (body && body.tmp) {
-        try { fs.unlinkSync(body.tmp); } catch { /* already gone */ }
-        try { fs.unlinkSync(body.tmp + '.tmp'); } catch { /* inner layer */ }
+        for (const t of [body.tmp, body.tmp + '.tmp']) {
+          try { fs.unlinkSync(t); }
+          catch (e) { if (e.code !== 'ENOENT') throw new StoreError('lock', `cannot isolate ${path.basename(t)}: ${e.message}`); }
+        }
       }
-      try { fs.unlinkSync(m); } catch { /* already gone */ }
+      try { fs.unlinkSync(m); }
+      catch (e) { if (e.code !== 'ENOENT') throw new StoreError('lock', `cannot isolate ${path.basename(m)}: ${e.message}`); }
     }
   }
 
@@ -201,35 +215,57 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   function lock() {
     if (refused) throw new StoreError(refused.code, refused.message); // settled: refuse with a clean error
     if (locked) return;
-    // Commit markers, judged before anything is claimed (we hold no lease yet, so every
-    // marker for this file is debris or a mid-commit writer whose lease must be judged).
-    // A FRESH marker over a LIVE lease means its writer is mid-commit right now: refuse.
-    // Anything else — fresh over a dead lease (the writer froze and its heartbeat went
-    // silent), stale debris, round-7 tombs — is cleared, each marker's recorded private
-    // commit file with it: that is what makes a resumed writer's final rename fail ENOENT
-    // instead of landing over whoever took over (H01/J01).
-    const markers = commitMarkers();
-    if (markers.length) {
+    // Best-effort refuse only (K01): a FRESH marker over a LIVE lease means its writer is
+    // mid-commit right now — do not contend. Nothing is CLEARED here: a directory listing
+    // taken now is stale by the time the lease changes hands (a writer can publish its
+    // marker and pass its lease check in the gap), so the authoritative isolation runs
+    // AFTER this store holds the lease, where it is provably complete.
+    const markersEarly = commitMarkers();
+    if (markersEarly.length) {
       const holder = readLock();
       const leaseAlive = holder && holder.token && (holder.host !== myHost
         ? (typeof holder.at === 'number' && now() - holder.at <= STALE_HOST_MS)
         : (holder.pid === process.pid || pidAlive(holder.pid)));
-      const anyFresh = markers.some(m => {
+      const anyFresh = markersEarly.some(m => {
         try { return now() - fs.statSync(m).mtimeMs <= STALE_HOST_MS; } catch { return false; }
       });
       if (anyFresh && leaseAlive) throw new StoreError('second-writer', `${file}: a commit is in progress`);
-      clearCommitMarkers(markers);
     }
     try {
       claimLock();
-      locked = true;
-      beat();
-      return;
     } catch (e) {
       if (e.code !== 'EEXIST') throw new StoreError('lock', e.message);
+      acquireStale();
     }
+    acquired();
+  }
+
+  /** Everything that must hold once the lease is ours, in order (K01): isolate the
+   *  commit markers a paused old writer may still be holding, and only then look alive
+   *  to the outside. An isolation that cannot prove its deletions failed REFUSES the
+   *  acquisition — the lease is handed back and the error is loud, never swallowed into
+   *  a success an old writer can still overwrite (K02). */
+  function acquired() {
+    locked = true;
+    try {
+      isolateCommitMarkers();
+    } catch (e) {
+      locked = false;
+      try {
+        const holder = readLock();
+        if (iOwn(holder)) fs.unlinkSync(lockFile);
+      } catch { /* best effort: the heartbeat never started */ }
+      throw e instanceof StoreError ? e : new StoreError('lock', e.message);
+    }
+    beat();
+  }
+
+  /** The takeover of a silent lease: judge, capture-verify-discard, claim. On success the
+   *  caller runs acquired(); a refusal inside leaves the lock file where the judgement
+   *  left it safe. */
+  function acquireStale() {
     let holder = readLock();
-    if (iOwn(holder)) { locked = true; beat(); return; }       // our own, from this store
+    if (iOwn(holder)) return;                                  // our own, from this store: acquired() finishes
     const lockAge = () => {
       try { return now() - fs.statSync(lockFile).mtimeMs; } catch { return STALE_HOST_MS + 1; }
     };
@@ -258,7 +294,7 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     // else is put back and we refuse.
     // (No takeover guard file: the lock capture below is the atomic step — a contender
     // that loses it never unseats the winner, T03/N05 — and commit markers are per-writer
-    // names, cleared above, with no shared name left to guard.)
+    // names, isolated by acquired() once the lease is held, with no shared name to guard.)
     const tomb = lockFile + '.take.' + crypto.randomBytes(6).toString('hex');
     let captured = null;
     try { fs.renameSync(lockFile, tomb); captured = readAt(tomb); }
@@ -274,8 +310,6 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     try { fs.unlinkSync(tomb); } catch { /* already gone */ }
     try {
       claimLock();
-      locked = true;
-      beat();
     } catch (e) {
       if (e.code === 'EEXIST') throw new StoreError('second-writer', `lost the takeover race for ${file}`);
       throw new StoreError('lock', e.message);
