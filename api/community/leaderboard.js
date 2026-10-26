@@ -337,7 +337,12 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
         const m = memberOf(data, targetUid);
         if (!m) throw new LeaderboardError(404, 'no-such-member');
         if (typeof actionId !== 'string' || !actionId || actionId.length > 64) throw new LeaderboardError(400, 'action-id');
-        const prior = (data.adminActions || []).find(a => a.actionId === actionId);
+        // I04: the idempotency index covers EVERY still-valid accepted action — the pending
+        // queue first (an action can fall out of the 500-entry reviewed history long before
+        // its audit line is deliverable; replaying it must answer "already applied", never
+        // re-apply it or enqueue a second copy), then the reviewed history.
+        const prior = list(data.pendingAudits).find(a => a.actionId === actionId)
+          || list(data.adminActions).find(a => a.actionId === actionId);
         if (prior) return { ok: true, applied: false, at: prior.at };
         if (suspended) {
           const why = String(reason || '').trim();
@@ -353,7 +358,7 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
         // H04: the pending audit event lives in its OWN queue that is never silently
         // trimmed — losing a promised audit is worse than refusing a new action once the
         // backlog is extreme. The capped adminActions list keeps only the reviewed history.
-        const action = { actionId, at: now(), actor: actorUid, targetUid, suspended: !!suspended, reason: suspended ? m.suspendedReason : String(reason || '').slice(0, 500) };
+        const action = { actionId, at: now(), actor: actorUid, targetUid, suspended: !!suspended, reason: suspended ? m.suspendedReason : String(reason || '').slice(0, 500), audited: true };
         const pending = list(data.pendingAudits);
         if (pending.length >= AUDIT_BACKLOG_MAX)
           throw new LeaderboardError(503, 'audit-backlog', { backlog: pending.length });
@@ -423,15 +428,44 @@ export function createLeaderboard({ store, personalRevOf, now = Date.now }) {
       return Promise.resolve({ delivered: 0, remaining: pending.length });
     },
 
+    /** I03: the re-entrant, persisted migration from the pre-pendingAudits format. Before
+     *  the dedicated queue existed, undelivered audit events lived in the reviewed history
+     *  as `adminActions[].audited === false`; a file from that build loads fine here (same
+     *  schemaVersion) but its events were invisible to the new deliverer and stranded
+     *  forever. The migration merges them into pendingAudits by actionId (never
+     *  duplicated), flips the history copies to reviewed, and stamps `auditQueueVersion: 2`
+     *  so a rerun — on every boot, after an interrupted one — is a no-op. One transaction:
+     *  atomic, so an interrupted migration simply had not happened. */
+    migrateLegacyAudits() {
+      return store.txn(data => {
+        if (data.auditQueueVersion >= 2) return false;
+        const pendingIds = new Set(list(data.pendingAudits).map(a => a.actionId));
+        const legacy = list(data.adminActions).filter(a => a && a.audited === false && !pendingIds.has(a.actionId));
+        data.pendingAudits = [...list(data.pendingAudits), ...legacy.map(a => ({ ...a, audited: false }))];
+        // The history keeps every action, but never again as "undelivered" — the pending
+        // queue is now the only place an unconfirmed event lives.
+        data.adminActions = list(data.adminActions).map(a => (a && a.audited === false ? { ...a, audited: true } : a));
+        data.auditQueueVersion = 2;
+        return legacy.length;
+      }).then(({ out }) => out);
+    },
+
     markAudited(actionIds) {
       const ids = new Set(actionIds);
       return store.txn(data => {
         const pending = list(data.pendingAudits);
         const delivered = pending.filter(a => ids.has(a.actionId));
-        // Delivered events join the capped reviewed history; the pending queue only shrinks
-        // by actual delivery — never by the history window (H04).
+        // The pending queue only shrinks by actual delivery — never by the history window
+        // (H04). The reviewed history already holds the action from the disposition itself;
+        //  a delivered event joins it only when it is missing (an action that fell out of
+        //  the capped history while still pending, or a legacy one), and always as
+        //  reviewed — one action, one history entry (the round-7 duplicate-history fix).
         data.pendingAudits = pending.filter(a => !ids.has(a.actionId));
-        data.adminActions = [...(data.adminActions || []), ...delivered].slice(-500);
+        const known = new Set(list(data.adminActions).map(a => a.actionId));
+        const additions = delivered
+          .filter(a => !known.has(a.actionId))
+          .map(a => { const { audited, ...rest } = a; return { ...rest, audited: true }; });
+        data.adminActions = [...list(data.adminActions), ...additions].slice(-500);
         return delivered.length;
       }).then(({ out }) => out);
     },

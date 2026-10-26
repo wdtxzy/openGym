@@ -68,39 +68,42 @@ export function setCheer(targetPublicId, windowType, windowKey, on) {
   return api('/api/leaderboard/like?' + q, { method: 'DELETE' });
 }
 
-/** Publish this device's facts. Returns { ok, reportRev?, acceptedFingerprint?, reason?, error? }.
+/** Publish a snapshot of this device's confirmed facts. Returns { ok, reportRev?,
+ *  acceptedFingerprint?, acceptedRev?, reason?, error? }.
  *
- *  On a stale base/consent/personal-state (another device published or synced, or the member
- *  joined/left) the PRD's rule is: merge personal state FIRST, then re-aggregate — `opts.pull`
- *  (the store's pullState) runs, and the retry is built from `opts.stateOf()` (the store's
- *  CURRENT state), never from the closure's stale copy.
+ *  I02: the facts and the personal-state revision they were confirmed at travel together in
+ *  ONE snapshot — { facts, rev } captured in the same read. A report never borrows the
+ *  freshest me.personalRev to label older facts (the first publish of a phone whose account
+ *  was synced ahead by another device would otherwise claim a pairing its facts do not
+ *  have), and a 409 recovery re-captures the WHOLE snapshot after the merge
+ *  (opts.snapshotOf), so the retry's facts and its revision can never come from different
+ *  moments. On a stale base/consent/personal-state the PRD's rule is unchanged: merge
+ *  personal state FIRST (opts.pull), then rebuild — never re-serialize the refused facts
+ *  under a fresh revision.
  *
  *  G02: the answer names the fingerprint of the facts ACTUALLY accepted — the send may have
- *  been the merged retry, not the caller's original snapshot — so the coordinator records what
- *  the server really holds instead of guessing from the response-time store. G03: every send
- *  carries the member's `personalRev` (the personal-state revision the server reported); the
- *  server refuses the report when that no longer matches its live state, which is what closes
- *  the merge→read window where another device syncs in between. */
-export async function publishReport(S, me, opts = {}) {
-  const send = (facts, m, requestId) => {
+ *  been the merged retry, not the caller's original snapshot — plus the revision that
+ *  pairing claimed (acceptedRev), so the coordinator records exactly what the server holds. */
+export async function publishReport(snapshot, me, opts = {}) {
+  const send = (snap, m, requestId) => {
     const body = buildReport(
-      { workouts: facts.workouts || [], activities: facts.activities || [] },
+      { workouts: snap.facts.workouts || [], activities: snap.facts.activities || [] },
       { consentVersion: m.consentVersion, baseReportRev: m.reportRev, requestId, now: Date.now() }
     );
-    if (Number.isFinite(opts.validatedPersonalRev)) body.personalRev = opts.validatedPersonalRev;
-    else if (Number.isFinite(m.personalRev)) body.personalRev = m.personalRev; // legacy fallback: no confirmed pairing known
+    // The pairing is the snapshot's own rev, or nothing (a pre-pairing client): the newest
+    // me label is never attached to facts it was not captured with.
+    if (Number.isFinite(snap.rev)) body.personalRev = snap.rev;
     return api('/api/leaderboard/report', { method: 'PUT', body: JSON.stringify(body) })
-      .then(out => ({ ...out, acceptedFingerprint: fingerprintOf(facts) }));
+      .then(out => ({ ...out, acceptedFingerprint: fingerprintOf(snap.facts), acceptedRev: snap.rev }));
   };
   try {
-    return { ok: true, ...(await send(S, me, uid())) };
+    return { ok: true, ...(await send(snapshot, me, uid())) };
   } catch (e) {
     const recoverable = e.status === 409 && (e.data?.error === 'report-stale' || e.data?.error === 'consent-stale' || e.data?.error === 'personal-stale');
     if (!recoverable) return { ok: false, error: e };
     // No source of merged facts, no retry: re-serializing the very facts that were just
-    // refused is how a stale device overwrites a newer one's totals. The caller keeps the
-    // publish pending and retries with a merge (the coordinator always passes both).
-    if (typeof opts.stateOf !== 'function') return { ok: false, reason: 'needs-merge', error: e };
+    // refused is how a stale device overwrites a newer one's totals.
+    if (typeof opts.snapshotOf !== 'function') return { ok: false, reason: 'needs-merge', error: e };
     // N03: the merge must actually land. pullState swallows its own errors, so the wrapper
     // answers true/false; a false (failed, offline, or held for adoption) leaves the publish
     // pending instead of re-sending the same outdated facts under a fresh revision.
@@ -111,11 +114,10 @@ export async function publishReport(S, me, opts = {}) {
     }
     const fresh = await fetchMe();
     if (!fresh || !fresh.enabled || fresh.suspended) return { ok: false, reason: 'disabled' };
-    const facts = opts.stateOf();
-    // N04: the account switched mid-recovery — the store no longer belongs to the publish.
-    if (!facts) return { ok: false, reason: 'account-switched', error: e };
+    const snap = opts.snapshotOf(); // facts and rev, re-captured together — or null on a switch
+    if (!snap) return { ok: false, reason: 'account-switched', error: e };
     try {
-      return { ok: true, ...(await send(facts, fresh, uid())) };
+      return { ok: true, ...(await send(snap, fresh, uid())) };
     } catch (e2) {
       return { ok: false, error: e2 };
     }

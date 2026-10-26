@@ -143,21 +143,12 @@ export function leaderboardRoutes({ domain, json, readBody, readSession, require
           actorUid: admin.id, targetUid: body.targetUid,
           suspended: !!body.suspended, reason: body.reason, actionId: body.actionId
         });
-        // H03: ONE delivery path. The disposition transaction already enqueued the pending
-        // audit event (with operator/target/act/reason); the flush below is the same reliable
-        // pipeline the boot and periodic deliverers use — no second, undeduplicated write.
-        const flush = domain.flushAudits(({ actionId, actor, targetUid, suspended, reason, at }) =>
-          audit(req, 'leaderboard.admin.status', {
-            ok: true,
-            user: { id: String(actor || '') },
-            target: { id: String(targetUid || '') },
-            act: (suspended ? 'suspend' : 'restore'),
-            msg: String(reason || ''),
-            meta: { actionId, applied: true }
-          }));
-        // Immediate delivery attempt; when anything remains (log or outbox unwritable),
-        // the retry loop takes over so the audit is delayed, never lost (G06/G07).
-        flush.then(f => { if (f.remaining > 0 && deliverAudits) deliverAudits(); }).catch(() => {});
+        // H03/I07: ONE delivery path. The disposition transaction already enqueued the
+        // pending audit event; delivery goes through the same dedup-by-actionId pipeline
+        // the boot and periodic deliverers use — a pending event whose line is already on
+        // disk (the log write landed, the queue confirmation did not) is confirmed, never
+        // written twice. Whatever cannot land now stays pending with its retry loop.
+        if (deliverAudits) { try { deliverAudits(); } catch { /* the retry loop owns it */ } }
         return json(res, 200, out);
       } catch (e) {
         if (e instanceof LeaderboardError) return fail(res, e);

@@ -12,6 +12,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createSharedStore, StoreError } from '../community/store.js';
 
 const dir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'community-store-'));
@@ -308,4 +309,114 @@ test('N05: a contender that lands during the takeover is captured, restored and 
   // With the contender gone the stale lock really is stale: a retry takes it over cleanly.
   const s2 = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   assert.equal(s2.warmup().ok, true);
+});
+
+/* I01, the three-writer reproduction from the round-7 review: A pauses inside the commit
+ * critical section (marker published and verified, before the final rename) → B recovers the
+ * silent lease and pauses in exactly the same place → A resumes and FAILS: its abort cleanup
+ * must not delete B's marker → C recovers B's silence and commits. The old code's
+ * unconditional `unlink(commitMarker)` in the failure catch deleted B's marker, C's takeover
+ * then never learned of B's private commit file, and B's resumed rename overwrote C's
+ * acknowledged commit. Each writer is a real child process with its own "hostname" (the
+ * cross-container recovery path) and a controllable clock file — the takeover windows move by
+ * writing the clock, not by sleeping 16 s each. */
+test('I01: a resumed old writer never deletes the current committer’s marker — three takeovers keep the acknowledged commit', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'community-store-i01-'));
+  const file = path.join(root, 'data.json');
+  const clockFile = path.join(root, 'clock');
+  const base = Date.now();
+  fs.writeFileSync(clockFile, String(base));
+  const childCode = `
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+os.hostname = () => 'i01-writer-' + process.env.ROLE;
+const clock = () => { try { return Number(fs.readFileSync(process.env.CLOCK, 'utf8')) } catch { return Date.now() } };
+const { createSharedStore } = await import(process.env.STORE_URL);
+const role = process.env.ROLE, file = process.env.FILE, root = process.env.ROOT;
+const realRename = fs.renameSync;
+let blocked = false;
+fs.renameSync = function (from, to) {
+  if ((role === 'A' || role === 'B') && !blocked && to === file && String(from).includes('.commit.')) {
+    let mine = false;
+    try { mine = !!JSON.parse(fs.readFileSync(from, 'utf8')).members[role] } catch { /* not the draft */ }
+    if (mine) {
+      blocked = true;
+      fs.writeFileSync(path.join(root, 'entered-' + role), '1');
+      const sleeper = new Int32Array(new SharedArrayBuffer(4));
+      const deadline = Date.now() + 60000;
+      while (!fs.existsSync(path.join(root, 'release-' + role)) && Date.now() < deadline) Atomics.wait(sleeper, 0, 0, 20);
+    }
+  }
+  return realRename(from, to);
+};
+const store = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: { seed: 1 } }), now: clock });
+try {
+  const r = await store.txn(d => { d.members[role] = 1 });
+  console.log(JSON.stringify({ ok: true, revision: r.revision }));
+} catch (e) {
+  console.log(JSON.stringify({ ok: false, code: e.code || 'unexpected' }));
+}
+`;
+  const children = [];
+  const spawnWriter = role => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', childCode], {
+      env: {
+        ...process.env, ROLE: role, FILE: file, ROOT: root, CLOCK: clockFile,
+        STORE_URL: pathToFileURL(path.join(import.meta.dirname, '../community/store.js')).href
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let out = '';
+    child.stdout.on('data', d => { out += d; });
+    children.push(child);
+    const answer = new Promise((resolve, reject) => {
+      child.on('exit', () => {
+        const line = out.trim().split('\n').pop();
+        try { resolve(JSON.parse(line)); } catch { reject(new Error(`${role} produced no result: ${out}`)); }
+      });
+      child.on('error', reject);
+    });
+    return answer;
+  };
+  const waitFor = async (what, p) => {
+    for (let i = 0; i < 750 && !fs.existsSync(p); i++) await new Promise(r => setTimeout(r, 20));
+    if (!fs.existsSync(p)) throw new Error('timed out waiting for ' + what);
+  };
+  const advanceClock = ms => fs.writeFileSync(clockFile, String(base + ms));
+  try {
+    // A: pauses between marker verify and the final rename, holding its marker.
+    const a = spawnWriter('A');
+    await waitFor('A to reach its rename', path.join(root, 'entered-A'));
+    assert.ok(fs.existsSync(file + '.committing'), 'A holds a commit marker');
+
+    // B (17 s of clock silence later): recovers A's lease, clears A's marker AND private
+    // file, then pauses in the same spot inside its own commit.
+    advanceClock(17000);
+    const b = spawnWriter('B');
+    await waitFor('B to reach its rename', path.join(root, 'entered-B'));
+    assert.ok(fs.existsSync(file + '.committing'), 'B holds a commit marker');
+
+    // A resumes and fails: its private file is gone, its abort must leave B's marker alone.
+    fs.writeFileSync(path.join(root, 'release-A'), '1');
+    assert.deepEqual(await a, { ok: false, code: 'write-failed' });
+    assert.ok(fs.existsSync(file + '.committing'), 'I01: A\'s cleanup kept B\'s marker — the current committer stays protected');
+
+    // C (another 17 s): recovers B's silence — B's marker names B's private file, so the
+    // takeover removes both — and commits. The acknowledged answer must survive B resuming.
+    advanceClock(34000);
+    const c = spawnWriter('C');
+    assert.deepEqual(await c, { ok: true, revision: 1 });
+
+    fs.writeFileSync(path.join(root, 'release-B'), '1');
+    assert.deepEqual(await b, { ok: false, code: 'write-failed' });
+
+    const final = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.deepEqual(final.members, { seed: 1, C: 1 }, 'C\'s acknowledged commit survives every resumed old writer');
+    assert.equal(final.revision, 1);
+  } finally {
+    for (const child of children) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
+    await new Promise(r => setTimeout(r, 50));
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

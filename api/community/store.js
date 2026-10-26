@@ -87,6 +87,69 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     } catch { /* unparseable marker: the takeover's own checks decide */ }
     try { fs.unlinkSync(commitMarker); } catch { /* already gone */ }
   }
+
+  /** I01: publish the commit marker ATOMICALLY. The full body — token, lease owner, and the
+   *  private commit file's name — is written to a private temp file and then linked into
+   * place: the shared name appears fully formed or not at all. The old open('wx')+write left
+   * a window where a takeover read a partial (empty) marker, could not learn which private
+   * file to remove, deleted the marker anyway, and the paused committer's rename then landed
+   * over the writer that had taken over. link() is the exclusive atomic create. */
+  function publishMarker(tmpData) {
+    const mtmp = commitMarker + '.new.' + crypto.randomBytes(6).toString('hex');
+    let fd = null;
+    try {
+      fd = fs.openSync(mtmp, 'wx');
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, host: myHost, token: myToken, at: now(), tmp: tmpData }));
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = null;
+      try { fs.linkSync(mtmp, commitMarker); }
+      catch (e) {
+        try { fs.unlinkSync(mtmp); } catch { /* never linked */ }
+        if (e.code === 'EEXIST') throw new StoreError('second-writer', `${file}: another commit is in progress`);
+        throw new StoreError('write-failed', e.message);
+      }
+      try { fs.unlinkSync(mtmp); } catch { /* the link already owns the inode */ }
+    } catch (e) {
+      if (fd != null) try { fs.closeSync(fd); } catch { /* not open */ }
+      try { fs.unlinkSync(mtmp); } catch { /* never created */ }
+      if (e instanceof StoreError) throw e;
+      throw new StoreError('write-failed', e.message);
+    }
+  }
+
+  /** I01: remove the shared commit marker only while it still names THIS exact commit. A
+   *  writer paused mid-commit that comes back after a takeover must never delete the marker
+   *  of the writer that now owns the critical section — that is how a third writer's takeover
+   *  missed the current committer's private file and the resumed writer renamed over an
+   *  acknowledged commit. Capture-verify-discard, exactly like the lock takeover: the marker
+   *  is atomically MOVED to a private tombstone, and only a tombstone that still records this
+   *  commit's token and temp name is discarded. Anything else is linked back into place —
+   *  link is exclusive, so a marker that meanwhile reappeared is never clobbered. */
+  function removeOwnMarker(tmpData) {
+    const tomb = commitMarker + '.old.' + crypto.randomBytes(6).toString('hex');
+    try { fs.renameSync(commitMarker, tomb); }
+    catch (e) {
+      if (e.code === 'ENOENT') return; // no marker: nothing of ours to remove
+      throw new StoreError('write-failed', e.message);
+    }
+    const captured = readAt(tomb);
+    if (captured && captured.token === myToken && captured.tmp === tmpData) {
+      try { fs.unlinkSync(tomb); } catch { /* already gone */ }
+      return;
+    }
+    // Not ours — a takeover recovered this commit and another writer is mid-commit. Put the
+    // captured marker back, but only while the shared name is still free (EEXIST: a newer
+    // marker owns it; the captured one's writer re-verifies its own marker and deposes
+    // safely). The commit this pass aborted for has nothing left on disk either way: its
+    // private file was already cleaned up by its own path.
+    try {
+      fs.linkSync(tomb, commitMarker);
+      try { fs.unlinkSync(tomb); } catch { /* the link owns the inode now */ }
+    } catch {
+      try { fs.unlinkSync(tomb); } catch { /* already gone */ }
+    }
+  }
   // The lease is rewritten ATOMICALLY (temp + rename), never by truncating the lock in place:
   // a truncating write leaves a moment where the lock reads empty and a peer would take the
   // file for ownerless (F02). Deposition (F01): a holder whose lease was taken over while it
@@ -256,25 +319,25 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     } catch { /* nothing more we can do honestly */ }
   }
 
-  /* The commit protocol (G01): a lease check and the actual write are two steps, and a
-   * process paused between them used to come back and overwrite the writer that had properly
-   * taken over. Now the injectable writer only ever produces a PRIVATE temp file; the real
-   * file is reached through a commit marker that a takeover must honour:
-   *   writer(tmp) — no shared state touched, however long this takes
-   *   create <file>.committing (wx)      — only one committer at a time, anywhere
-   *   verify the lease still ours        — a recovered-over writer deposes here, writes nothing
-   *   rename(tmp → file)                 — the atomic commit
-   *   remove marker, refresh lease
-   * A takeover sees a fresh marker and refuses (the "dead" writer is mid-commit); a marker
-   * silent past the stale window is crash debris and is removed. */
-  /* The commit protocol (G01/H01): the injectable writer only produces a PRIVATE, already
-   * durable temp file whose name is RECORDED IN THE MARKER; the shared file is reached
-   * through <file>.committing. The takeover path that recovers a dead lease removes exactly
-   * the recorded private file, so a process paused inside the critical section finds its
-   * rename source gone and can never overwrite the writer that properly took over — the
-   * final rename re-verifies the marker token first and tolerates the source being gone.
-   * The commit rename is followed by a directory fsync (H06), keeping durable.js's
-   * data-fsync/rename/dir-fsync contract end to end. */
+  /* The commit protocol (G01/H01/I01). A lease check and the actual write are two steps, and
+   * a process paused between them must never come back and overwrite the writer that properly
+   * took over — nor may its cleanup break the NEXT writer's protection:
+   *   writer(tmp)                         — a PRIVATE temp file, no shared state touched
+   *   publish <file>.committing (link)    — atomic + exclusive; records token AND tmp's name
+   *   verify the marker still names us    — a recovered-over writer deposes here, writes nothing
+   *   rename(tmp → file) + dir fsync      — the atomic commit (H06 keeps durable.js's contract)
+   *   removeOwnMarker(tmp)                — ONLY while the marker still names THIS commit
+   *   refresh lease
+   * The exclusivity proof is the RESOURCE the rename consumes: every takeover that could
+   * commit its own data first clears the marker it finds (which names the paused writer's
+   * private file, and removes it), so a resumed committer's rename fails ENOENT instead of
+   * landing. That guarantee holds only while NOBODY deletes a marker without handling its
+   * recorded file — which is exactly what the old unconditional cleanup did (I01): a resumed
+   * writer's abort deleted the CURRENT writer's marker, the next takeover then never learned
+   * of that writer's private file, and the writer resumed straight over an acknowledged
+   * commit. Marker creation is atomic (no partial reads) and removal is ownership-checked
+   * (capture-verify-discard); a takeover sees a fresh marker and refuses, and a marker silent
+   * past the stale window is crash debris it clears — with the private file it names. */
   function persist(draft) {
     if (!locked || deposed) throw new StoreError('lost-lock', `${file}: not the lease owner`);
     const tmpData = `${file}.commit.${crypto.randomBytes(6).toString('hex')}`;
@@ -284,19 +347,10 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
       cleanupTemp(tmpData);
       throw new StoreError('write-failed', e.message);
     }
-    let markerFd = null;
-    try {
-      markerFd = fs.openSync(commitMarker, 'wx');
-      fs.writeSync(markerFd, JSON.stringify({ pid: process.pid, host: myHost, token: myToken, at: now(), tmp: tmpData }));
-      fs.closeSync(markerFd);
-      markerFd = null;
-    } catch (e) {
-      try { fs.closeSync(markerFd); } catch { /* not open */ }
-      markerFd = null;
-      cleanupTemp(tmpData);
-      if (e.code === 'EEXIST') throw new StoreError('second-writer', `${file}: another commit is in progress`);
-      throw new StoreError('write-failed', e.message);
-    }
+    // I01: the marker appears ATOMICALLY and fully formed (publishMarker) — a takeover
+    // can never read a half-written marker, miss the private commit file's name, and leave
+    // a paused committer's rename free to land over the next writer's commit.
+    publishMarker(tmpData);
     try {
       // Re-verify the MARKER (not just the lease): it is what the takeover clears.
       const marker = readAt(commitMarker);
@@ -312,11 +366,17 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
       syncDir(path.dirname(file)); // H06: the project's durable contract ends with a dir fsync
     } catch (e) {
       cleanupTemp(tmpData);
-      try { fs.unlinkSync(commitMarker); } catch { /* keep recovery honest */ }
+      // I01: the abort may remove ONLY this commit's own marker — a takeover may already
+      // have replaced it with the next writer's, and deleting that one is how a resumed
+      // writer's cleanup set up a later writer to overwrite an acknowledged commit.
+      try { removeOwnMarker(tmpData); } catch { /* the marker stays; a takeover recovers it */ }
       if (e instanceof StoreError) throw e;
       throw new StoreError('write-failed', e.message);
     }
-    try { fs.unlinkSync(commitMarker); } catch { /* a crash here leaves recoverable debris */ }
+    // I01: same ownership rule on the success path — between this commit's rename and this
+    // cleanup a full takeover cycle may have happened, and the marker on disk may already
+    // be a newer writer's.
+    try { removeOwnMarker(tmpData); } catch { /* recoverable debris; a takeover clears it */ }
     refreshLease(); // a long commit must not look abandoned, and a lost lease surfaces now
   }
 

@@ -26,7 +26,7 @@ function domainFixture(startAt = bj(2026, 10, 22, 10)) {
   let clock = startAt;
   const lb = createLeaderboard({ store, now: () => clock });
   const setClock = t => { clock = t; };
-  return { lb, store, setClock, clock: () => clock };
+  return { lb, store, file, setClock, clock: () => clock };
 }
 
 const reportBody = (over = {}) => ({
@@ -280,6 +280,22 @@ function routeFixture({ publicRead = true } = {}) {
       return null;
     },
     audit: (req, event, data) => audited.push([event, data]),
+    // I07: the same dedup-by-actionId pipeline server.js wires — the route's immediate
+    // flush runs through it, so an event whose line is already captured is confirmed, not
+    // written twice.
+    deliverAudits: () => {
+      const seen = new Set(audited.filter(([, d]) => d?.meta?.actionId).map(([, d]) => d.meta.actionId));
+      const pending = domain.unauditedActions();
+      const done = [];
+      for (const a of pending) {
+        if (seen.has(a.actionId)) { done.push(a.actionId); continue; }
+        audited.push(['leaderboard.admin.status', { meta: { actionId: a.actionId, applied: true } }]);
+        seen.add(a.actionId);
+        done.push(a.actionId);
+      }
+      if (done.length) domain.markAudited(done).catch(() => {});
+      return done.length === pending.length;
+    },
     publicRead
   });
   const call = async (route, { body, user, url } = {}) => {
@@ -329,7 +345,12 @@ test('routes: auth, guest gating, error shape, rate limit, audit', async () => {
   const admin = { ...users.alice, admin: true };
   assert.equal((await call('PUT /api/admin/leaderboard/member-status', { body: { targetUid: 'alice', suspended: false, actionId: 'z2' }, user: admin })).status, 200);
   await new Promise(r => setTimeout(r, 5)) // the flush runs async after the answer
-  assert.ok(audited.some(([e]) => e === 'leaderboard.admin.status'), 'exactly one delivered audit: ' + JSON.stringify(audited));
+  // The delivered audit is exactly one event with the applied semantics — counted, not
+  // merely "some" (the round-7 hardening: a duplicate write must fail this).
+  const statusEvents = audited.filter(([e]) => e === 'leaderboard.admin.status');
+  assert.equal(statusEvents.length, 1, 'exactly one delivered audit event: ' + JSON.stringify(audited));
+  assert.equal(statusEvents[0][1].meta.applied, true);
+  assert.equal(statusEvents[0][1].meta.actionId, 'z2');
 
   // Like rate limit: 30 per minute per account, then 429 with Retry-After.
   assert.equal((await call('PUT /api/leaderboard/consent', { body: { enabled: true, disclosureVersion: DISCLOSURE_VERSION, baseConsentVersion: 0 }, user: users.bob })).status, 200);
@@ -477,4 +498,93 @@ test('adminMembers: identity and status per joined member, nothing else', async 
   assert.deepEqual(Object.keys(u2).sort(), ['displayName', 'emoji', 'enabled', 'publicMemberId', 'suspended', 'suspendedReason', 'uid']);
   assert.equal(u2.suspended, true);
   assert.equal(u2.suspendedReason, 'check');
+});
+
+/* ------------------- round-7: the audit queue's lifecycle (I03/I04) ------------------- */
+
+test('I03: legacy adminActions[].audited=false migrate into the pending queue — idempotently, and deliver', async () => {
+  const { lb, store } = domainFixture();
+  await join(lb, 'u1');
+  // A file from the pre-pendingAudits build: the accepted-but-undelivered event sits in the
+  // reviewed history with audited:false, and there is no pendingAudits at all.
+  await store.txn(d => {
+    d.adminActions = [{ actionId: 'legacy-1', at: 1, actor: 'admin', targetUid: 'u1', suspended: true, reason: 'old build', audited: false }];
+    delete d.pendingAudits;
+  });
+  // The deliverer of that build only read the queue — it saw nothing. The migration moves
+  // the event in, never duplicating one that is already queued.
+  await store.txn(d => { d.pendingAudits = [{ actionId: 'legacy-2', at: 2, actor: 'admin', targetUid: 'u1', suspended: false, reason: '', audited: false }]; });
+  assert.equal(await lb.migrateLegacyAudits(), 1); // only legacy-1: legacy-2 was already queued
+  let pending = lb.unauditedActions().map(a => a.actionId);
+  assert.deepEqual(pending.sort(), ['legacy-1', 'legacy-2']);
+  // The history keeps the action but never again claims it undelivered.
+  const hist = store.peek().adminActions;
+  assert.equal(hist.find(a => a.actionId === 'legacy-1').audited, true);
+  // Re-entrant: a rerun (every boot) is a no-op, and new reviewed history never re-imports.
+  assert.equal(await lb.migrateLegacyAudits(), false);
+  assert.equal(lb.unauditedActions().length, 2);
+  // Delivery drains the queue — including the migrated event — exactly once each.
+  const written = [];
+  const r = await lb.flushAudits(a => { written.push(a.actionId); return true; });
+  assert.deepEqual(r, { delivered: 2, remaining: 0 });
+  assert.deepEqual(written.sort(), ['legacy-1', 'legacy-2']);
+  assert.equal(lb.unauditedActions().length, 0);
+});
+
+test('I03: an interrupted migration simply had not happened — the next boot picks it up', async () => {
+  const { lb, store, file } = domainFixture();
+  await join(lb, 'u1');
+  await store.txn(d => {
+    d.adminActions = [
+      { actionId: 'k1', at: 1, actor: 'admin', targetUid: 'u1', suspended: true, reason: 'r', audited: false },
+      { actionId: 'k2', at: 2, actor: 'admin', targetUid: 'u1', suspended: false, reason: '', audited: true }
+    ];
+    delete d.pendingAudits;
+  });
+  store.release();
+  // The "restart": a fresh store and domain over the same file — only k1 migrates (k2 was
+  // reviewed history, never pending), and nothing duplicates.
+  const store2 = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {}, likes: {}, adminActions: [] }) });
+  const lb2 = createLeaderboard({ store: store2 });
+  try {
+    assert.equal(await lb2.migrateLegacyAudits(), 1);
+    assert.deepEqual(lb2.unauditedActions().map(a => a.actionId), ['k1']);
+    assert.equal(await lb2.migrateLegacyAudits(), false); // the stamp is persisted
+  } finally { store2.release(); }
+});
+
+test('I04: a pending action that fell out of the capped history is still idempotent', async () => {
+  const { lb, store } = domainFixture();
+  await join(lb, 'u1');
+  // 502 accepted-but-undelivered dispositions in one transaction (the state 502 real
+  // adminStatus calls would leave): the reviewed history keeps the newest 500, so
+  // pending-0 and pending-1 live ONLY in the pending queue. The audit log is deliberately
+  // unwritable for the whole stretch.
+  await store.txn(d => {
+    const events = Array.from({ length: 502 }, (_, i) => ({
+      actionId: 'pending-' + i, at: 1000 + i, actor: 'admin', targetUid: 'u1',
+      suspended: i % 2 === 0, reason: 'backlog', audited: false
+    }));
+    d.pendingAudits = events;
+    d.adminActions = events.slice(-500).map(({ audited, ...rest }) => ({ ...rest, audited: true }));
+    d.members.u1.suspended = false; // pending-501 (odd index) was the last applied
+  });
+  // Replaying the very first action — gone from history, still pending — must not re-apply
+  // it and must not enqueue a second copy of its event.
+  const replay = await lb.adminStatus({ actorUid: 'admin', targetUid: 'u1', suspended: true, reason: 'original', actionId: 'pending-0' });
+  assert.deepEqual(replay, { ok: true, applied: false, at: 1000 });
+  assert.equal(store.peek().members.u1.suspended, false, 'the member state does not move on a replay');
+  assert.equal(lb.unauditedActions().filter(a => a.actionId === 'pending-0').length, 1, 'exactly one pending copy');
+});
+
+test('the reviewed history keeps ONE entry per action across delivery (round-7 duplicate-history fix)', async () => {
+  const { lb, store } = domainFixture();
+  await join(lb, 'u1');
+  await lb.adminStatus({ actorUid: 'admin', targetUid: 'u1', suspended: true, reason: 'once', actionId: 'one-1' });
+  assert.equal(store.peek().adminActions.filter(a => a.actionId === 'one-1').length, 1); // enqueued at apply time
+  await lb.flushAudits(() => true);
+  await new Promise(r => setTimeout(r, 5)); // the markAudited transaction settles
+  assert.equal(store.peek().adminActions.filter(a => a.actionId === 'one-1').length, 1, 'delivery confirms, it does not append a second copy');
+  assert.equal(store.peek().adminActions.find(a => a.actionId === 'one-1').audited, true);
+  assert.equal(lb.unauditedActions().length, 0);
 });

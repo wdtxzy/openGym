@@ -1020,8 +1020,10 @@ if (AUDIT_ON) {
 /* G06: disposition facts and their audit events are committed together in the shared file
  * (audited:false); this deliverer is the separate, retryable step that replays them into
  * audit.log. Replay is deduped by actionId — a crash between the audit append and the
- * audited flag re-checks the log instead of double-writing. Failures leave the event
- * pending in the shared file; the interval keeps trying. */
+ * audited flag re-checks the log instead of double-writing (I07: the same dedup serves the
+ * admin route's immediate flush, the boot pass and the periodic retry — one pipeline, so a
+ * pending event whose line is already on disk is only CONFIRMED, never re-written).
+ * Failures leave the event pending in the shared file; the interval keeps trying. */
 const AUDIT_DELIVER_INTERVAL_MS = 5000;
 let auditDeliverTimer = null;
 function deliverLeaderboardAudits() {
@@ -1043,10 +1045,16 @@ function deliverLeaderboardAudits() {
       meta: { actionId: a.actionId, applied: true }
     });
     if (!written) break; // still unwritable: the outbox/backoff owns it now
+    seen.add(a.actionId);
     done.push(a.actionId);
   }
   if (done.length) {
-    leaderboardDomain.markAudited(done).catch(e => console.error('leaderboard audit confirm failed:', e.message));
+    leaderboardDomain.markAudited(done).catch(e => {
+      // I07: the confirmation itself is retried — the events stay pending and the dedup
+      // above turns the next pass into confirm-only until the disk answers again.
+      console.error('leaderboard audit confirm failed:', e.message);
+      scheduleAuditDelivery();
+    });
     console.log('delivered', done.length, 'pending leaderboard audit event(s)');
   }
   return done.length === pending.length;
@@ -1059,9 +1067,16 @@ function scheduleAuditDelivery() {
   auditDeliverTimer.unref?.();
 }
 
-// Boot delivery (G06/G07): anything stranded by a previous life flushes now; whatever cannot
-// be written keeps its retry loop alive instead of waiting for the next admin action.
-if (LEADERBOARD && !deliverLeaderboardAudits()) scheduleAuditDelivery();
+// Boot delivery (G06/G07/I03): legacy-format undelivered events migrate into the pending
+// queue FIRST — only then can the delivery pass see them instead of concluding the queue is
+// empty. Whatever cannot be written keeps its retry loop alive instead of waiting for the
+// next admin action; a failed migration logs loudly and still arms the retry loop.
+if (LEADERBOARD) {
+  leaderboardDomain.migrateLegacyAudits()
+    .then(moved => { if (moved) console.log('migrated', moved, 'legacy undelivered audit event(s) into the pending queue'); })
+    .then(() => { if (!deliverLeaderboardAudits()) scheduleAuditDelivery(); })
+    .catch(e => { console.error('leaderboard audit migration failed:', e.message); scheduleAuditDelivery(); });
+}
 
 // A graceful stop hands the shared-file lock back, so a recreated container starts clean
 // instead of waiting out the stale-heartbeat window (T04). A crash (SIGKILL, power) skips

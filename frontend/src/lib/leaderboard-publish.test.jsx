@@ -68,7 +68,7 @@ describe('the coordinator factory', () => {
     h.merged()
     await vi.advanceTimersByTimeAsync(3000)
     expect(h.client.publishReport).toHaveBeenCalledTimes(1)
-    expect(h.client.publishReport.mock.calls[0][0].workouts[0].id).toBe('changed-while-unmerged')
+    expect(h.client.publishReport.mock.calls[0][0].facts.workouts[0].id).toBe('changed-while-unmerged')
     h.p.stop()
   })
 
@@ -86,10 +86,10 @@ describe('the coordinator factory', () => {
     await expect(opts.pull()).resolves.toBe(false) // merge did not land healthy
     h.state.sync = { ...h.state.sync, status: 'ok' }
     await expect(opts.pull()).resolves.toBe(true)
-    expect(opts.stateOf()).toBe(h.state.S)
+    expect(opts.snapshotOf().facts).toBe(h.state.S)
     h.state.user = { id: 'b', name: 'B' }
     h.fire() // the session changes on notification, not on mutation
-    expect(opts.stateOf()).toBe(null)
+    expect(opts.snapshotOf()).toBe(null)
     h.p.stop()
   })
 
@@ -141,7 +141,7 @@ describe('the coordinator factory', () => {
     expect(h.p.publishStatus().pending).toBe(true)
     await vi.advanceTimersByTimeAsync(3000)
     expect(h.client.publishReport).toHaveBeenCalledTimes(1)
-    expect(h.client.publishReport.mock.calls[0][0].workouts[0].id).toBe('NEW')
+    expect(h.client.publishReport.mock.calls[0][0].facts.workouts[0].id).toBe('NEW')
     expect(h.p.publishStatus().pending).toBe(false)
     h.p.stop()
   })

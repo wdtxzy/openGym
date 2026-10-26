@@ -1,28 +1,30 @@
-import { randomUUID } from 'node:crypto'
+import { useStore } from '../store/useStore.js'
+import { fingerprintOf } from './leaderboard.js'
+import { fetchMe, leaveLeaderboard, publishReport } from './leaderboard-client.js'
+
 // The leaderboard's global publisher — a session machine, not a pile of module globals.
 //
 // One publisher instance (created once from App), one store subscription, and ONE session
-// object at a time: { key, generation, baselineSyncedAt, sessionSyncedAt, me, meAt,
-// lastAcceptedReportRev, lastPublished, withdrawal }. Every switch — sign-out, A→B, B→A, the
-// same uid onto another paired server — swaps the whole object (F04: a merge credential from
-// one session can never authorize the next), and every async step re-validates the captured
-// object before touching cache, marks or status (F07: an old me response cannot seed the new
-// session's cache; an old leave cannot clear the new session's mark).
+// object at a time. Every switch — sign-out, A→B, B→A, the same uid onto another paired
+// server — swaps the whole object (F04: a merge credential from one session can never
+// authorize the next), and every async step re-validates the captured object before touching
+// cache, marks or status (F07: an old me response cannot seed the new session's cache; an old
+// leave cannot clear the new session's mark).
 //
 // A publish requires (T01/F03): the CURRENT session has completed its own confirmed exchange
 // (lastSynced moved off this session's baseline — a value restored from storage proves
-// nothing), AND the report's facts correspond to the server's current baseline. When the
-// server's reportRev is ahead of what this session produced — another device published —
-// sending is only allowed AFTER a fresh personal merge lands and the report is rebuilt from
-// the merged state; the merge must itself move lastSynced (pullState swallows its own
-// failures, so "it was called" proves nothing).
+// nothing), AND the report's facts and their personal-state revision are captured in ONE
+// snapshot (I02). When the server's reportRev is ahead of what this session produced —
+// another device published — sending is only allowed AFTER a fresh personal merge lands and
+// the report is rebuilt from the merged snapshot; the merge must itself move lastSynced
+// (pullState swallows its own failures, so "it was called" proves nothing).
 //
 // Withdrawal marks (F05/F06) know every format this app ever wrote, and an old mark whose
 // instance cannot be proven blocks publishing and waits for the person to resolve it — it is
 // never silently dropped, never replayed against a server it cannot be proven to belong to.
-import { useStore } from '../store/useStore.js'
-import { fingerprintOf } from './leaderboard.js'
-import { fetchMe, leaveLeaderboard, publishReport } from './leaderboard-client.js'
+// Every withdrawal path — direct, automatic retry, ambiguous-resolution, already-out —
+// captures the exact marks it acts on and may clear only those, only while unchanged (I05);
+// the pending state is always re-derived from the marks that remain.
 
 const DEBOUNCE_MS = 2500
 const ME_TTL_MS = 30000
@@ -66,16 +68,30 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
 
   /* ---------- withdrawal state, resolved per session ---------- */
 
-  const readMark = key => { try { return storage.getItem(key) !== null } catch { return false } }
-  const readIntent = key => {
-    try {
-      const raw = storage.getItem(key)
-      if (raw == null) return null
-      try { const p = JSON.parse(raw); return p && p.i ? p.i : 'legacy' } catch { return 'legacy' }
-    } catch { return null }
-  }
   const clearMark = key => { try { storage.removeItem(key) } catch { /* private mode */ } }
   const setMark = (key, intentId) => { try { storage.setItem(key, JSON.stringify({ v: 3, i: intentId })) } catch { /* private mode */ } }
+
+  /** A withdrawal intent id — browser crypto when present (everywhere this app ships), a
+   *  timestamp+random fallback for the odd WebView without it. No Node import: this module
+   *  is part of the browser bundle (the round-7 build warning). */
+  const newIntentId = () => {
+    try { if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID() } catch { /* unavailable */ }
+    return String(clock()) + '-' + Math.random().toString(36).slice(2)
+  }
+
+  /* I05 — the one rule every withdrawal path shares: a response may clear only the exact
+   * marks it was sent against, captured (key + stored value) BEFORE the request, and only
+   * while the stored value is still byte-for-byte the same one. A newer intent that
+   * replaced a mark while the request was in flight survives; the pending state is always
+   * re-derived from the marks that remain, never asserted from this one answer. */
+  const rawMark = key => { try { return storage.getItem(key) } catch { return null } }
+  const captureMarks = sess => {
+    const hist = historicalKeys(sess)
+    return [...hist.here, ...hist.ambiguous].map(key => ({ key, raw: rawMark(key) })).filter(c => c.raw !== null)
+  }
+  const acknowledgeMarks = captured => {
+    for (const { key, raw } of captured) if (rawMark(key) === raw) clearMark(key)
+  }
 
   /* ---------- withdrawal marks, resolved per session (G04) ----------
    * Historical keys are captured as WHOLE strings and classified by exact prefix, never by
@@ -122,31 +138,31 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   }
 
   /** Withdraw with the offline guarantee. The v3 mark (this instance) is persisted first and
-   *  blocks publishing immediately; the answer clears only what belongs to the captured
-   *  session (N09/F07). */
+   *  blocks publishing immediately; the answer clears only the mark it was sent against,
+   * only while that mark is still this exact intent (I05) — a newer intent made while the
+   * request was in flight keeps its mark and keeps the withdrawal pending. */
   async function requestLeave(me) {
     const sess = session
     if (!sess) return { ok: false, error: new Error('not signed in') }
-    // H05: every leave intent gets a unique id; the response clears the key ONLY while it
-    // still stores this exact intent — a late success cannot erase a newer intent that the
-    // same account made on the same server after this request was already in flight.
-    const intentId = (randomUUID ? randomUUID() : String(clock()) + '-' + Math.random().toString(36).slice(2))
-    setMark(KEY_V3(sess.instance, sess.uid), intentId)
-    sess.withdrawIntent = intentId
+    const key = KEY_V3(sess.instance, sess.uid)
+    const intentId = newIntentId()
+    setMark(key, intentId)
+    const captured = [{ key, raw: rawMark(key) }].filter(c => c.raw !== null)
     sess.withdrawMarked = true
     status.withdrawPending = true
     status.withdrawAmbiguous = false
     emit()
     try {
       await client.leaveLeaderboard(me)
-      // H05: clear only while the stored intent is still THIS one.
-      if (readIntent(KEY_V3(sess.instance, sess.uid)) === intentId) clearMark(KEY_V3(sess.instance, sess.uid))
+      acknowledgeMarks(captured)
       sess.withdrawMarked = false
       if (session === sess) {
-        status.withdrawPending = withdrawalState(sess).pending
-        status.withdrawAmbiguous = withdrawalState(sess).ambiguous
+        const wd = withdrawalState(sess)
+        status.withdrawPending = wd.pending
+        status.withdrawAmbiguous = wd.ambiguous
         sess.me = null
-        if (!status.withdrawPending) ok()
+        if (!wd.pending) ok()
+        else emit()
       }
       return { ok: true }
     } catch (e) {
@@ -156,15 +172,15 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   }
 
   /** Resolve an ambiguous historical mark (G04/G05): 'here' — the person confirms the intent
-   *  belongs to THIS server, so leave and clear every captured key; 'discard' — the person
-   *  says the intent belongs elsewhere, so drop exactly the captured keys. Either way the
-   *  same records that were recognized are the ones removed. */
+   *  belongs to THIS server, so leave and clear the captured marks; 'discard' — the person
+   *  says the intent belongs elsewhere, so drop them. Either way the marks that were
+   *  recognized are the ones acted on, and only while unchanged (I05). */
   async function resolveAmbiguousWithdraw(action, me) {
     const sess = session
     if (!sess) return { ok: false }
-    const hist = historicalKeys(sess)
+    const captured = captureMarks(sess) // every mark this resolution may act on
     if (action === 'discard') {
-      for (const key of hist.ambiguous) clearMark(key)
+      acknowledgeMarks(captured)
       if (session === sess) {
         const wd = withdrawalState(sess)
         status.withdrawAmbiguous = wd.ambiguous
@@ -175,14 +191,17 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     }
     try {
       await client.leaveLeaderboard(me || sess.me)
-      for (const key of [...hist.ambiguous, ...hist.here]) clearMark(key)
+      // The leave landed for the captured marks' account and instance — they are resolved
+      // wherever they are still the marks this resolution captured (I05).
+      acknowledgeMarks(captured)
       sess.withdrawMarked = false
       if (session === sess) {
         const wd = withdrawalState(sess)
         status.withdrawAmbiguous = wd.ambiguous
         status.withdrawPending = wd.pending
         sess.me = null
-        ok()
+        if (!wd.pending) ok()
+        else emit()
       }
       return { ok: true }
     } catch (e) {
@@ -220,29 +239,37 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       status.withdrawAmbiguous = wd.ambiguous
       if (wd.pending) {
         if (wd.ambiguous) { emit(); return } // F06: unprovable — the person resolves it
+        // I05: the marks this automatic retry may act on are captured BEFORE the me fetch
+        // and the request — its late success can clear only these, only while unchanged.
+        const captured = captureMarks(sess)
         const m = await me(sess, true)
         if (!stillUs()) return
         if (!m?.enabled) {
-          // Already out server-side: every captured mark for this uid is resolved.
-          for (const key of [...historicalKeys(sess).here, ...historicalKeys(sess).ambiguous]) clearMark(key)
-          sess.withdrawMarked = false
-          const wd = withdrawalState(sess)
-          status.withdrawPending = wd.pending
-          status.withdrawAmbiguous = wd.ambiguous
+          // Already out server-side: the captured marks' goal is the server's state, not
+          // this request — they are resolved wherever they are still the captured ones.
+          acknowledgeMarks(captured)
+          const wd2 = withdrawalState(sess)
+          status.withdrawPending = wd2.pending
+          status.withdrawAmbiguous = wd2.ambiguous
+          if (!wd2.pending) sess.withdrawMarked = false
           emit()
           return
         }
         try {
           await client.leaveLeaderboard(m)
           if (!stillUs()) return
-          for (const key of [...historicalKeys(sess).here, ...historicalKeys(sess).ambiguous]) clearMark(key)
-          sess.withdrawMarked = false
-          const wd = withdrawalState(sess)
-          status.withdrawPending = wd.pending
-          status.withdrawAmbiguous = wd.ambiguous
+          acknowledgeMarks(captured)
+          const wd2 = withdrawalState(sess)
+          status.withdrawPending = wd2.pending
+          status.withdrawAmbiguous = wd2.ambiguous
           sess.me = null
-          ok()
-        } catch (e) { fail(e) }
+          if (!wd2.pending) { sess.withdrawMarked = false; ok() } else emit()
+        } catch (e) {
+          // I06: the inner catch checks the session too — a withdrawal started under A that
+          // fails after the switch must not paint B's error state (the outer catch's H09
+          // rule, applied to this branch's own await as well).
+          if (stillUs()) fail(e)
+        }
         return
       }
 
@@ -292,7 +319,8 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
           return // retry on the next change; never send facts older than the baseline
         }
         sess.lastSeenReportRev = m.reportRev
-        sess.validatedPersonalRev = get().sync?.rev ?? sess.validatedPersonalRev
+        // I02: no second version field is recorded here — the send below captures facts and
+        // rev in one snapshot, so the pairing can never come from a different moment.
         if (!m?.enabled || m.suspended) { setPending(false); return }
         if (m.disclosureVersion !== m.currentDisclosureVersion) { setPending(false); return }
         if (fingerprintOf(get().S) === sess.lastPublished) { setPending(false); return }
@@ -302,27 +330,40 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       if (!m.reportRev) sess.lastPublished = ''
       if (fingerprint === sess.lastPublished) { setPending(false); return }
 
-      const sentFacts = get().S // captured at send: the fallback when the client cannot name the accepted fingerprint
-      const r = await client.publishReport(sentFacts, m, {
-        validatedPersonalRev: sess.validatedPersonalRev,
+      /* I02: the facts and the personal-state revision they were confirmed at, captured in
+       * ONE read. The report's pairing can never name a rev from a different moment than its
+       * facts — not the session's memory of an older sync, and not the newest me label. A
+       * 409 recovery re-captures the whole snapshot after the merge (passed to the client
+       * below); a response-time re-sync cannot pollute what was accepted either, because
+       * the success path records the fingerprint and rev the answer names. */
+      const snapshotOf = () => {
+        if (!(active && session === sess)) return null
+        const st = get()
+        return { facts: st.S, rev: Number.isFinite(st.sync?.rev) ? st.sync.rev : null }
+      }
+      const snapshot = snapshotOf()
+      if (!snapshot) return
+      const r = await client.publishReport(snapshot, m, {
         // N03: the pull wrapper answers whether the merge actually landed healthy.
         pull: async () => {
           try { await get().pullState() } catch { return false }
           const st = get()
           return session === sess && st.sync?.status === 'ok'
         },
-        // N04: the retry's facts come from the store only while it is still this session.
-        stateOf: () => (session === sess ? get().S : null)
+        // I02: the retry's facts and rev come from the store together, only while it is
+        // still this session (N04: an account switch answers null and the publish stays
+        // pending — it is never rebuilt from a stranger's store).
+        snapshotOf
       })
       if (!stillUs() || !healthy()) return // the answer belongs to a previous session
       if (r.ok) {
-        // G02: record the fingerprint of the facts the server ACTUALLY accepted (the 409
-        // recovery may have sent the merged retry, not the caller's snapshot) — the response
-        // carries it, so no guessing from the response-time store.
-        sess.lastPublished = r.acceptedFingerprint ?? fingerprintOf(sentFacts)
+        // G02/I02: record the fingerprint of the facts the server ACTUALLY accepted — the
+        // 409 recovery may have sent the re-captured snapshot, not the caller's. The answer
+        // names it; the fallback is what THIS pass sent (the snapshot), never a response-time
+        // re-read of the store — a change landing mid-flight must not count as published.
+        sess.lastPublished = r.acceptedFingerprint ?? fingerprintOf(snapshot.facts)
         sess.lastAcceptedReportRev = r.reportRev ?? m.reportRev
         sess.lastSeenReportRev = sess.lastAcceptedReportRev
-        if (get().sync?.rev != null) sess.validatedPersonalRev = get().sync.rev
         if (sess.me) sess.me = { ...sess.me, reportRev: sess.lastSeenReportRev } // the cache must not look stale next round
         ok()
       } else if (r.reason === 'disabled') {
@@ -368,7 +409,6 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         meAt: 0,
         lastAcceptedReportRev: null,
         lastSeenReportRev: null,
-        validatedPersonalRev: null,
         withdrawMarked: false,
         lastPublished: ''
       }
