@@ -127,24 +127,35 @@ test('an unknown schemaVersion is refused the same way', () => {
   assert.equal(fs.readFileSync(file, 'utf8'), JSON.stringify({ schemaVersion: 99, revision: 5, members: {} }));
 });
 
-test('a foreign live PID in the lock is refused; a dead one is taken over', async () => {
+test('O01/B01=A: a lock is refused at runtime whatever it says — live pid, dead pid, foreign host — and recovery is the documented deployment act', async () => {
   const file = path.join(dir(), 'shared.json');
-  // A real second process, so PID liveness is not faked: it outlives the refusal check.
+  // A real second process, so pid liveness is not faked: it outlives the refusal check.
   const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
   await new Promise(r => child.on('spawn', r));
-  fs.writeFileSync(file + '.lock', JSON.stringify({ pid: child.pid, host: os.hostname(), token: 'live-foreign' }));
+  const fixture = { pid: child.pid, host: os.hostname(), token: 't'.repeat(32), at: Date.now() };
+  fs.writeFileSync(file + '.lock', JSON.stringify(fixture));
   const first = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   assert.equal(first.warmup().code, 'second-writer');
-  // The refusal left the live owner's lock exactly as it was — never trampled.
-  assert.deepEqual(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')), { pid: child.pid, host: os.hostname(), token: 'live-foreign' });
+  // The refusal left the owner's lock byte-for-byte as it was — nothing captured, nothing moved.
+  assert.deepEqual(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')), fixture);
+  assert.equal(fs.readdirSync(dir()).filter(n => n.includes('.lock.take.')).length, 0, 'O01: no capture attempt — no tombstone was ever created');
 
+  // The holder dies. Even a PROVABLY dead pid is not taken over at runtime any more: the
+  // judge-to-capture gap is where a live owner could be moved away (the round-13 race), so
+  // the runtime answer is refusal for every residual lock, whatever it names.
   child.kill('SIGKILL');
   await new Promise(r => child.on('exit', r));
-  const second = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  assert.equal(second.warmup().ok, true, 'a stale lock from a crash does not wedge the feature');
+  const residual = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  assert.equal(residual.warmup().code, 'second-writer', 'a dead holder\u2019s residual lock still refuses at runtime');
+  assert.equal(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')).pid, child.pid, 'the residual lock is untouched');
+  // The documented recovery: every writer is confirmed stopped (the pid is gone — proven
+  // above), then the residual lock is removed, then the single writer starts.
+  fs.unlinkSync(file + '.lock');
+  const recovered = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
+  assert.equal(recovered.warmup().ok, true, 'after the documented recovery the writer claims cleanly');
   assert.equal(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')).pid, process.pid);
+  recovered.release();
 });
-
 test('a lock from another host (a sibling container on one volume) is honoured as live', async () => {
   const file = path.join(dir(), 'shared.json');
   // Two containers on one volume are both pid 1: a bare pid cannot tell them apart (N05) —
@@ -167,7 +178,7 @@ test('N01/B01=A: a foreign lease is refused however long it has been silent — 
   const w = s.warmup();
   assert.equal(w.ok, false);
   assert.equal(w.code, 'second-writer');
-  assert.ok(/foreign/.test(w.detail), 'the refusal names the verdict: ' + w.detail);
+  assert.ok(/writer exists/.test(w.detail), 'the refusal names the holder: ' + w.detail);
   // The refusal left the residual lock byte-for-byte where it was (S01/S03).
   assert.deepEqual(JSON.parse(fs.readFileSync(file + '.lock', 'utf8')), fixture);
 });test('release() hands the lock back, so a recreated instance starts clean', async () => {
@@ -301,51 +312,13 @@ test('a restart continues the revision from what is on disk', async () => {
     const d = view.edit(); d.members.a = 1; });
   await first.txn(view => {
     const d = view.edit(); d.members.b = 2; });
+  first.release(); // a restart releases first — the graceful path needs no recovery flow
   const second = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
   const { revision } = await second.txn(view => {
     const d = view.edit(); d.members.c = 3; });
   assert.equal(revision, 3);
 });
 
-test('N05: a contender that lands during the takeover is captured, restored and refused — never deleted', async () => {
-  const file = path.join(dir(), 'shared.json');
-  const lock = file + '.lock';
-  // A genuinely dead stale lock, and a genuinely live second process.
-  fs.writeFileSync(lock, JSON.stringify({ pid: 99999999, host: os.hostname(), token: 'dead-token' }));
-  const owner = spawn(process.execPath, ['-e', 'setInterval(()=>{},10000)'], { stdio: 'ignore' });
-  await new Promise(r => owner.on('spawn', r));
-  const live = JSON.stringify({ pid: owner.pid, host: os.hostname(), token: 'live-contender' });
-  // The worst window: the contender replaces the lock in the instant our takeover reaches for
-  // it. Hooking rename is the only place that can happen now — unlink no longer touches it.
-  const rename = fs.renameSync;
-  let injected = false;
-  fs.renameSync = function (from, to) {
-    if (from === lock && !injected) { injected = true; fs.writeFileSync(lock, live); }
-    return rename(from, to);
-  };
-  try {
-    const s = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-    assert.equal(s.warmup().code, 'second-writer');
-    assert.equal(JSON.parse(fs.readFileSync(lock, 'utf8')).token, 'live-contender', 'the live owner keeps the lock');
-  } finally {
-    fs.renameSync = rename;
-    owner.kill('SIGKILL');
-    await new Promise(r => owner.on('exit', r));
-  }
-  // With the contender gone the stale lock really is stale: a retry takes it over cleanly.
-  const s2 = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
-  assert.equal(s2.warmup().ok, true);
-});
-
-/* I01, the three-writer reproduction from the round-7 review: A pauses inside the commit
- * critical section (marker published and verified, before the final rename) → B recovers the
- * silent lease and pauses in exactly the same place → A resumes and FAILS: its abort cleanup
- * must not delete B's marker → C recovers B's silence and commits. The old code's
- * unconditional `unlink(commitMarker)` in the failure catch deleted B's marker, C's takeover
- * then never learned of B's private commit file, and B's resumed rename overwrote C's
- * acknowledged commit. Each writer is a real child process with its own "hostname" (the
- * cross-container recovery path) and a controllable clock file — the takeover windows move by
- * writing the clock, not by sleeping 16 s each. */
 test('the view (round-7 NO_WRITE cost): a no-op plans without a clone; the first mutation clones once', async () => {
   const s = makeStore();
   await s.txn(view => { const d = view.edit(); d.members.a = 1; });
@@ -587,7 +560,9 @@ test('M01: a deposed holder\u2019s heartbeat never rewrites the lease that repla
     await new Promise(r => setTimeout(r, 2300));
     const after = JSON.parse(fs.readFileSync(file + '.lock', 'utf8'));
     assert.equal(after.token, foreign.token, 'the foreign lease is untouched — no resurrection by heartbeat');
-    // The control: a live holder's own lease survives its beats (still its token).
+    // The control: after the DOCUMENTED recovery (the foreign holder is a corpse — pid
+    // proven dead — so the operator removes the residual lock), the next writer claims.
+    fs.unlinkSync(file + '.lock');
     const s2 = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: {} }) });
     try {
       assert.equal(s2.warmup().ok, true);
@@ -607,19 +582,14 @@ test('M01: a deposed holder\u2019s heartbeat never rewrites the lease that repla
  * there, leaving lease + marker + private commit file behind with a pid that answers
  * nothing. That is the only state a takeover may proceed over. */
 
-/* I01's invariant, restated for the conservative policy: a takeover isolates exactly the
- * dead writer's marker and private file — both temp layers — and never touches anything
- * the dead writer managed to acknowledge before it died. Three generations, each taking
- * over the corpse of the last. */
-
-/* The conservative takeover world (B01=A, N01): a lease changes hands only over a holder
- * that is PROVABLY stopped. The child writers below run WITHOUT a hostname mock — they all
- * share the real host, so the judge is the pid-liveness proof. A writer's scenario has two
- * transactions: WRITE (completes, acknowledged) and — when a pause key is set — PAUSE,
- * whose commit the writer stops inside its own final rename; the parent SIGKILLs it there,
- * leaving lease + marker + private commit file behind with a pid that answers nothing.
- * That corpse is the only state a takeover may proceed over. */
-function corpseScenario(w, { writeKey, pauseKey, role, intercept }) {
+/* The conservative world (B01=A, O01): a residual lock is NEVER taken over at runtime. The
+ * child writers below run WITHOUT a hostname mock — they share the real host. A writer's
+ * scenario has two transactions: WRITE (completes, acknowledged) and — when a pause key is
+ * set — PAUSE, whose commit the writer stops inside its own final rename; the parent
+ * SIGKILLs it there, leaving lease + marker + private commit file behind with a pid that
+ * answers nothing. That residual lock refuses every later writer until the documented
+ * recovery (confirm stopped, remove the lock) hands the file over. */
+function corpseScenario(w, { writeKey, pauseKey, role, intercept, recovery }) {
   return `
 import fs from 'node:fs';
 import path from 'node:path';
@@ -628,6 +598,7 @@ const file = process.env.FILE, root = process.env.ROOT;
 ${intercept || ''}
 const store = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: { seed: 1 } }) });
 console.log('WARMUP ' + JSON.stringify(store.warmup()));
+${recovery ? `{ const sleeper = new Int32Array(new SharedArrayBuffer(4)); const deadline = Date.now() + 60000; while (!fs.existsSync(path.join(root, 'release-recovery')) && Date.now() < deadline) Atomics.wait(sleeper, 0, 0, 20); let lockSeen = 'absent'; try { lockSeen = fs.readFileSync(file + '.lock', 'utf8') } catch (e) { lockSeen = 'absent:' + e.code } const w2 = store.warmup(); console.log('WARMUP2 ' + JSON.stringify({ ...w2, lockSeen: lockSeen.slice(0, 120) })); }` : ''}
 const txn = async key => {
   try { const r = await store.txn(v => { v.edit().members[key] = 1 }); console.log('TXN ' + JSON.stringify({ ok: true, revision: r.revision })) }
   catch (e) { console.log('TXN ' + JSON.stringify({ ok: false, code: e.code || 'unexpected' })) }
@@ -650,15 +621,18 @@ fs.renameSync = function (from, to) {
     }
   }
   return rename(from, to);
-};`;
+};
+`;
 
-/* I01's invariant, restated for the conservative policy: a takeover isolates exactly the
- * dead writer's marker and private commit file — both temp layers — and never touches
- * anything the dead writer acknowledged before it died. Three generations, each taking
- * over the corpse of the last. */
-test('N01/B01=A: each takeover over a provably-stopped holder isolates exactly that dead writer\u2019s files; acknowledged commits survive every generation', async () => {
+/* I01's invariant, restated for the FINAL conservative policy (O01): a residual lock from a
+ * confirmed-stopped writer is refused at runtime — recovery is the deployment act (confirm
+ * every writer stopped, remove the lock). The recovery hands the file to the next writer,
+ * whose clean claim isolates exactly the dead writer's marker and private commit file, and
+ * nothing the dead writer acknowledged is ever lost. */
+test('O01/B01=A: a residual lock refuses at runtime; after the documented recovery the next writer isolates exactly the dead writer\u2019s debris, and acknowledged commits survive', async () => {
   const w = writerWorld('community-store-i01-');
   const markerFiles = () => fs.readdirSync(w.root).filter(n => n.startsWith('data.json.committing.'));
+  const noCapture = () => fs.readdirSync(w.root).filter(n => n.includes('.lock.take.')).length === 0;
   try {
     // Generation 1: w1 is acknowledged (revision 1); then the writer pauses inside its p1
     // commit — marker published, private file armed — and is killed there.
@@ -669,83 +643,49 @@ test('N01/B01=A: each takeover over a provably-stopped holder isolates exactly t
     assert.equal(markerFiles().length, 1, 'W1 holds a commit marker (per-writer name)');
     const token1 = JSON.parse(fs.readFileSync(w.file + '.lock', 'utf8')).token;
     g1.kill();
-    await g1.exited; // the pid is reaped: provably stopped — the takeover precondition
+    await g1.exited; // provably stopped: the deployment precondition
     assert.equal(markerFiles().length, 1, 'the corpse keeps its marker and its private file');
-    // Generation 2 takes the corpse's lease over: the isolation removes exactly W1's
-    // marker and private file — W1 can never resume to fire its armed rename.
-    const g2 = w.spawnWriter(corpseScenario(w, { writeKey: 'p2', pauseKey: 'p2', role: 'W2', intercept: renamePauseIntercept('p2') }), 'W2');
-    assert.equal((await g2.warmup()).ok, true);
-    assert.equal(markerFiles().length, 0, 'the takeover isolated W1\u2019s marker and private file before any business write');
+    // The next writer REFUSES the residual lock at runtime — no capture, no tombstone.
+    const g2 = w.spawnWriter(corpseScenario(w, { writeKey: 'w2', pauseKey: '', role: 'W2', intercept: renamePauseIntercept(''), recovery: true }), 'W2');
+    const refuse2 = await g2.warmup();
+    assert.equal(refuse2.ok, false);
+    assert.equal(refuse2.code, 'second-writer');
+    assert.equal(noCapture(), true, 'O01: the refusal never moved the public lock');
+    assert.equal(JSON.parse(fs.readFileSync(w.file + '.lock', 'utf8')).token, token1, 'the residual lease is untouched');
+    // The documented recovery: every writer is confirmed stopped (g1 is reaped — proven
+    // above), remove the lock. The same writer's second attempt claims cleanly and
+    // isolates exactly the dead writer\u2019s debris.
+    fs.unlinkSync(w.file + '.lock');
+    fs.writeFileSync(path.join(w.root, 'release-recovery'), '1');
+    const claimed = await g2.waitForLine('WARMUP2');
+    assert.equal(claimed.ok, true, 'after the documented recovery W2 claims');
+    assert.equal(markerFiles().length, 0, 'the clean claim isolated W1\u2019s marker and private file');
     const token2 = JSON.parse(fs.readFileSync(w.file + '.lock', 'utf8')).token;
-    assert.notEqual(token2, token1, 'the lease changed hands over the dead holder');
-    const stop2 = g2.done.catch(() => {});
-    await w.waitFor('W2 to reach its p2 rename', path.join(w.root, 'entered-W2'));
-    assert.equal(markerFiles().length, 1, 'now W2 is mid-commit with its own marker');
-    g2.kill();
-    await g2.exited;
-    // Generation 3: takes over W2's corpse, isolates it, and commits — W1's acknowledged
-    // w1 survives both takeovers, and no dead writer's uncommitted draft ever lands.
-    const g3 = w.spawnWriter(corpseScenario(w, { writeKey: 'w3', pauseKey: '', role: 'W3', intercept: renamePauseIntercept('') }), 'W3');
-    assert.equal((await g3.warmup()).ok, true);
-    assert.deepEqual(await g3.done, { ok: true, revision: 2 });
+    assert.notEqual(token2, token1, 'the lease changed hands through the documented recovery');
+    // W2 commits: W1\u2019s acknowledged w1 survives; W1\u2019s uncommitted draft never lands.
+    assert.deepEqual(await g2.done, { ok: true, revision: 2 });
     const final = JSON.parse(fs.readFileSync(w.file, 'utf8'));
-    assert.deepEqual(final.members, { seed: 1, w1: 1, w3: 1 }, 'acked data survived; no dead writer\u2019s uncommitted draft did');
-    assert.equal(markerFiles().length, 0, 'no marker debris after the last isolation');
-    await stop2;
+    assert.deepEqual(final.members, { seed: 1, w1: 1, w2: 1 }, 'acked data survived; no dead writer\u2019s uncommitted draft did');
+    assert.equal(markerFiles().length, 0, 'no marker debris after the recovery');
   } finally { await w.teardown(); }
 });
 
-/* K01's invariant, restated: a second writer that arrives while the first is mid-commit is
- * REFUSED — and the refusal clears nothing. Whatever path delivers it (the early guard's
- * marker-over-live-lease check or the takeover judge), the paused writer's marker, private
- * file and lease must all be exactly where it left them, so its resumed rename lands and
- * its acknowledged commit survives. (S01: a refusal never changes the business file or the
- * owner's identity.) */
-test('N01/B01=A: a second writer over a LIVE same-host holder is refused, clears nothing, and the paused writer completes', async () => {
-  const w = writerWorld('community-store-k01-');
-  try {
-    const holder = w.spawnWriter(corpseScenario(w, { writeKey: 'w1', pauseKey: 'p1', role: 'holder', intercept: renamePauseIntercept('p1') }), 'holder');
-    assert.equal((await holder.warmup()).ok, true);
-    const token = JSON.parse(fs.readFileSync(w.file + '.lock', 'utf8')).token;
-    const stop = holder.done.catch(() => {});
-    fs.writeFileSync(path.join(w.root, 'go'), '1');
-    await w.waitFor('holder to reach its rename', path.join(w.root, 'entered-holder'));
-    const marker = fs.readdirSync(w.root).find(n => n.startsWith('data.json.committing.'));
-    assert.ok(marker, 'the holder is mid-commit with a published marker');
-    // A second writer on the same host: the holder's pid answers signal 0 — no proof of
-    // death, no takeover. The refusal is total and touches nothing.
-    const contender = w.spawnWriter(corpseScenario(w, { writeKey: 'c2', pauseKey: '', role: 'contender', intercept: renamePauseIntercept('') }), 'contender');
-    const cw = await contender.warmup();
-    assert.equal(cw.ok, false);
-    assert.equal(cw.code, 'second-writer');
-    assert.deepEqual(await contender.done, { ok: false, code: 'second-writer' }, 'the transaction refuses too');
-    // Nothing was cleared: the marker, the private file and the holder's lease are intact.
-    assert.equal(fs.existsSync(path.join(w.root, marker)), true, 'the stale-listing guard cleared no marker');
-    assert.equal(JSON.parse(fs.readFileSync(w.file + '.lock', 'utf8')).token, token, 'the live holder\u2019s lease is untouched');
-    // The holder resumes and completes: its paused commit lands behind the acknowledged one.
-    fs.writeFileSync(path.join(w.root, 'release-holder'), '1');
-    assert.deepEqual(await holder.done, { ok: true, revision: 2 });
-    const final = JSON.parse(fs.readFileSync(w.file, 'utf8'));
-    assert.deepEqual(final.members, { seed: 1, w1: 1, p1: 1 });
-    await stop;
-  } finally { await w.teardown(); }
-});
-
-/* K02's invariant, restated: the takeover's isolation is load-bearing even over a corpse —
- * a fencing unlink that fails with anything but ENOENT refuses the whole acquisition (the
- * lease is given back, the dead writer's evidence stays on disk untouched), and a healed
- * retry then isolates cleanly and commits. */
-test('N01/B01=A: a fencing unlink EIO over a dead holder refuses the acquisition, keeps the evidence, and a healed retry recovers', async () => {
+/* K02's invariant, restated: the isolation is load-bearing on EVERY clean claim — a fencing
+ * unlink that fails with anything but ENOENT refuses the acquisition (the lease is given
+ * back, the dead writer's evidence stays on disk untouched), and a healed retry then
+ * isolates cleanly and commits. The residual lock itself refuses first (O01); recovery is
+ * the documented flow. */
+test('O01/B01=A: a residual lock refuses; after the documented recovery a fencing unlink EIO still refuses the acquisition, keeps the evidence, and a healed retry recovers', async () => {
   const w = writerWorld('community-store-k02-');
-  // W1 pauses inside its x1 commit and is killed: marker + private file remain, pid dead.
   const g1 = w.spawnWriter(corpseScenario(w, { writeKey: 'x1', pauseKey: 'x1', role: 'W1', intercept: renamePauseIntercept('x1') }), 'W1');
   assert.equal((await g1.warmup()).ok, true);
   await w.waitFor('W1 to reach its x1 rename', path.join(w.root, 'entered-W1'));
   const marker = fs.readdirSync(w.root).find(n => n.startsWith('data.json.committing.'));
   g1.kill();
   await g1.exited;
-  // W2's every unlink of a private commit file fails with EIO: the isolation cannot prove
-  // its deletions, so the acquisition is refused — twice (warmup and transaction).
+  const g0 = w.spawnWriter(corpseScenario(w, { writeKey: 'y0', pauseKey: '', role: 'W0', intercept: renamePauseIntercept('') }), 'W0');
+  assert.equal((await g0.warmup()).code, 'second-writer');
+  fs.unlinkSync(w.file + '.lock'); // the documented recovery; the debris stays for isolation
   const eioCode = `
 const unlink = fs.unlinkSync;
 fs.unlinkSync = function (p, ...args) {
@@ -758,25 +698,23 @@ fs.unlinkSync = function (p, ...args) {
   assert.equal(cw.code, 'lock');
   assert.ok(/cannot isolate/.test(cw.detail), 'the refusal names the file it could not isolate: ' + cw.detail);
   assert.deepEqual(await g2.done, { ok: false, code: 'lock' }, 'the transaction refuses too');
-  // The refused acquisition kept the dead writer's evidence and the path clean for a retry.
   assert.equal(fs.existsSync(path.join(w.root, marker)), true, 'the marker is kept for diagnosis');
-  assert.equal(fs.existsSync(path.join(w.root, marker + '.tmp')) || true, true);
   assert.equal(fs.readdirSync(w.root).filter(n => n.includes('.commit.')).length >= 1, true, 'the private commit file is kept too');
   assert.equal(fs.existsSync(w.file + '.lock'), false, 'the refused writer gave its own lease back');
-  // W3, with working deletes: the takeover isolates W1's remains and commits.
   const g3 = w.spawnWriter(corpseScenario(w, { writeKey: 'w3', pauseKey: '', role: 'W3', intercept: renamePauseIntercept('') }), 'W3');
   assert.equal((await g3.warmup()).ok, true);
   assert.deepEqual(await g3.done, { ok: true, revision: 1 });
-  assert.equal(fs.readdirSync(w.root).filter(n => n.startsWith('data.json.committing.')).length, 0, 'the healed takeover isolated the debris');
+  assert.equal(fs.readdirSync(w.root).filter(n => n.startsWith('data.json.committing.')).length, 0, 'the healed claim isolated the debris');
   const final = JSON.parse(fs.readFileSync(w.file, 'utf8'));
   assert.deepEqual(final.members, { seed: 1, w3: 1 });
 });
 
-/* L01's invariant, restated: the isolation READ is load-bearing over a corpse too — a
- * canonical marker that cannot be read or verified refuses the takeover (the marker and
- * the private file it names stay for diagnosis); once the read works again, the same
- * takeover proceeds and cleans exactly what it could finally verify. */
-test('N01/B01=A: an unreadable canonical marker over a dead holder refuses the acquisition; a healed retry isolates and commits', async () => {
+/* L01's invariant, restated: the isolation READ is load-bearing on every clean claim — a
+ * canonical marker that cannot be read or verified refuses the acquisition (the marker and
+ * the private file it names stay for diagnosis); once the read works again, the same claim
+ * proceeds and cleans exactly what it could finally verify. The residual lock itself
+ * refuses first (O01); recovery is the documented flow. */
+test('O01/B01=A: a residual lock refuses; after the documented recovery an unreadable canonical marker still refuses the acquisition; a healed retry isolates and commits', async () => {
   const w = writerWorld('community-store-l01-');
   const g1 = w.spawnWriter(corpseScenario(w, { writeKey: 'x1', pauseKey: 'x1', role: 'W1', intercept: renamePauseIntercept('x1') }), 'W1');
   assert.equal((await g1.warmup()).ok, true);
@@ -785,6 +723,9 @@ test('N01/B01=A: an unreadable canonical marker over a dead holder refuses the a
   const commitFile = fs.readdirSync(w.root).find(n => n.includes('.commit.') && !n.startsWith('data.json.committing.'));
   g1.kill();
   await g1.exited;
+  const g0 = w.spawnWriter(corpseScenario(w, { writeKey: 'y0', pauseKey: '', role: 'W0', intercept: renamePauseIntercept('') }), 'W0');
+  assert.equal((await g0.warmup()).code, 'second-writer', 'the residual lock refuses at runtime');
+  fs.unlinkSync(w.file + '.lock'); // the documented recovery
   const eioCode = `
 const readFile = fs.readFileSync;
 fs.readFileSync = function (p, ...args) {
@@ -804,7 +745,7 @@ fs.readFileSync = function (p, ...args) {
   const g3 = w.spawnWriter(corpseScenario(w, { writeKey: 'w3', pauseKey: '', role: 'W3', intercept: renamePauseIntercept('') }), 'W3');
   assert.equal((await g3.warmup()).ok, true);
   assert.deepEqual(await g3.done, { ok: true, revision: 1 });
-  assert.equal(fs.existsSync(path.join(w.root, marker)), false, 'the healed takeover removed the marker');
+  assert.equal(fs.existsSync(path.join(w.root, marker)), false, 'the healed claim removed the marker');
   assert.equal(fs.existsSync(path.join(w.root, commitFile)), false, 'and the private file it named');
   const final = JSON.parse(fs.readFileSync(w.file, 'utf8'));
   assert.deepEqual(final.members, { seed: 1, w3: 1 });

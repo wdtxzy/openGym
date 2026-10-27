@@ -26,7 +26,8 @@ const pub = vi.hoisted(() => {
   return {
     state, subs,
     push: patch => { Object.assign(state, patch); for (const l of subs) l(state) },
-    retryNow: vi.fn(), requestLeave: vi.fn(), invalidateMe: vi.fn()
+    retryNow: vi.fn(), requestLeave: vi.fn(), invalidateMe: vi.fn(),
+    resolveAmbiguousWithdraw: vi.fn(), resolveWithdrawConflict: vi.fn()
   }
 })
 vi.mock('../lib/leaderboard-publish.js', () => ({
@@ -34,7 +35,9 @@ vi.mock('../lib/leaderboard-publish.js', () => ({
   onPublishStatus: l => { pub.subs.add(l); return () => pub.subs.delete(l) },
   retryNow: (...a) => pub.retryNow(...a),
   requestLeave: (...a) => pub.requestLeave(...a),
-  invalidateMe: (...a) => pub.invalidateMe(...a)
+  invalidateMe: (...a) => pub.invalidateMe(...a),
+  resolveAmbiguousWithdraw: (...a) => pub.resolveAmbiguousWithdraw(...a),
+  resolveWithdrawConflict: (...a) => pub.resolveWithdrawConflict(...a)
 }))
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
@@ -63,7 +66,7 @@ beforeEach(() => {
   mocks.S = { workouts: [], activities: [] }
   mocks.user = null
   mocks.config = { leaderboard: { public_read: false } }
-  Object.assign(pub.state, { pending: false, lastOkAt: null, lastError: null, withdrawPending: false })
+  Object.assign(pub.state, { pending: false, lastOkAt: null, lastError: null, withdrawPending: false, withdrawAmbiguous: false, withdrawConflict: false, withdrawSaved: false })
   pub.subs.clear()
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host)
 })
@@ -206,7 +209,25 @@ describe('Leaderboard view', () => {
     await act(async () => { button('Leave the leaderboard').click() })
     await settle()
     expect(pub.requestLeave).toHaveBeenCalledWith(ME_JOINED)
-    act(() => pub.push({ withdrawPending: true })) // the coordinator's persisted intent
+    act(() => pub.push({ withdrawPending: true, withdrawSaved: true })) // the coordinator's persisted intent
     expect(textOf()).toContain('when you are online')
+  })
+
+  it('B03: while a withdrawal is pending the join card stays closed, even when the page GET already says "out"', async () => {
+    mocks.user = { id: 'u1', name: 'Ana' }
+    fetchBoard.mockResolvedValue(BOARD)
+    // The view's own GET shows the member OUT — without the gate this page would offer the
+    // join form while the coordinator still holds the pending leave intent (O04).
+    fetchMe.mockResolvedValue({ ...ME_JOINED, enabled: false })
+    pub.state.withdrawPending = true
+    pub.state.withdrawSaved = true
+    await mount(); await settle()
+    expect(textOf()).not.toContain('Join the leaderboard')
+    expect(textOf()).toContain('still being confirmed')
+    expect(joinLeaderboard).not.toHaveBeenCalled()
+    // The coordinator's answer resolves the intent: the join card opens afterwards.
+    act(() => pub.push({ withdrawPending: false }))
+    await settle()
+    expect(textOf()).toContain('Join the leaderboard')
   })
 })

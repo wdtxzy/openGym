@@ -23,6 +23,7 @@ import { Button } from '../components/ui.jsx'
 import Icon from '../components/Icon.jsx'
 import { fetchBoard, fetchMe, joinLeaderboard, saveProfile, setCheer } from '../lib/leaderboard-client.js'
 import { invalidateMe, onPublishStatus, publishStatus, requestLeave, resolveAmbiguousWithdraw, resolveWithdrawConflict, retryNow } from '../lib/leaderboard-publish.js'
+import { publishStatus as livePublishStatus } from '../lib/leaderboard-publish.js'
 const toast = m => useUI.getState().toast(m)
 const WINDOWS = [['week', 'Week'], ['month', 'Month'], ['all', 'All']]
 const EMOJIS = ['💪', '🏋️', '🔥', '⚡', '🏃', '🚴', '🏅', '🧘']
@@ -87,6 +88,9 @@ export default function Leaderboard() {
   }
 
   async function join() {
+    // O04/B03: the command entry re-checks the effective intent — a pending withdrawal is
+    // retried, never overridden by a join that the page's own (possibly stale) GET invited.
+    if (livePublishStatus().withdrawPending) { toast(t('Finish the pending withdrawal first.')); return }
     setBusy(true)
     try {
       await joinLeaderboard(me || { consentVersion: 0, currentDisclosureVersion: 1 }, user.name)
@@ -179,8 +183,22 @@ export default function Leaderboard() {
         <Button size="sm" variant="ghost" disabled={busy} onClick={async () => { setBusy(true); await resolveWithdrawConflict(); setBusy(false) }}>{t('Keep the new join')}</Button>
       </div>
     </div>}
-    {user && me?.enabled && pub.withdrawPending && !pub.withdrawAmbiguous && !pub.withdrawConflict && <div className="card" role="status">
+    {user && pub.withdrawPending && !pub.withdrawAmbiguous && !pub.withdrawConflict && !pub.withdrawSaved && <div className="card" role="alert" style={{ borderColor: 'var(--danger, #c33)' }}>
+      {/* B04=A: the decision lives in memory only (storage refused the mark) — never promise
+          it survives a restart; keep the warning up and offer the retry until it is saved. */}
+      <h2 style={{ margin: 0 }}>{t('The leave request was not saved reliably')}</h2>
+      <div className="muted small" style={{ marginTop: 4 }}>
+        {t('Closing the app now may lose it. Until it is saved and the server confirms, nothing is published.')}
+      </div>
+      <div className="row" style={{ gap: 8, marginTop: 10 }}><Button size="sm" disabled={busy} onClick={retryNow}>{t('Retry')}</Button></div>
+    </div>}
+    {user && me?.enabled && pub.withdrawPending && !pub.withdrawAmbiguous && !pub.withdrawConflict && pub.withdrawSaved && <div className="card" role="status">
       <div className="small">{t('Saved. We will finish leaving the leaderboard when you are online.')}</div>
+    </div>}
+    {user && pub.withdrawPending && me && !me.enabled && !pub.withdrawConflict && <div className="card" role="status">
+      {/* B03=A: the withdrawal is being confirmed — only the retry exists; joining again
+          opens after the server confirms the exit, never beside a pending intent. */}
+      <div className="small">{t('Your leave request is still being confirmed. You can join again once it finishes.')}</div>
     </div>}
 
     {me?.suspended && <div className="card" style={{ borderColor: 'var(--danger, #c33)' }}>
@@ -189,7 +207,7 @@ export default function Leaderboard() {
       {me.suspendedReason ? <div className="small" style={{ marginTop: 6 }}>“{me.suspendedReason}”</div> : null}
     </div>}
 
-    {user && me && !me.enabled && !me.suspended && <div className="card">
+    {user && me && !me.enabled && !me.suspended && !pub.withdrawPending && <div className="card">
       <h2>{t('Join the leaderboard')}</h2>
       <div className="muted small" style={{ marginBottom: 8 }}>
         {t('Anyone who joins this instance sees your weekly, monthly and all-time training totals here. The administrator can also open the leaderboard to visitors — if they do, your results become visible to them too.')}

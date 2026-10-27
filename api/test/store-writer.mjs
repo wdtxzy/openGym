@@ -96,7 +96,7 @@ export function writerWorld(prefix) {
         if (wm) resolve(wm); else reject(bail('exited before printing WARMUP'));
       });
     });
-    return { done, warmup, waitForLine, kill: () => child.kill('SIGKILL'),
+    return { done, warmup, waitForLine, pid: child.pid, kill: () => child.kill('SIGKILL'), out: () => out + (err ? ' | stderr: ' + err : ''),
              /** Resolves when the process is REALLY gone ('close' reaps it) — the proof a
               *  same-host takeover needs before it may judge the holder dead. */
              exited: new Promise(resolve => child.on('close', resolve)) };

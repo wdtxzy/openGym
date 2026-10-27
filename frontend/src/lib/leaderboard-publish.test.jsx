@@ -730,3 +730,106 @@ describe('B02/P09 — an old leave intent meets a newer authorization: the perso
     h.p.stop()
   })
 })
+
+describe('O03 — the withdrawal conflict state belongs to the session', () => {
+  const HERE = 'lb-withdraw:https://alpha.example:a'
+
+  function conflictedSession() {
+    const h = harness()
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'old-intent', cv: 1 })
+    h.client.leaveLeaderboard.mockRejectedValue(new Error('leave offline'))
+    h.client.fetchMe.mockResolvedValue({ ...ME, consentVersion: 2 }) // a newer join elsewhere
+    h.p.start()
+    return h
+  }
+
+  it('a conflict on A does not follow the account to B', async () => {
+    const h = conflictedSession()
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.p.publishStatus().withdrawConflict).toBe(true)
+    // Switch to a different account on the same instance: B has no withdrawal at all.
+    h.state.user = { id: 'b' }
+    delete h.storage[HERE]
+    h.fire()
+    await vi.advanceTimersByTimeAsync(10)
+    const st = h.p.publishStatus()
+    expect(st.withdrawConflict).toBe(false) // O03: the flag died with A's session
+    expect(st.withdrawPending).toBe(false)
+    h.p.stop()
+  })
+
+  it('a late success from A does not clear B\u2019s own conflict', async () => {
+    const h = conflictedSession()
+    // A's own leave request is still in flight when the account switches to B.
+    let resolveA
+    h.client.leaveLeaderboard.mockImplementationOnce(() => new Promise(r => { resolveA = r }))
+    const leaving = h.p.requestLeave({ ...ME }) // A's direct leave, against consent v1... the fixture's newer join makes it conflict later
+    h.state.user = { id: 'b' }
+    delete h.storage[HERE]
+    h.storage['lb-withdraw:https://alpha.example:b'] = JSON.stringify({ v: 3, i: 'b-intent', cv: 1 })
+    h.fire()
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.p.publishStatus().withdrawConflict).toBe(true) // B's own conflict (cv1 intent, cv2 server)
+    resolveA({}) // A's leave finally succeeds
+    await leaving
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.p.publishStatus().withdrawConflict).toBe(true) // O03: A's answer never painted B
+    expect(h.p.publishStatus().withdrawPending).toBe(true) // B's intent still waits
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    h.p.stop()
+  })
+
+  it('signing out clears the projected conflict state', async () => {
+    const h = conflictedSession()
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.p.publishStatus().withdrawConflict).toBe(true)
+    h.state.user = null
+    h.fire()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.p.publishStatus().withdrawConflict).toBe(false)
+    h.p.stop()
+  })
+})
+
+describe('O02 — B04: a memory-only withdrawal is never promised as saved', () => {
+  const ME0 = { enabled: true, suspended: false, disclosureVersion: 1, currentDisclosureVersion: 1, consentVersion: 1, reportRev: 0 }
+
+  it('a storage failure flags the intent as not saved; the gate and the retry still hold', async () => {
+    const h = harness()
+    let full = false
+    const realSet = h.storage.setItem
+    h.storage.setItem = (k, v) => { if (full) throw new Error('quota'); realSet(k, v) }
+    h.client.fetchMe.mockResolvedValue({ ...ME0 })
+    h.client.leaveLeaderboard.mockRejectedValue(new Error('offline'))
+    h.p.start()
+    full = true
+    await h.p.requestLeave({ ...ME0 })
+    const st = h.p.publishStatus()
+    expect(st.withdrawPending).toBe(true)
+    expect(st.withdrawSaved).toBe(false) // B04: the UI must warn, never promise "Saved"
+    // The memory-only decision still blocks publishing (L02) — the risk is contained.
+    h.merged()
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    expect(h.p.publishStatus().withdrawSaved).toBe(false)
+    h.p.stop()
+  })
+
+  it('a persisted intent is flagged saved — the ordinary offline path keeps its promise', async () => {
+    const h = harness()
+    h.client.fetchMe.mockResolvedValue({ ...ME0 })
+    h.client.leaveLeaderboard.mockRejectedValue(new Error('offline'))
+    h.p.start()
+    await h.p.requestLeave({ ...ME0 })
+    const st = h.p.publishStatus()
+    expect(st.withdrawPending).toBe(true)
+    expect(st.withdrawSaved).toBe(true) // the mark is on disk: "saved, waiting for the network"
+    h.p.stop()
+  })
+})
