@@ -232,7 +232,9 @@ describe('the coordinator factory', () => {
     h.fire()
     resolveLeave({})
     await pending
-    expect('lb-withdraw:https://alpha.example:a' in h.storage).toBe(false)
+    // R04/R05: the outcome completes its OWN intent by id (an ack record) — the shared
+    // mark position is never deleted, so B's newer intent on the same key is untouched.
+    expect(JSON.parse(h.storage['lb-withdraw:https://alpha.example:a']).i).toBeTypeOf('string')
     expect(JSON.parse(h.storage['lb-withdraw:https://alpha.example:b']).i).toBe('b-intent') // untouched
     h.p.stop()
   })
@@ -274,7 +276,9 @@ describe('J04 — an offline withdrawal finishes after automatic recovery', () =
     await h.p.retryNow()
     await vi.advanceTimersByTimeAsync(1)
 
-    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw:'))).toHaveLength(0)
+    // The completion is recorded by intent id (an ack next to the mark); the mark itself
+    // stays — the pending state is what clears.
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw-ack:'))).toHaveLength(1)
     expect(h.p.publishStatus().withdrawPending).toBe(false)
     expect(h.p.publishStatus().lastError).toBe(null)
     expect(h.p.publishStatus().lastOkAt).not.toBe(null)
@@ -338,7 +342,7 @@ describe('K03 — replacing a failed intent and completing the new one leaves no
       await vi.advanceTimersByTimeAsync(1)
     }
     const key = 'lb-withdraw:https://alpha.example:a'
-    expect(key in h.storage).toBe(false)            // the persisted mark settled
+    expect(key in h.storage).toBe(true)             // the mark stays; completion is by intent id
     expect(h.p.publishStatus().withdrawPending).toBe(false) // and so did the in-memory intents
     expect(h.p.publishStatus().lastError).toBe(null)
     expect(h.p.publishStatus().lastOkAt).not.toBe(null)
@@ -350,7 +354,7 @@ describe('K03 — replacing a failed intent and completing the new one leaves no
     await h.p.requestLeave({ ...ME0 }) // C, fails
     await h.p.requestLeave({ ...ME0 }) // D replaces C, fails
     await h.p.requestLeave({ ...ME0 }) // E replaces D, succeeds
-    expect('lb-withdraw:https://alpha.example:a' in h.storage).toBe(false)
+    expect('lb-withdraw:https://alpha.example:a' in h.storage).toBe(true) // marks stay; completion is by id
     expect(h.p.publishStatus().withdrawPending).toBe(false)
   })
 })
@@ -443,7 +447,10 @@ describe('L02 — a memory-only intent (its storage write failed) survives an ol
     h.client.leaveLeaderboard.mockResolvedValue({})
     await h.p.requestLeave({ ...ME0, consentVersion: 4 })
     expect(h.p.publishStatus().withdrawPending).toBe(false)
-    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw:'))).toHaveLength(0)
+    // Only the healed decision ever wrote a mark; the replaced chain was completed by id
+    // (its acks) — nothing outstanding, nothing deleted behind another tab's back.
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw:'))).toHaveLength(1)
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw-ack:'))).toHaveLength(2)
   })
 })
 
@@ -483,15 +490,19 @@ describe('M02 — provenance-scoped withdrawal resolution', () => {
     h.p.start()
     await vi.advanceTimersByTimeAsync(10)
     await h.p.resolveAmbiguousWithdraw('discard')
-    // The person said the unproven intents are not ours: they go — and ONLY them.
-    expect(UNKNOWN in h.storage).toBe(false)
-    expect(JSON.parse(h.storage[HERE]).i).toBe('here-intent') // still this instance's decision
+    // The person said the unproven intents are not ours: they are completed by id (their
+    // acks) — and ONLY them; the provable mark stays this instance's decision.
+    expect(UNKNOWN in h.storage).toBe(true)
+    expect(JSON.parse(h.storage[HERE]).i).toBe('here-intent')
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw-ack:'))).toHaveLength(1) // the discarded unproven intent
     expect(h.p.publishStatus().withdrawPending).toBe(true)
     // With the unknown side decided, the automatic flow may finish the provable one.
     h.p.retryNow()
     await vi.advanceTimersByTimeAsync(10)
     expect(h.client.leaveLeaderboard).toHaveBeenCalledTimes(1)
-    expect(HERE in h.storage).toBe(false)
+    // The automatic completion is recorded by id (the ack) — the mark itself stays.
+    expect(HERE in h.storage).toBe(true)
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw-ack:'))).toHaveLength(2) // the discarded one + this one
     expect(h.p.publishStatus().withdrawPending).toBe(false)
     h.p.stop()
   })
@@ -506,8 +517,10 @@ describe('M02 — provenance-scoped withdrawal resolution', () => {
     await vi.advanceTimersByTimeAsync(10)
     await h.p.resolveAmbiguousWithdraw('leave')
     expect(h.client.leaveLeaderboard).toHaveBeenCalledTimes(1)
-    expect(UNKNOWN in h.storage).toBe(false)
-    expect(HERE in h.storage).toBe(false)
+    // The person attested everything captured belongs here: both intents completed by id.
+    expect(UNKNOWN in h.storage).toBe(true)
+    expect(HERE in h.storage).toBe(true)
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw-ack:'))).toHaveLength(2)
     expect(h.p.publishStatus().withdrawPending).toBe(false)
     h.p.stop()
   })
@@ -528,7 +541,7 @@ describe('M02 — provenance-scoped withdrawal resolution', () => {
     // The response speaks for the current instance only: the unproven mark is untouched
     // and still demands the person.
     expect(UNKNOWN in h.storage).toBe(true)
-    expect(HERE in h.storage).toBe(false)
+    expect(HERE in h.storage).toBe(true) // completed by id, not deleted
     expect(h.p.publishStatus().withdrawPending).toBe(true)
     expect(h.p.publishStatus().withdrawAmbiguous).toBe(true)
     expect(h.client.publishReport).not.toHaveBeenCalled()
@@ -695,7 +708,7 @@ describe('B02/P09 — an old leave intent meets a newer authorization: the perso
     const st = h.p.publishStatus()
     expect(st.withdrawPending).toBe(false)
     expect(st.withdrawConflict).toBe(false)
-    expect(HERE in h.storage).toBe(false)
+    expect(HERE in h.storage).toBe(true) // the mark stays; the replacement completed by id
     h.p.stop()
   })
 
@@ -710,7 +723,7 @@ describe('B02/P09 — an old leave intent meets a newer authorization: the perso
     const st = h.p.publishStatus()
     expect(st.withdrawPending).toBe(false)
     expect(st.withdrawConflict).toBe(false)
-    expect(HERE in h.storage).toBe(false)
+    expect(HERE in h.storage).toBe(true) // completed by id, not deleted
     h.p.stop()
   })
 
@@ -726,7 +739,7 @@ describe('B02/P09 — an old leave intent meets a newer authorization: the perso
     expect(st.withdrawPending).toBe(true) // the unproven mark still waits for the person (M02)
     expect(st.withdrawAmbiguous).toBe(true)
     expect(JSON.parse(h.storage[UNKNOWN]).i).toBe('older-intent')
-    expect(HERE in h.storage).toBe(false)
+    expect(HERE in h.storage).toBe(true) // completed by id, not deleted
     h.p.stop()
   })
 })
@@ -830,6 +843,109 @@ describe('O02 — B04: a memory-only withdrawal is never promised as saved', () 
     const st = h.p.publishStatus()
     expect(st.withdrawPending).toBe(true)
     expect(st.withdrawSaved).toBe(true) // the mark is on disk: "saved, waiting for the network"
+    h.p.stop()
+  })
+})
+
+describe('R01 — an unavailable member observation is never a confirmed exit', () => {
+  const HERE = 'lb-withdraw:https://alpha.example:a'
+
+  function featureOffFixture(meAnswer) {
+    const h = harness()
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'intent-1', cv: 1 })
+    h.client.leaveLeaderboard.mockRejectedValue(new Error('offline'))
+    h.client.fetchMe.mockResolvedValue(meAnswer)
+    h.p.start()
+    return h
+  }
+
+  it.each([
+    ['a feature-off 404 (null)', null],
+    ['a malformed answer (enabled missing)', { consentVersion: 1, reportRev: 1 }],
+    ['a non-object answer', 'x'],
+  ])('%s keeps the intent, keeps the gate, sends nothing', async (_name, meAnswer) => {
+    const h = featureOffFixture(meAnswer)
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.client.leaveLeaderboard).not.toHaveBeenCalled()
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    expect(JSON.parse(h.storage[HERE]).i).toBe('intent-1') // the intent survives
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+    h.p.stop()
+  })
+
+  it('when the feature returns, the ORIGINAL withdrawal completes first — no report, the hour stays withdrawn', async () => {
+    const h = featureOffFixture(null)
+    await vi.advanceTimersByTimeAsync(10)
+    // The feature comes back with the SAME authorization (cv1): the withdrawal finishes.
+    h.client.fetchMe.mockResolvedValue({ ...ME, consentVersion: 1 })
+    h.client.leaveLeaderboard.mockResolvedValue({})
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.client.leaveLeaderboard).toHaveBeenCalledTimes(1)
+    expect(h.client.publishReport).not.toHaveBeenCalled() // R01: no re-publication
+    expect(h.p.publishStatus().withdrawPending).toBe(false)
+    h.p.stop()
+  })
+
+  it('a valid enabled=false settles the captured intent; the gate opens with nothing sent', async () => {
+    const h = featureOffFixture({ ...ME, enabled: false, consentVersion: 2 })
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.client.leaveLeaderboard).not.toHaveBeenCalled() // already out: nothing to send
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    expect(h.p.publishStatus().withdrawPending).toBe(false)
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw-ack:'))).toHaveLength(1)
+    h.p.stop()
+  })
+})
+
+describe('R04/R05 — conflict resolution is bound to the intents it was shown for', () => {
+  const HERE = 'lb-withdraw:https://alpha.example:a'
+
+  it('a Keep from a stale conflict card completes the old intent and never the newer one', async () => {
+    const h = harness()
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'old-intent', cv: 1 })
+    h.client.leaveLeaderboard.mockRejectedValue(new Error('offline'))
+    h.client.fetchMe.mockResolvedValue({ ...ME, consentVersion: 2 }) // the newer join that raises the conflict
+    h.p.start()
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.p.publishStatus().withdrawConflict).toBe(true)
+    // Another tab replaces the SAME key with a NEWER withdrawal intent while the card is up.
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'new-intent', cv: 3 })
+    await h.p.resolveWithdrawConflict() // the old card's Keep
+    // The old intent is completed by id; the newer one is untouched and still blocks.
+    expect(JSON.parse(h.storage[HERE]).i).toBe('new-intent')
+    expect(h.p.publishStatus().withdrawConflict).toBe(false) // the displayed conflict is resolved
+    expect(h.p.publishStatus().withdrawPending).toBe(true) // the newer intent keeps the gate
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    const acks = Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw-ack:'))
+    expect(acks).toHaveLength(1)
+    expect(acks[0]).toContain('old-intent')
+    h.p.stop()
+  })
+
+  it('a restored (persisted-only) intent\u2019s conflict clears when the server confirms out (R05)', async () => {
+    const h = harness()
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'restored-intent', cv: 1 }) // no in-memory id: restored from storage
+    h.client.leaveLeaderboard.mockRejectedValue(new Error('offline'))
+    h.client.fetchMe.mockResolvedValue({ ...ME, consentVersion: 3 }) // a newer join raises the conflict
+    h.p.start()
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.p.publishStatus().withdrawConflict).toBe(true)
+    // Another device completed the exit: the server now shows out on a newer version.
+    h.client.fetchMe.mockResolvedValue({ ...ME, enabled: false, consentVersion: 4 })
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    const st = h.p.publishStatus()
+    expect(st.withdrawPending).toBe(false) // the restored intent completed
+    expect(st.withdrawConflict).toBe(false) // R05: its conflict ended with it
+    expect(h.client.publishReport).not.toHaveBeenCalled()
     h.p.stop()
   })
 })

@@ -102,6 +102,9 @@ export default function Leaderboard() {
   }
 
   async function reconfirm() {
+    // R03/B03: the disclosure re-confirm authorizes participation just like Join — the
+    // same real-time withdrawal gate applies at the command entry, not only in the render.
+    if (livePublishStatus().withdrawPending) { toast(t('Finish the pending withdrawal first.')); return }
     setBusy(true)
     try {
       await joinLeaderboard(me, user.name) // the same call: current disclosure + the member's seq
@@ -117,7 +120,9 @@ export default function Leaderboard() {
     setBusy(true)
     const r = await requestLeave(me)
     if (r.ok) await reload()
-    else toast(t('Saved. We will finish leaving the leaderboard when you are online.'))
+    // R02: the toast derives from the same saved fact as the persistent banner — a
+    // memory-only decision (storage refused the mark) is never announced as "Saved".
+    else toast(t(r.saved ? 'Saved. We will finish leaving the leaderboard when you are online.' : 'The leave request was not saved reliably'))
     setBusy(false)
   }
 
@@ -219,7 +224,7 @@ export default function Leaderboard() {
       <Button disabled={!agreed || busy} onClick={join}>{t('Join')}</Button>
     </div>}
 
-    {disclosureStale && <div className="card">
+    {disclosureStale && !pub.withdrawPending && <div className="card">
       <h2>{t('The leaderboard terms changed — confirm to stay listed')}</h2>
       <div className="muted small" style={{ marginBottom: 8 }}>
         {t('Anyone who joins this instance sees your weekly, monthly and all-time training totals here. The administrator can also open the leaderboard to visitors — if they do, your results become visible to them too.')}

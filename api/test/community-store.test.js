@@ -589,7 +589,7 @@ test('M01: a deposed holder\u2019s heartbeat never rewrites the lease that repla
  * SIGKILLs it there, leaving lease + marker + private commit file behind with a pid that
  * answers nothing. That residual lock refuses every later writer until the documented
  * recovery (confirm stopped, remove the lock) hands the file over. */
-function corpseScenario(w, { writeKey, pauseKey, role, intercept, recovery }) {
+function corpseScenario(w, { writeKey, pauseKey, role, intercept, recovery, probeOnly }) {
   return `
 import fs from 'node:fs';
 import path from 'node:path';
@@ -598,13 +598,13 @@ const file = process.env.FILE, root = process.env.ROOT;
 ${intercept || ''}
 const store = createSharedStore({ file, schemaVersion: 1, init: () => ({ members: { seed: 1 } }) });
 console.log('WARMUP ' + JSON.stringify(store.warmup()));
-${recovery ? `{ const sleeper = new Int32Array(new SharedArrayBuffer(4)); const deadline = Date.now() + 60000; while (!fs.existsSync(path.join(root, 'release-recovery')) && Date.now() < deadline) Atomics.wait(sleeper, 0, 0, 20); let lockSeen = 'absent'; try { lockSeen = fs.readFileSync(file + '.lock', 'utf8') } catch (e) { lockSeen = 'absent:' + e.code } const w2 = store.warmup(); console.log('WARMUP2 ' + JSON.stringify({ ...w2, lockSeen: lockSeen.slice(0, 120) })); }` : ''}
+${recovery ? `{ const sleeper = new Int32Array(new SharedArrayBuffer(4)); const deadline = Date.now() + 60000; while (!fs.existsSync(path.join(root, 'release-recovery')) && Date.now() < deadline) Atomics.wait(sleeper, 0, 0, 20); const w2 = store.warmup(); console.log('WARMUP2 ' + JSON.stringify(w2)); }` : ''}
 const txn = async key => {
   try { const r = await store.txn(v => { v.edit().members[key] = 1 }); console.log('TXN ' + JSON.stringify({ ok: true, revision: r.revision })) }
   catch (e) { console.log('TXN ' + JSON.stringify({ ok: false, code: e.code || 'unexpected' })) }
 };
-await txn(${JSON.stringify(writeKey)});
-${pauseKey ? `await txn(${JSON.stringify(pauseKey)});` : ''}
+${probeOnly ? '' : `await txn(${JSON.stringify(writeKey)});`}
+${!probeOnly && pauseKey ? `await txn(${JSON.stringify(pauseKey)});` : ''}
 `;
 }
 const renamePauseIntercept = pauseKey => `
@@ -683,7 +683,7 @@ test('O01/B01=A: a residual lock refuses; after the documented recovery a fencin
   const marker = fs.readdirSync(w.root).find(n => n.startsWith('data.json.committing.'));
   g1.kill();
   await g1.exited;
-  const g0 = w.spawnWriter(corpseScenario(w, { writeKey: 'y0', pauseKey: '', role: 'W0', intercept: renamePauseIntercept('') }), 'W0');
+  const g0 = w.spawnWriter(corpseScenario(w, { writeKey: '', pauseKey: '', role: 'W0', intercept: renamePauseIntercept(''), probeOnly: true }), 'W0');
   assert.equal((await g0.warmup()).code, 'second-writer');
   fs.unlinkSync(w.file + '.lock'); // the documented recovery; the debris stays for isolation
   const eioCode = `
@@ -723,7 +723,7 @@ test('O01/B01=A: a residual lock refuses; after the documented recovery an unrea
   const commitFile = fs.readdirSync(w.root).find(n => n.includes('.commit.') && !n.startsWith('data.json.committing.'));
   g1.kill();
   await g1.exited;
-  const g0 = w.spawnWriter(corpseScenario(w, { writeKey: 'y0', pauseKey: '', role: 'W0', intercept: renamePauseIntercept('') }), 'W0');
+  const g0 = w.spawnWriter(corpseScenario(w, { writeKey: '', pauseKey: '', role: 'W0', intercept: renamePauseIntercept(''), probeOnly: true }), 'W0');
   assert.equal((await g0.warmup()).code, 'second-writer', 'the residual lock refuses at runtime');
   fs.unlinkSync(w.file + '.lock'); // the documented recovery
   const eioCode = `

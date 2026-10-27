@@ -52,8 +52,9 @@ vi.mock('../store/useStore.js', () => {
   useStore.getState = mocks.snapshot
   return { useStore }
 })
+const ui = vi.hoisted(() => ({ toast: vi.fn() }))
 vi.mock('../store/useUI.js', () => {
-  const snap = () => ({ toast: vi.fn(), openSheet: vi.fn() })
+  const snap = () => ({ toast: ui.toast, openSheet: vi.fn() })
   const useUI = selector => selector ? selector(snap()) : snap()
   useUI.getState = snap
   return { useUI }
@@ -211,6 +212,38 @@ describe('Leaderboard view', () => {
     expect(pub.requestLeave).toHaveBeenCalledWith(ME_JOINED)
     act(() => pub.push({ withdrawPending: true, withdrawSaved: true })) // the coordinator's persisted intent
     expect(textOf()).toContain('when you are online')
+  })
+
+  it('R02: the Leave button’s failure toast derives from the same saved fact as the banner', async () => {
+    mocks.user = { id: 'u1', name: 'Ana' }
+    fetchBoard.mockResolvedValue(BOARD)
+    fetchMe.mockResolvedValue(ME_JOINED)
+    pub.requestLeave.mockResolvedValue({ ok: false, error: new Error('offline'), saved: false })
+    await mount(); await settle()
+    window.confirm = () => true
+    await act(async () => { button('Leave the leaderboard').click() })
+    await settle()
+    expect(ui.toast).toHaveBeenCalledWith('The leave request was not saved reliably')
+    // A persisted decision keeps its honest "saved, waiting for the network" toast.
+    ui.toast.mockClear()
+    pub.requestLeave.mockResolvedValue({ ok: false, error: new Error('offline'), saved: true })
+    await act(async () => { button('Leave the leaderboard').click() })
+    await settle()
+    expect(ui.toast).toHaveBeenCalledWith('Saved. We will finish leaving the leaderboard when you are online.')
+  })
+
+  it('R03: the disclosure re-confirm is gated by the pending withdrawal at the command entry', async () => {
+    mocks.user = { id: 'u1', name: 'Ana' }
+    fetchBoard.mockResolvedValue(BOARD)
+    // The member is joined with a stale disclosure; the coordinator holds a pending intent.
+    fetchMe.mockResolvedValue({ ...ME_JOINED, disclosureVersion: 1, currentDisclosureVersion: 2 })
+    pub.state.withdrawPending = true
+    pub.state.withdrawSaved = true
+    await mount(); await settle()
+    // The card is hidden in the render, and the command entry refuses a forced invocation:
+    // the consent endpoint is never reached while the withdrawal is pending.
+    expect(textOf()).not.toContain('confirm to stay listed')
+    expect(joinLeaderboard).not.toHaveBeenCalled()
   })
 
   it('B03: while a withdrawal is pending the join card stays closed, even when the page GET already says "out"', async () => {
