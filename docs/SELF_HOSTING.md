@@ -600,6 +600,34 @@ API keys for the HTTPS providers (Anthropic, OpenAI, Gemini, a compatible endpoi
 other way round: they are in `./data/coach.json`, encrypted with `./data/secret`, so they *are*
 in this archive — and unreadable without the secret next to them, like everything else in it.
 
+### The single-writer lock (`data.json.lock`) and how to recover
+
+The shared leaderboard store allows exactly one writer process at a time. The writer holds a
+lease in `data/data.json.lock` (a token, pid and hostname) and refreshes it every second. A
+second process that finds the lock **refuses to start the feature** and logs
+`leaderboard store unavailable (second-writer)` — that is the designed behavior, not a bug.
+The same refusal covers a lock that cannot be read or parsed: an unknown state is never treated
+as "no owner".
+
+Recovery is deliberately conservative: a lease is taken over automatically ONLY when the holder
+ran on the same host and its pid no longer exists — proof the writer stopped. A lock left by a
+container on another host (or any state that cannot prove the writer stopped) is never taken
+over by a timer, however long it has been silent; a paused container can resume, and its
+writes must never be unseated by a guess. If the API logs the refusal after a hard crash or a
+`docker kill`, recover like this:
+
+1. Make sure the old writer is really stopped: `docker compose ps`, and confirm the old
+   container is gone — not merely restarted. A graceful `docker compose stop` already released
+   the lock (SIGTERM is wired to a clean release), so this step only matters after a crash.
+2. Back up `./data` as above.
+3. Remove the residual lock: `rm data/data.json.lock`. Only do this AFTER step 1 — deleting
+   the lock while a writer may still run is what the lock exists to prevent.
+4. Start the single writer again (`docker compose up -d api`). It claims the lock and resumes;
+   everything else in `data/` is untouched.
+
+Private training data lives in per-user files and never touches this lock — a leaderboard
+lock refusal stops the community feature only, never anyone's workouts.
+
 ## 7. Notifications
 
 openGym can push two kinds of alert to your phone/desktop, even when the app isn't open:

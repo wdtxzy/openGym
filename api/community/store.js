@@ -57,11 +57,14 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   const lockFile = file + '.lock';
   // Ownership is a random token, minted per store instance and written in the lock — never a
   // bare PID: two containers on one volume are both "pid 1" (N05). The hostname rides along so
-  // liveness stays a same-host judgement; a foreign-host holder is honoured as live UNLESS its
-  // heartbeat went silent past STALE_HOST_MS — the cross-container recovery path for a crash
-  // or a `docker rm` that no signal could clean up after (T04). A graceful stop releases the
-  // lock outright (release(), wired to SIGTERM in server.js), so a normal recreate needs no
-  // window at all.
+  // liveness stays a same-host judgement. Recovery is CONSERVATIVE (B01=A, the user-confirmed
+  // boundary): a lease is taken over only when the holder is PROVABLY stopped — it ran in this
+  // very process, or it ran on this host and its pid answers nothing. A foreign-host lease is
+  // never taken over, however long it has been silent: no TTL is proof that a paused container
+  // will not resume (N01). Recovery from a foreign residual lock is a deployment act — confirm
+  // the old writer is stopped, then remove the lock (docs/SELF_HOSTING.md). A graceful stop
+  // releases the lock outright (release(), wired to SIGTERM in server.js), so a normal recreate
+  // needs no window at all.
   const myToken = crypto.randomBytes(16).toString('hex');
   const myHost = os.hostname();
   const HEARTBEAT_MS = 1000;
@@ -191,6 +194,12 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   // was paused must not simply write its token back — every refresh is CONDITIONAL on the
   // lock still naming us, and a holder that finds someone else's token deposes itself: no
   // further leases, no further commits, until the process restarts.
+  // Why the check-then-rename inside refreshLease is safe (N01): the protocol gives NO ONE a
+  // way to replace a live same-host holder's lease — a claim needs an EMPTY path, takeovers
+  // proceed only over provably-stopped holders (B01=A), and the takeover's restore is
+  // exclusive (M01). The one vector that could slip a new lease under our check — the old
+  // TTL takeover of a silent-but-resumable process — is closed at the judge; within one
+  // process the check and the rename share a thread and cannot interleave.
   let heartbeat = null;
   let deposed = false;      // another writer took the lease from us: refuse everything since
   const refreshLease = () => {
@@ -249,8 +258,9 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     const markersEarly = commitMarkers();
     if (markersEarly.length) {
       const holder = readLock();
+      // B01=A: a foreign lease is never ours to take, whatever its age — treat it as alive.
       const leaseAlive = holder && holder.token && (holder.host !== myHost
-        ? (typeof holder.at === 'number' && now() - holder.at <= STALE_HOST_MS)
+        ? true
         : (holder.pid === process.pid || pidAlive(holder.pid)));
       const anyFresh = markersEarly.some(m => {
         try { return now() - fs.statSync(m).mtimeMs <= STALE_HOST_MS; } catch { return false; }
@@ -286,33 +296,36 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     beat();
   }
 
-  /** The takeover of a silent lease: judge, capture-verify-discard, claim. On success the
-   *  caller runs acquired(); a refusal inside leaves the lock file where the judgement
-   *  left it safe. */
+  /** The takeover of a lease whose holder is PROVABLY stopped (B01=A, the user-confirmed
+   *  conservative boundary). The only verdicts that may proceed cannot be wrong about a
+   *  living writer: the holder ran in THIS process (same pid — its earlier incarnation is
+   *  deposed through its own conditional heartbeat), or it ran on THIS host and its pid
+   *  answers nothing (a dead process cannot resume; pid reuse shows up as "live" and
+   *  refuses). Everything else refuses loudly, with the lease left exactly where it is:
+   *    - foreign host: no signal, pid or silence window can prove a sibling container
+   *      stopped — a paused one can resume, and a resumed writer's commits must never be
+   *      unseated by a guess (N01). Recovery is a deployment act: confirm the old writer
+   *      is stopped, then remove the residual lock (docs/SELF_HOSTING.md).
+   *    - unreadable: a lease we cannot parse is an UNKNOWN state, never an empty one (S03) —
+   *      it is kept for diagnosis and refused.
+   *  The takeover itself stays capture-verify-discard: the rename moves the public lease
+   *  into a private tombstone atomically, so two contenders can never both "verify" the
+   *  same dead holder, and the restore of a captured-but-superseded lease is EXCLUSIVE
+   *  (M01) — it can only fill an empty path, never unseat a legitimate claimer. */
   function acquireStale() {
     let holder = readLock();
     if (iOwn(holder)) return;                                  // our own, from this store: acquired() finishes
-    const lockAge = () => {
-      try { return now() - fs.statSync(lockFile).mtimeMs; } catch { return STALE_HOST_MS + 1; }
-    };
     const judge = h => {
       if (h && h.token) {
-        if (h.host !== myHost) {
-          // Cross-container: live while the heartbeat is fresh; silent past STALE_HOST_MS, the
-          // holder crashed without a signal and a recreated instance may recover the file (T04).
-          const age = typeof h.at === 'number' ? now() - h.at : Infinity;
-          return age <= STALE_HOST_MS ? 'foreign-host' : 'foreign-stale';
-        }
-        if (h.pid === process.pid) return 'same-pid';         // provably THIS process: may take over
-        return pidAlive(h.pid) ? 'live' : 'dead';
+        if (h.host !== myHost) return 'foreign';               // B01=A: no proof of death across containers
+        if (h.pid === process.pid) return 'same-pid';          // this process's earlier incarnation
+        return pidAlive(h.pid) ? 'live' : 'dead';              // same host: a silent pid is PROOF it stopped
       }
-      // Unparseable or token-less: garbage from before this protocol, or a lease damaged in
-      // flight. Fresh, it is not ours to touch (F02); silent, it may be recovered.
-      return lockAge() <= STALE_HOST_MS ? 'unreadable-fresh' : 'gone';
+      return 'unreadable';                                     // S03: unknown state, never ownerless
     };
     const verdict = judge(holder);
-    if (verdict === 'live' || verdict === 'foreign-host' || verdict === 'unreadable-fresh')
-      throw new StoreError('second-writer', `${verdict} holder (${JSON.stringify(holder)}) owns ${file}`);
+    if (verdict !== 'same-pid' && verdict !== 'dead')
+      throw new StoreError('second-writer', `${verdict} holder (${JSON.stringify(holder)}) owns ${file}; takeover needs proof the holder stopped`);
     // Stale. The takeover is capture-verify-discard against THE HOLDER WE JUDGED (the first
     // read) — never against a fresher re-read, which a live contender could already own (T03):
     // the lock is atomically MOVED to a private tombstone, and only what that captured —

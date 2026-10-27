@@ -74,6 +74,14 @@ export function writerWorld(prefix) {
       child.on('error', e => { clearTimeout(timer); reject(bail('spawn failed: ' + e.message)); });
     });
     done.catch(() => {}); // killed children must not mask the real failure (the world is SIGKILLed)
+    /** Resolve with the first `prefix` line's JSON once it appears — for scenarios where a
+     *  writer pauses after printing an intermediate line and never exits. */
+    const waitForLine = (prefix, timeoutMs = BOOT_TIMEOUT_MS) => new Promise((resolve, reject) => {
+      const seen = () => { const l = lines().find(x => x.startsWith(prefix + ' ')); return l ? JSON.parse(l.slice(prefix.length + 1)) : null; };
+      const iv = setInterval(() => { const v = seen(); if (v) { clearInterval(iv); clearTimeout(timer); resolve(v); } }, 5);
+      const timer = setTimeout(() => { clearInterval(iv); try { child.kill('SIGKILL'); } catch { /* already gone */ } reject(bail('no ' + prefix + ' line within ' + timeoutMs + 'ms')); }, timeoutMs);
+      child.on('close', () => { clearInterval(iv); clearTimeout(timer); const v = seen(); if (v) resolve(v); else reject(bail('closed before printing ' + prefix)); });
+    });
     const warmup = () => new Promise((resolve, reject) => {
       const seen = () => { const l = lines().find(x => x.startsWith('WARMUP ')); return l ? JSON.parse(l.slice(7)) : null; };
       // Resolve the moment the boot line appears — writers that pause mid-scenario never
@@ -88,7 +96,10 @@ export function writerWorld(prefix) {
         if (wm) resolve(wm); else reject(bail('exited before printing WARMUP'));
       });
     });
-    return { done, warmup };
+    return { done, warmup, waitForLine, kill: () => child.kill('SIGKILL'),
+             /** Resolves when the process is REALLY gone ('close' reaps it) — the proof a
+              *  same-host takeover needs before it may judge the holder dead. */
+             exited: new Promise(resolve => child.on('close', resolve)) };
   };
   const teardown = async () => {
     for (const child of children) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }

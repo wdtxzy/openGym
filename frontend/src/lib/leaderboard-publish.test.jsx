@@ -8,11 +8,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fingerprintOf } from './leaderboard.js'
 import { createPublisher } from './leaderboard-publish.js'
+import * as realClient from './leaderboard-client.js'
+
+vi.mock('./api.js', () => ({ api: vi.fn() }))
 
 const ME = { enabled: true, suspended: false, disclosureVersion: 1, currentDisclosureVersion: 1, consentVersion: 1, reportRev: 1, personalRev: 7 }
 const facts = id => ({ workouts: [{ id, d: '2026-10-25', start: 100, end: 200 }], activities: [] })
 
-function harness({ server = 'https://alpha.example', lastSynced = 1 } = {}) {
+function harness({ server = 'https://alpha.example', lastSynced = 1, client: clientOverride } = {}) {
   const state = {
     user: { id: 'a', name: 'A' }, S: facts('A-private'), config: { leaderboard: {} },
     sync: { status: 'ok', server, lastSynced }, pullState: vi.fn(async () => { state.sync = { ...state.sync, lastSynced: state.sync.lastSynced + 1 } })
@@ -22,7 +25,7 @@ function harness({ server = 'https://alpha.example', lastSynced = 1 } = {}) {
     getState: () => state,
     subscribe: fn => { listeners.push(fn); return () => {} }
   }
-  const client = { fetchMe: vi.fn(), leaveLeaderboard: vi.fn(), publishReport: vi.fn() }
+  const client = clientOverride || { fetchMe: vi.fn(), leaveLeaderboard: vi.fn(), publishReport: vi.fn() }
   const clock = vi.fn(() => 1000)
   // The marks live as own enumerable keys on the storage itself, exactly like the
   // browser's localStorage; the factory enumerates Object.keys(storage).
@@ -453,7 +456,7 @@ describe('M02 — provenance-scoped withdrawal resolution', () => {
   it('the automatic flow never touches an unproven mark beside a provable one', async () => {
     const h = harness()
     h.storage[UNKNOWN] = JSON.stringify({ v: 2, i: 'older-intent' })
-    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent' })
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent', cv: 1 })
     h.client.fetchMe.mockResolvedValue({ ...ME })
     h.client.leaveLeaderboard.mockResolvedValue({})
     h.p.start()
@@ -474,7 +477,7 @@ describe('M02 — provenance-scoped withdrawal resolution', () => {
   it('a discard attests only the unproven marks; the provable part then auto-completes', async () => {
     const h = harness()
     h.storage[UNKNOWN] = JSON.stringify({ v: 2, i: 'older-intent' })
-    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent' })
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent', cv: 1 })
     h.client.fetchMe.mockResolvedValue({ ...ME })
     h.client.leaveLeaderboard.mockResolvedValue({})
     h.p.start()
@@ -496,7 +499,7 @@ describe('M02 — provenance-scoped withdrawal resolution', () => {
   it('a confirm attests everything captured belongs here: its leave settles all of it', async () => {
     const h = harness()
     h.storage[UNKNOWN] = JSON.stringify({ v: 1, i: 'legacy-intent' }) // v1: no instance proof
-    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent' })
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent', cv: 1 })
     h.client.fetchMe.mockResolvedValue({ ...ME })
     h.client.leaveLeaderboard.mockResolvedValue({})
     h.p.start()
@@ -511,7 +514,7 @@ describe('M02 — provenance-scoped withdrawal resolution', () => {
 
   it('a leave response settles only the provable marks it captured — an unproven mark written mid-flight survives', async () => {
     const h = harness()
-    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent' })
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent', cv: 1 })
     h.client.fetchMe.mockResolvedValue({ ...ME })
     let resolveLeave
     h.client.leaveLeaderboard.mockImplementationOnce(() => new Promise(r => { resolveLeave = r }))
@@ -536,7 +539,7 @@ describe('M02 — provenance-scoped withdrawal resolution', () => {
     const h = harness()
     h.storage['lb-withdraw:a'] = '1'                                             // v1: no proof
     h.storage['lb-withdraw:https://paired-elsewhere.example:3000:a'] = '1'       // v2, foreign origin
-    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent' })
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'here-intent', cv: 1 })
     h.client.fetchMe.mockResolvedValue({ ...ME })
     h.client.leaveLeaderboard.mockResolvedValue({})
     h.p.start()
@@ -546,6 +549,184 @@ describe('M02 — provenance-scoped withdrawal resolution', () => {
     expect('lb-withdraw:a' in h.storage).toBe(false)
     expect('lb-withdraw:https://paired-elsewhere.example:3000:a' in h.storage).toBe(false)
     expect(JSON.parse(h.storage[HERE]).i).toBe('here-intent')
+    h.p.stop()
+  })
+})
+
+describe('N02 — a withdrawal that lands mid-publish stops every new send', () => {
+  it('P01: a withdrawal during the first me blocks the publish — the server answer does not outrank it', async () => {
+    const h = harness()
+    h.client.publishReport.mockResolvedValue({ ok: true, reportRev: 2, acceptedFingerprint: 'x' })
+    let resolveMe
+    h.client.fetchMe.mockImplementationOnce(() => new Promise(r => { resolveMe = r }))
+    h.p.start()
+    h.merged()
+    await vi.advanceTimersByTimeAsync(3000) // the pass is now parked on the me fetch
+    // The person withdraws; the request never reaches the server (offline).
+    h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('leave offline'))
+    await h.p.requestLeave({ ...ME })
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+    // The me answer finally lands: the server still has the member enabled — but the local
+    // decision is newer than that answer, and it closes the gate.
+    resolveMe({ ...ME })
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    const st = h.p.publishStatus()
+    expect(st.withdrawPending).toBe(true)
+    expect(st.lastError).toBe('leave offline') // the withdrawal's error was not wiped (P04)
+    // And the gate stays closed on later passes while the withdrawal is pending.
+    h.client.fetchMe.mockResolvedValue({ ...ME })
+    h.merged()
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    h.p.stop()
+  })
+
+  it('P02: a withdrawal during the merge-stabilization me stops the send; the personal merge still completed', async () => {
+    const h = harness()
+    h.client.publishReport.mockResolvedValue({ ok: true, reportRev: 2, acceptedFingerprint: 'x' })
+    // First sighting: a reportRev this session never saw — the merge loop runs, and its
+    // fresh me fetch is where this pass parks.
+    h.client.fetchMe.mockResolvedValueOnce({ ...ME, reportRev: 5 })
+    let resolveFresh
+    h.client.fetchMe.mockImplementationOnce(() => new Promise(r => { resolveFresh = r }))
+    h.p.start()
+    h.merged()
+    await vi.advanceTimersByTimeAsync(3000)
+    h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('leave offline'))
+    await h.p.requestLeave({ ...ME })
+    resolveFresh({ ...ME, reportRev: 5 }) // the server still says enabled
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+    expect(h.p.publishStatus().lastError).toBe('leave offline')
+    h.p.stop()
+  })
+
+  it('P02: a withdrawal during the 409 recovery blocks the resend (the real client, real recovery)', async () => {
+    const api = vi.mocked((await import('./api.js')).api)
+    let sends = 0
+    api.mockImplementation(async (url, opts) => {
+      if (url.endsWith('/me')) return { ...ME }
+      if (url.endsWith('/report')) {
+        sends++
+        if (sends === 1) throw Object.assign(new Error('stale'), { status: 409, data: { error: 'report-stale' } })
+        return { ok: true, reportRev: 2 }
+      }
+      if (url.endsWith('/consent')) throw new Error('leave offline') // the withdrawal fails offline
+      throw new Error('unexpected ' + url)
+    })
+    const h = harness({ client: realClient })
+    let resolvePull
+    h.state.pullState = vi.fn()
+      .mockImplementationOnce(async () => { h.state.sync = { ...h.state.sync, lastSynced: h.state.sync.lastSynced + 1 } }) // the merge loop's pull
+      .mockImplementationOnce(() => new Promise(r => { resolvePull = r })) // the recovery's pull parks here
+    h.p.start()
+    h.merged()
+    await vi.advanceTimersByTimeAsync(3000) // the send 409s; the recovery parks on its pull
+    expect(sends).toBe(1)
+    await h.p.requestLeave({ ...ME })
+    resolvePull()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(sends).toBe(1) // N02: the recovery never re-sent past the withdrawal
+    expect(h.p.publishStatus().withdrawPending).toBe(true)
+    expect(h.p.publishStatus().lastError).toBe('leave offline')
+    h.p.stop()
+  })
+
+  it('P04: a report accepted after a withdrawal began records the facts but never repaints the withdrawal', async () => {
+    const h = harness()
+    let resolveSend
+    h.client.publishReport.mockImplementationOnce(() => new Promise(r => { resolveSend = r }))
+    h.client.fetchMe.mockResolvedValue({ ...ME })
+    h.p.start()
+    h.merged()
+    await vi.advanceTimersByTimeAsync(3000) // the send is on the wire
+    // The withdrawal begins while the request is in flight; its own request fails offline.
+    h.client.leaveLeaderboard.mockRejectedValueOnce(new Error('leave offline'))
+    await h.p.requestLeave({ ...ME })
+    // The pre-withdrawal send is then accepted (the server sorts it against the withdrawal).
+    resolveSend({ ok: true, reportRev: 2, acceptedFingerprint: 'x' })
+    await vi.advanceTimersByTimeAsync(1)
+    const st = h.p.publishStatus()
+    expect(st.withdrawPending).toBe(true) // the withdrawal state survived the success
+    expect(st.lastError).toBe('leave offline') // and its error message with it
+    h.p.stop()
+  })
+})
+
+describe('B02/P09 — an old leave intent meets a newer authorization: the person decides', () => {
+  const HERE = 'lb-withdraw:https://alpha.example:a'
+
+  function conflictFixture() {
+    const h = harness()
+    h.storage[HERE] = JSON.stringify({ v: 3, i: 'old-intent', cv: 1 }) // made against consent v1
+    h.client.leaveLeaderboard.mockRejectedValue(new Error('leave offline'))
+    // The server now shows the member ENABLED on consent v2 — another device joined again.
+    h.client.fetchMe.mockResolvedValue({ ...ME, consentVersion: 2 })
+    h.p.start()
+    return h
+  }
+
+  it('the automatic retry stops at the conflict: no leave, no publish, the intent stays pending', async () => {
+    const h = conflictFixture()
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.client.leaveLeaderboard).not.toHaveBeenCalled() // the old leave never fires against v2
+    expect(h.client.publishReport).not.toHaveBeenCalled()
+    const st = h.p.publishStatus()
+    expect(st.withdrawPending).toBe(true)
+    expect(st.withdrawConflict).toBe(true)
+    expect(JSON.parse(h.storage[HERE]).i).toBe('old-intent') // untouched: the person decides
+    h.p.stop()
+  })
+
+  it('"still leave" makes a NEW decision against the current authorization and completes', async () => {
+    const h = conflictFixture()
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.p.publishStatus().withdrawConflict).toBe(true)
+    // The person confirms leaving under the CURRENT version: a fresh intent, bound to v2.
+    h.client.leaveLeaderboard.mockResolvedValueOnce({})
+    await h.p.requestLeave({ ...ME, consentVersion: 2 })
+    expect(h.client.leaveLeaderboard).toHaveBeenCalledTimes(1)
+    const st = h.p.publishStatus()
+    expect(st.withdrawPending).toBe(false)
+    expect(st.withdrawConflict).toBe(false)
+    expect(HERE in h.storage).toBe(false)
+    h.p.stop()
+  })
+
+  it('"keep the new join" ends the old decision without sending anything', async () => {
+    const h = conflictFixture()
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.p.publishStatus().withdrawConflict).toBe(true)
+    await h.p.resolveWithdrawConflict()
+    expect(h.client.leaveLeaderboard).not.toHaveBeenCalled() // nothing was sent: the join stands
+    const st = h.p.publishStatus()
+    expect(st.withdrawPending).toBe(false)
+    expect(st.withdrawConflict).toBe(false)
+    expect(HERE in h.storage).toBe(false)
+    h.p.stop()
+  })
+
+  it('"keep the new join" leaves unproven marks alone — they still demand their own confirmation', async () => {
+    const h = conflictFixture()
+    const UNKNOWN = 'lb-withdraw:https://older-server.example:a'
+    h.storage[UNKNOWN] = JSON.stringify({ v: 2, i: 'older-intent' })
+    await vi.advanceTimersByTimeAsync(10)
+    h.p.retryNow()
+    await vi.advanceTimersByTimeAsync(10)
+    await h.p.resolveWithdrawConflict()
+    const st = h.p.publishStatus()
+    expect(st.withdrawPending).toBe(true) // the unproven mark still waits for the person (M02)
+    expect(st.withdrawAmbiguous).toBe(true)
+    expect(JSON.parse(h.storage[UNKNOWN]).i).toBe('older-intent')
+    expect(HERE in h.storage).toBe(false)
     h.p.stop()
   })
 })

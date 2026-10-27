@@ -22,7 +22,7 @@ import { fmtDur } from '../lib/format.js'
 import { Button } from '../components/ui.jsx'
 import Icon from '../components/Icon.jsx'
 import { fetchBoard, fetchMe, joinLeaderboard, saveProfile, setCheer } from '../lib/leaderboard-client.js'
-import { invalidateMe, onPublishStatus, publishStatus, requestLeave, resolveAmbiguousWithdraw, retryNow } from '../lib/leaderboard-publish.js'
+import { invalidateMe, onPublishStatus, publishStatus, requestLeave, resolveAmbiguousWithdraw, resolveWithdrawConflict, retryNow } from '../lib/leaderboard-publish.js'
 const toast = m => useUI.getState().toast(m)
 const WINDOWS = [['week', 'Week'], ['month', 'Month'], ['all', 'All']]
 const EMOJIS = ['💪', '🏋️', '🔥', '⚡', '🏃', '🚴', '🏅', '🧘']
@@ -167,7 +167,19 @@ export default function Leaderboard() {
         <Button size="sm" variant="ghost" disabled={busy} onClick={async () => { setBusy(true); await resolveAmbiguousWithdraw('discard'); setBusy(false) }}>{t('It was for another server — discard it')}</Button>
       </div>
     </div>}
-    {user && me?.enabled && pub.withdrawPending && !pub.withdrawAmbiguous && <div className="card" role="status">
+    {/* B02=A: a saved leave intent bound to an older authorization, while the server shows a
+        newer join from another device — the person chooses; nothing fires without them. */}
+    {user && pub.withdrawConflict && <div className="card" role="alert" style={{ borderColor: 'var(--danger, #c33)' }}>
+      <h2 style={{ margin: 0 }}>{t('Your saved leave request conflicts with a newer join')}</h2>
+      <div className="muted small" style={{ marginTop: 4 }}>
+        {t('Another device joined the leaderboard again with a newer authorization. Your saved leave request is older than that — nothing is published and nothing is withdrawn until you choose.')}
+      </div>
+      <div className="row" style={{ gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+        <Button size="sm" disabled={busy} onClick={async () => { setBusy(true); await requestLeave(me || undefined); setBusy(false) }}>{t('Still leave the leaderboard')}</Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={async () => { setBusy(true); await resolveWithdrawConflict(); setBusy(false) }}>{t('Keep the new join')}</Button>
+      </div>
+    </div>}
+    {user && me?.enabled && pub.withdrawPending && !pub.withdrawAmbiguous && !pub.withdrawConflict && <div className="card" role="status">
       <div className="small">{t('Saved. We will finish leaving the leaderboard when you are online.')}</div>
     </div>}
 

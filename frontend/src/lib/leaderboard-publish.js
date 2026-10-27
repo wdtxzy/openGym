@@ -50,7 +50,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   let generation = 0
   let session = null           // the live session object; replaced whole on any switch
   const listeners = new Set()
-  const status = { pending: false, lastOkAt: null, lastError: null, withdrawPending: false, withdrawAmbiguous: false }
+  const status = { pending: false, lastOkAt: null, lastError: null, withdrawPending: false, withdrawAmbiguous: false, withdrawConflict: false }
 
   const emit = () => { for (const l of [...listeners]) l(status) }
   const setPending = v => { if (status.pending !== v) { status.pending = v; emit() } }
@@ -68,7 +68,10 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
   /* ---------- withdrawal state, resolved per session ---------- */
 
   const clearMark = key => { try { storage.removeItem(key) } catch { /* private mode */ } }
-  const setMark = (key, intentId) => { try { storage.setItem(key, JSON.stringify({ v: 3, i: intentId })) } catch { /* private mode */ } }
+  // B02=A: a leave intent binds the authorization (consentVersion) it was made against — the
+  // persisted copy rides in the mark, the memory decision keeps it beside the id.
+  const setMark = (key, intentId, cv) => { try { storage.setItem(key, JSON.stringify({ v: 3, i: intentId, cv })) } catch { /* private mode */ } }
+  const cvOfMark = raw => { try { const p = JSON.parse(raw); return Number.isFinite(p?.cv) ? p.cv : null } catch { return null } }
 
   /** A withdrawal intent id — browser crypto when present (everywhere this app ships), a
    *  timestamp+random fallback for the odd WebView without it. No Node import: this module
@@ -118,7 +121,11 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
    *  still the current decision. */
   function settleIntents(sess, captured, endableId) {
     acknowledgeMarks(captured)
-    if (endableId != null && sess.currentIntentId === endableId) sess.currentIntentId = null
+    if (endableId != null && sess.currentIntentId === endableId) {
+      sess.currentIntentId = null
+      sess.currentIntentCv = null
+      status.withdrawConflict = false // the decision it conflicted about is resolved
+    }
   }
 
   /* ---------- withdrawal marks, resolved per session (G04) ----------
@@ -171,6 +178,20 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     }
   }
 
+  /** P01/P02: the public-send gate, re-read at EVERY wait resumption of a publish pass. A
+   *  withdrawal that began while the pass was paused — its own intent id (made before the
+   *  first await, N02), a persisted mark, or an unproven mark demanding the person — closes
+   *  the gate for the WHOLE pass: the person's newest decision outranks a publication that
+   *  was already on its way. Repaints the withdrawal status so the UI keeps showing it, and
+   *  answers whether sending is blocked. The server cannot judge an intent it never
+   *  received; once this machine knows a withdrawal is pending, no NEW report may go out. */
+  const withdrawBlocked = sess => {
+    const wd = withdrawalState(sess)
+    status.withdrawPending = wd.pending
+    status.withdrawAmbiguous = wd.ambiguous
+    return wd.pending
+  }
+
   /** Withdraw with the offline guarantee. The v3 mark (this instance) is persisted first and
    *  blocks publishing immediately; the answer clears only the mark it was sent against,
    * only while that mark is still this exact intent (I05) — a newer intent made while the
@@ -187,9 +208,14 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     // its pending state and its protection against publishing survive, and its own
     // confirmation ends it without ever needing the mark.
     sess.currentIntentId = intentId
-    setMark(key, intentId)
+    // B02=A: bind the authorization this decision is made against — a leave fired against
+    // the CURRENT consentVersion is the person's explicit choice, which is exactly what
+    // resolves an authorization conflict.
+    sess.currentIntentCv = Number.isFinite(me?.consentVersion) ? me.consentVersion : null
+    setMark(key, intentId, sess.currentIntentCv)
     const captured = [{ key, raw: rawMark(key) }].filter(c => c.raw !== null)
     status.withdrawPending = true
+    status.withdrawConflict = false // a fresh explicit decision speaks for the current authorization
     // Marks of unknown provenance that already sat in storage keep demanding the person
     // (M02) — this new decision for the current instance does not speak for them.
     status.withdrawAmbiguous = historicalKeys(sess).ambiguous.length > 0
@@ -255,6 +281,28 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     }
   }
 
+  /** B02=A, the person chose "keep the new join": the newer authorization from the other
+   *  device stands, and the OLD leave decision is ended WITHOUT sending anything. Only the
+   *  provably-current-instance marks and the current intent are settled — unproven marks
+   *  keep demanding their own confirmation (M02) — and the flow re-derives the pending
+   *  state, so publishing resumes only when nothing else is owed. */
+  async function resolveWithdrawConflict() {
+    const sess = session
+    if (!sess) return { ok: false }
+    acknowledgeMarks(captureMarks(sess, 'here'))
+    sess.currentIntentId = null
+    sess.currentIntentCv = null
+    status.withdrawConflict = false
+    if (session === sess) {
+      const wd = withdrawalState(sess)
+      status.withdrawPending = wd.pending
+      status.withdrawAmbiguous = wd.ambiguous
+      if (!wd.pending) ok() // the kept join is confirmed by nothing owed: publishing resumes
+      else emit()
+    }
+    return { ok: true }
+  }
+
   /* ---------- the me cache, bound to the session (F07) ---------- */
 
   async function me(sess, force = false) {
@@ -294,6 +342,21 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         const intentAtCapture = sess.currentIntentId
         const m = await me(sess, true)
         if (!stillUs()) return
+        // B02=A: the outstanding leave binds the authorization it was made against. The
+        // server showing the member ENABLED with a NEWER consentVersion means another
+        // device joined again — firing the old leave against an authorization it never
+        // saw would undo the person's newer choice. Stop: keep the intent (still pending,
+        // still blocking publishes), surface the conflict, and let the person decide.
+        // The outstanding decision's own authorization comes FIRST: a newer in-memory
+        // decision (its storage write may have failed, L02) was made against the version
+        // the server now shows, and the captured marks of OLDER, already-replaced intents
+        // must not resurrect a conflict the person already superseded.
+        const intentCv = sess.currentIntentCv ?? captured.map(c => cvOfMark(c.raw)).find(v => v != null)
+        if (m?.enabled && (intentCv == null || Number(m.consentVersion) > intentCv)) {
+          status.withdrawConflict = true
+          emit()
+          return
+        }
         if (!m?.enabled) {
           // Already out server-side: the captured marks' goal is the server's state, not
           // this request — they are resolved wherever they are still the captured ones,
@@ -336,6 +399,9 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       const prevSeen = sess.lastSeenReportRev
       let m = await me(sess)
       if (!stillUs() || !healthy()) return
+      // N02: the person could withdraw while this pass waited for the me answer — a
+      // pending withdrawal ends the pass here, before anything is sent.
+      if (withdrawBlocked(sess)) return
       sess.lastSeenReportRev = m.reportRev
       // Terminal gates are owed nothing — blocked on a person's decision, not a retry.
       if (!m?.enabled || m.suspended) { setPending(false); return }
@@ -362,9 +428,13 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
           const syncBefore = get().sync?.lastSynced
           try { await get().pullState() } catch { return } // stays pending
           const after = get()
+          // N02: a withdrawal landing during the merge stops the public side here — the
+          // merge itself was the PERSONAL save and is allowed to complete (C10).
+          if (withdrawBlocked(sess)) return
           if (!(stillUs() && after.sync?.status === 'ok' && after.sync?.lastSynced !== syncBefore)) return
           m = await me(sess, true)
           if (!stillUs() || !healthy()) return
+          if (withdrawBlocked(sess)) return
           if (m.reportRev === revBefore) merged = true // no new publish during the merge
         }
         if (!merged) {
@@ -395,12 +465,16 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
        * is gone". */
       const snapshotOf = () => {
         if (!(active && session === sess)) return null
+        if (withdrawBlocked(sess)) return null // a 409 recovery must not re-send past a new withdrawal (N02)
         const st = get()
         if (st.sync?.status !== 'ok') return 'unconfirmed'
         const fp = st.sync?.confirmedFp   // the store's proof: a JSON string (J02 wiring)
         if (typeof fp === 'string' && JSON.stringify(syncFingerprint(st.S)) !== fp) return 'unconfirmed'
         return { facts: st.S, rev: Number.isFinite(st.sync?.rev) ? st.sync.rev : null }
       }
+      // P02: the last gate before the wire — every await this pass crossed has been
+      // re-checked, and this is the send's own doorway.
+      if (withdrawBlocked(sess)) return
       const snapshot = snapshotOf()
       if (snapshot === null) return
       if (snapshot === 'unconfirmed') { setPending(true); return } // owed to the personal sync first
@@ -409,6 +483,8 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         pull: async () => {
           try { await get().pullState() } catch { return false }
           const st = get()
+          // N02: a withdrawal landing during the recovery's merge stops the resend.
+          if (withdrawBlocked(sess)) return false
           return session === sess && st.sync?.status === 'ok'
         },
         // I02: the retry's facts and rev come from the store together, only while it is
@@ -417,6 +493,10 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         snapshotOf
       })
       if (!stillUs() || !healthy()) return // the answer belongs to a previous session
+      // P04: read the gate once more — a withdrawal that began while the request was on
+      // the wire outranks this answer. (A send that left BEFORE the withdrawal may land;
+      // the server sorts it against the withdrawal by authorization and transaction order.)
+      const blocked = withdrawBlocked(sess)
       if (r.ok) {
         // G02/I02: record the fingerprint of the facts the server ACTUALLY accepted — the
         // 409 recovery may have sent the re-captured snapshot, not the caller's. The answer
@@ -426,7 +506,10 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         sess.lastAcceptedReportRev = r.reportRev ?? m.reportRev
         sess.lastSeenReportRev = sess.lastAcceptedReportRev
         if (sess.me) sess.me = { ...sess.me, reportRev: sess.lastSeenReportRev } // the cache must not look stale next round
+        if (blocked) { emit(); return } // the accepted report must not repaint the withdrawal (P04)
         ok()
+      } else if (blocked) {
+        emit() // this pass ends quietly: the person's withdrawal keeps the status
       } else if (r.reason === 'disabled') {
         sess.me = null
         setPending(false)
@@ -479,6 +562,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
                                         // explicitly by every newer request (K03), ended only by
                                         // its own confirmation (L02); persisted marks are a
                                         // best-effort copy of it, never the decision itself
+        currentIntentCv: null,          // the consentVersion that decision was made against (B02)
         lastPublished: ''
       }
       const wd = withdrawalState(session)
@@ -529,6 +613,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     retryNow: runPublish,
     requestLeave,
     resolveAmbiguousWithdraw,
+    resolveWithdrawConflict,
     invalidateMe() { if (session) { session.me = null; session.meAt = 0 } },
     publishStatus() { return status },
     onPublishStatus(l) { listeners.add(l); return () => listeners.delete(l) },
@@ -550,4 +635,5 @@ export const publishStatus = () => singleton
 export const onPublishStatus = l => singleton?.onPublishStatus(l) || (() => {})
 export const requestLeave = (...a) => singleton?.requestLeave(...a) ?? { ok: false, error: new Error('no session') }
 export const resolveAmbiguousWithdraw = (...a) => singleton?.resolveAmbiguousWithdraw(...a) ?? { ok: false }
+export const resolveWithdrawConflict = (...a) => singleton?.resolveWithdrawConflict(...a) ?? { ok: false }
 export const invalidateMe = () => singleton?.invalidateMe()
