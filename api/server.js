@@ -95,9 +95,6 @@ const leaderboardStore = createSharedStore({
 // The personal-state revision a report was built against (G03): the domain refuses a
 // report whose pairing no longer matches the live state file, closing the merge→send window
 // where another device syncs in between.
-// The personal-state revision a report was built against (G03): the domain refuses a
-// report whose pairing no longer matches the live state file, closing the merge→send window
-// where another device syncs in between.
 function personalRevOf(uid) { return readState(uid)?._rev || 0 }
 const leaderboardDomain = createLeaderboard({ store: leaderboardStore, personalRevOf });
 if (LEADERBOARD) {

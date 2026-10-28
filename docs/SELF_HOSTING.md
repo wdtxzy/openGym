@@ -602,23 +602,24 @@ in this archive — and unreadable without the secret next to them, like everyth
 
 ### The single-writer lock (`leaderboard.json.lock`) and how to recover
 
-The shared leaderboard store allows exactly one writer process at a time. The shared leaderboard store lives in `data/leaderboard.json`; its writer holds a
-lease in `data/leaderboard.json.lock` (a token, pid and hostname) and refreshes it every second. A
-second process that finds the lock **refuses to start the feature** and logs
-`leaderboard store unavailable (second-writer)` — that is the designed behavior, not a bug.
-The same refusal covers a lock that cannot be read or parsed: an unknown state is never treated
-as "no owner".
+The shared leaderboard store allows exactly one writer process at a time. It lives in
+`data/leaderboard.json`; its writer holds a lease in `data/leaderboard.json.lock` (a random
+token, pid and hostname) and refreshes it every second. A second process that finds the lock
+**refuses to start the feature** and logs `leaderboard store unavailable (second-writer)` —
+that is the designed behavior, not a bug. The same refusal covers a lock that cannot be read
+or parsed: an unknown state is never treated as "no owner".
 
-Recovery is deliberately conservative: a lease is taken over automatically ONLY when the holder
-ran on the same host and its pid no longer exists — proof the writer stopped. A lock left by a
-container on another host (or any state that cannot prove the writer stopped) is never taken
-over by a timer, however long it has been silent; a paused container can resume, and its
-writes must never be unseated by a guess. If the API logs the refusal after a hard crash or a
-`docker kill`, recover like this:
+Recovery is deliberately conservative: **the runtime never takes an existing lock over**, not
+even one whose pid no longer exists and not after any amount of silence. A paused container can
+resume, and its writes must never be unseated by a guess; judging a lease dead and claiming it
+are two steps, and a legitimate recovery can land in between. The one automatic case is a
+graceful stop: SIGTERM releases the lock outright, so `docker compose stop` / `restart` needs no
+recovery at all.
+
+If the API logs the refusal after a hard crash or a `docker kill`, recover by hand:
 
 1. Make sure the old writer is really stopped: `docker compose ps`, and confirm the old
-   container is gone — not merely restarted. A graceful `docker compose stop` already released
-   the lock (SIGTERM is wired to a clean release), so this step only matters after a crash.
+   container is gone — not merely restarted.
 2. Back up `./data` as above.
 3. Remove the residual lock: `rm data/leaderboard.json.lock`. Only do this AFTER step 1 —
    deleting the lock while a writer may still run is what the lock exists to prevent. (The

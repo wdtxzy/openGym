@@ -264,3 +264,51 @@ describe('Leaderboard view', () => {
     expect(textOf()).toContain('Join the leaderboard')
   })
 })
+
+// Round 15's S01/S02, at the surface the person actually touches: the Leave button.
+describe('Leaderboard view — the leave button after round 15', () => {
+  const joined = async () => {
+    mocks.user = { id: 'u1', name: 'Ana' }
+    fetchBoard.mockResolvedValue(BOARD)
+    fetchMe.mockResolvedValue(ME_JOINED)
+    await mount(); await settle()
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+  }
+
+  it('S02: a leave saved locally but not confirmed says saved — the banner already does', async () => {
+    await joined()
+    pub.state.withdrawSaved = true // what the persistent banner renders after the same attempt
+    pub.requestLeave.mockResolvedValue({ ok: false, saved: true, persistence: 'storage', superseded: false })
+    await act(async () => { button('Leave the leaderboard').click() })
+    await settle()
+    expect(ui.toast).toHaveBeenCalledWith('Saved. We will finish leaving the leaderboard when you are online.')
+    expect(ui.toast).not.toHaveBeenCalledWith('The leave request was not saved reliably')
+  })
+
+  it('S02: a decision storage refused keeps the warning, matching an unsaved banner', async () => {
+    await joined()
+    pub.requestLeave.mockResolvedValue({ ok: false, saved: false, persistence: 'memory', superseded: false })
+    await act(async () => { button('Leave the leaderboard').click() })
+    await settle()
+    expect(ui.toast).toHaveBeenCalledWith('The leave request was not saved reliably')
+  })
+
+  it('S02: a superseded answer says nothing — the banner shows the decision that replaced it', async () => {
+    await joined()
+    pub.requestLeave.mockResolvedValue({ ok: false, saved: false, superseded: true })
+    await act(async () => { button('Leave the leaderboard').click() })
+    await settle()
+    expect(ui.toast).not.toHaveBeenCalled()
+  })
+
+  it('S01: a throwing request reports it and re-enables the button for a retry', async () => {
+    await joined()
+    pub.requestLeave.mockRejectedValue(new Error('boom'))
+    await act(async () => { button('Leave the leaderboard').click() })
+    await settle()
+    expect(ui.toast).toHaveBeenCalledWith('Something went wrong')
+    const again = button('Leave the leaderboard')
+    expect(again).toBeTruthy()
+    expect(again.disabled).toBe(false) // the old handler left it disabled forever
+  })
+})

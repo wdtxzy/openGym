@@ -15,11 +15,14 @@
  * explicit that a damaged shared file must survive untouched for an operator to look at, so
  * every route then answers 503 until the process is restarted with the file fixed or removed.
  *
- * A `<file>.lock` holding a live PID refuses a second API process touching the same data
+ * A `<file>.lock` naming a live writer refuses a second API process touching the same data
  * directory (both containers mounting one volume, an accidental second `npm start`): the
  * newcomer logs a clear error and every route answers 503, instead of two processes quietly
- * erasing each other's revisions. The check is best-effort — a PID file without a live PID is
- * a stale lock from a crash, and is taken over.
+ * erasing each other's revisions. Ownership is a random token plus hostname, never a bare PID
+ * (two containers on one volume are both "pid 1"), and the runtime NEVER takes an existing
+ * lock over — not even one whose PID is gone. A lock left by a crash is cleared by the
+ * documented deployment flow (docs/SELF_HOSTING.md), because guessing "the writer must be
+ * dead" from the outside is exactly how a paused writer's acknowledged commit is lost.
  *
  * A commit in flight is bracketed by a per-writer marker, `<file>.committing.<lease-token>`:
  * it names the private commit file, so an acquisition that recovers a silent lease deletes
@@ -65,7 +68,6 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   const myToken = crypto.randomBytes(16).toString('hex');
   const myHost = os.hostname();
   const HEARTBEAT_MS = 1000;
-  const STALE_HOST_MS = 15000;
   const readLock = () => {
     try { return JSON.parse(fs.readFileSync(lockFile, 'utf8')); } catch { return null; }
   };
@@ -242,13 +244,13 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
   let locked = false;
   let queue = Promise.resolve();
 
-  /* Best-effort single-writer guard (see header). Acquire is the atomic 'wx' create; EEXIST is
-   * resolved by the holder's TOKEN, not by guessing from PIDs. Taking over a stale lock re-reads
-   * the holder immediately before removing it and gives up (refuses) the moment the lock names
-   * anyone else — a contender that won the stale lock after our judgement is never unseated.
-   * A lock that exists but does not parse is NOT automatically ownerless (F02): fresh, it is
-   * someone's mid-write or damaged lease and we refuse; only silent past the stale window may
-   * it be recovered, exactly like a crashed foreign holder. */
+  /* The single-writer guard (see header). Acquire is the atomic 'wx' create; EEXIST is
+   * settled by the holder's TOKEN, and there is no take-over step at all: an existing lock —
+   * live, crashed, foreign-hosted, silent or unparseable — is refused, and its residual is
+   * removed by the deployment flow once every writer is confirmed stopped. The round-13 race
+   * (O01/B01=A) is why: judging a token stale and renaming the public lock are two steps, and
+   * a legitimate recovery can claim the lease in between, after which the late capture moves
+   * a LIVE owner away. No check-then-act ordering fixes that; refusing does. */
   function lock() {
     if (refused) throw new StoreError(refused.code, refused.message); // settled: refuse with a clean error
     if (locked) return;
@@ -307,9 +309,9 @@ export function createSharedStore({ file, schemaVersion, init, writer = atomicWr
     beat();
   }
 
-  /** Graceful shutdown: release the lock so a recreated instance starts clean instead of
-   *  waiting out the heartbeat window (T04). Best-effort — a crash leaves the stale-heartbeat
-   *  path as the fallback. */
+  /** Graceful shutdown: release the lock so a recreated instance starts clean (T04) instead
+   *  of needing the operator's recovery. Best-effort — after a hard crash the residual lock
+   *  stays, and the deployment flow in docs/SELF_HOSTING.md is the only way past it. */
   function release() {
     if (!locked) return;
     locked = false;

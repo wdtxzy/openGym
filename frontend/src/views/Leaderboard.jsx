@@ -118,12 +118,30 @@ export default function Leaderboard() {
   async function leave() {
     if (!window.confirm(t('Leave the leaderboard? Your published results are removed.'))) return
     setBusy(true)
-    const r = await requestLeave(me)
-    if (r.ok) await reload()
-    // R02: the toast derives from the same saved fact as the persistent banner — a
-    // memory-only decision (storage refused the mark) is never announced as "Saved".
-    else toast(t(r.saved ? 'Saved. We will finish leaving the leaderboard when you are online.' : 'The leave request was not saved reliably'))
-    setBusy(false)
+    try {
+      const r = await requestLeave(me)
+      if (r.ok) await reload()
+      // S02: the toast and the persistent banner read the SAME outcome — `saved` means the
+      // decision is durable, never "the button was pressed" or "the server answered". A
+      // superseded outcome speaks for a decision this page no longer owns: the banner shows
+      // the current one, so the toast stays quiet instead of contradicting it.
+      else if (r.superseded) await reload()
+      else toast(t(r.saved ? 'Saved. We will finish leaving the leaderboard when you are online.' : 'The leave request was not saved reliably'))
+    } catch {
+      // A throw is not a product outcome — the coordinator answers with a controlled result.
+      // If one ever escapes, the person gets a message instead of a dead button.
+      toast(t('Something went wrong'))
+    } finally {
+      // S01: a request that throws (not a rejection the caller handles, a real throw) used to
+      // leave the button disabled for the rest of the session. The button always comes back.
+      setBusy(false)
+    }
+  }
+
+  /** S01: every one-shot action button releases busy even when its request throws. */
+  const runBusy = async fn => {
+    setBusy(true)
+    try { await fn() } catch { toast(t('Something went wrong')) } finally { setBusy(false) }
   }
 
   async function saveIdentity() {
@@ -172,8 +190,8 @@ export default function Leaderboard() {
         {t('An older version of the app saved a leave request without saying which server it was for. Until you decide, nothing is published and nothing is withdrawn.')}
       </div>
       <div className="row" style={{ gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-        <Button size="sm" disabled={busy} onClick={async () => { setBusy(true); await resolveAmbiguousWithdraw('leave', me || undefined); setBusy(false) }}>{t('It was for this server — leave it')}</Button>
-        <Button size="sm" variant="ghost" disabled={busy} onClick={async () => { setBusy(true); await resolveAmbiguousWithdraw('discard'); setBusy(false) }}>{t('It was for another server — discard it')}</Button>
+        <Button size="sm" disabled={busy} onClick={() => runBusy(() => resolveAmbiguousWithdraw('leave', me || undefined))}>{t('It was for this server — leave it')}</Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={() => runBusy(() => resolveAmbiguousWithdraw('discard'))}>{t('It was for another server — discard it')}</Button>
       </div>
     </div>}
     {/* B02=A: a saved leave intent bound to an older authorization, while the server shows a
@@ -184,8 +202,8 @@ export default function Leaderboard() {
         {t('Another device joined the leaderboard again with a newer authorization. Your saved leave request is older than that — nothing is published and nothing is withdrawn until you choose.')}
       </div>
       <div className="row" style={{ gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-        <Button size="sm" disabled={busy} onClick={async () => { setBusy(true); await requestLeave(me || undefined); setBusy(false) }}>{t('Still leave the leaderboard')}</Button>
-        <Button size="sm" variant="ghost" disabled={busy} onClick={async () => { setBusy(true); await resolveWithdrawConflict(); setBusy(false) }}>{t('Keep the new join')}</Button>
+        <Button size="sm" disabled={busy} onClick={() => runBusy(() => requestLeave(me || undefined))}>{t('Still leave the leaderboard')}</Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={() => runBusy(() => resolveWithdrawConflict())}>{t('Keep the new join')}</Button>
       </div>
     </div>}
     {user && pub.withdrawPending && !pub.withdrawAmbiguous && !pub.withdrawConflict && !pub.withdrawSaved && <div className="card" role="alert" style={{ borderColor: 'var(--danger, #c33)' }}>

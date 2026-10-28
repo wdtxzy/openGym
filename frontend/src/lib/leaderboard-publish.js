@@ -98,20 +98,88 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
    * captured mark they stand for is acknowledged away. */
   const rawMark = key => { try { return storage.getItem(key) } catch { return null } }
   const intentIdOf = raw => { try { const p = JSON.parse(raw); return p && typeof p.i === 'string' ? p.i : null } catch { return null } }
-  /** R04/R05 — completion records, keyed by INTENT ID. A withdrawal outcome never deletes
-   *  the shared v3 mark another tab may have replaced between display and click: completing
-   *  an intent writes its own ack record (`lb-withdraw-ack:<uid>:<intentId>`) and marks it
-   *  complete in the session. Readers derive the outstanding state by matching each mark's
-   *  intent id against the acks — a newer intent (its own id) is untouched by an older
-   *  outcome, and an ack write failure keeps the completion in memory only (honest: a
-   *  restart may re-run the idempotent leave). The ack namespace sits outside the
-   *  `lb-withdraw:` mark prefix, so no historical-key scan mistakes it for a new mark. */
-  const ackKey = (uid, intentId) => `lb-withdraw-ack:${uid}:${intentId}`
-  const recordCompletion = (sess, intentId) => {
-    if (intentId == null) return
+
+  /* ---------- completion records: written once, read everywhere (S03) ----------
+   * R04/R05 made a withdrawal outcome finish its INTENT (by id) instead of deleting the
+   * shared mark a newer tab may have replaced. The round-14 version only remembered those
+   * ids in the live session's Set and wrote a record nobody read: a reload, a second tab or
+   * a fresh sign-in started with an empty Set, saw the mark still on disk (the protocol
+   * keeps it as evidence) and called the finished intent outstanding again — the exit became
+   * a pending withdrawal, or an old conflict, all over again.
+   *
+   * So completion is now a READ-WRITE contract, not a write-only one:
+   *   - `store`  — `lb-withdraw-ack:<instance>:<uid>:<intentId>`, carrying the version, the
+   *                intent id, the account, the INSTANCE and the reason. The namespace sits
+   *                outside the `lb-withdraw:` mark prefix, so no historical-key scan mistakes
+   *                it for a mark. Everything is read by exact key, never by counting colons:
+   *                an origin carries colons of its own, and a v1 record
+   *                (`lb-withdraw-ack:<uid>:<intentId>`) is a different key, not a shorter one.
+   *   - `read`   — one lookup by id per question, never a scan, and never cached: a second
+   *                tab's write must be visible here on the next derivation, not after a
+   *                restart (a cache is exactly how S03 would come back).
+   *   - `proof`  — a record that cannot be parsed, or that names another version, account or
+   *                instance, is NOT a reliable completion: it is left for the operator and the
+   *                intent stays outstanding. Only an exact match completes.
+   *
+   * v1 records (no instance) are migrated only when they can be PROVEN to correspond to a
+   * mark this instance still holds — the intent id of the `lb-withdraw:<instance>:<uid>`
+   * mark. An unattributable v1 record is left untouched and never completes anything: reusing
+   * it across instances is the one thing it cannot support. */
+  const ACK_VERSION = 2
+  const ackKey = (instance, uid, intentId) => `lb-withdraw-ack:${instance}:${uid}:${intentId}`
+  const legacyAckKey = (uid, intentId) => `lb-withdraw-ack:${uid}:${intentId}`
+
+  const validAck = (raw, { intentId, uid, instance }) => {
+    let p
+    try { p = JSON.parse(raw) } catch { return null } // corrupt: not evidence of anything
+    if (!p || typeof p !== 'object') return null
+    if (p.v !== ACK_VERSION || p.i !== intentId || p.uid !== uid || p.instance !== instance) return null
+    return p
+  }
+
+  /** The completion record for this intent, or null. Never throws: an unreadable store
+   *  answers "not completed", which keeps the intent pending (honest) instead of finishing
+   *  a leave this device cannot prove happened. */
+  function readCompletion(sess, intentId) {
+    if (intentId == null) return null
+    let raw = null
+    try { raw = storage.getItem(ackKey(sess.instance, sess.uid, intentId)) } catch { return null }
+    if (raw != null) return validAck(raw, { intentId, uid: sess.uid, instance: sess.instance })
+    // v1 → v2, only with proof: this instance's own mark still carrying this same intent id.
+    try {
+      const legacy = storage.getItem(legacyAckKey(sess.uid, intentId))
+      if (legacy == null) return null
+      const old = JSON.parse(legacy)
+      if (!old || old.v !== 1 || old.i !== intentId) return null
+      if (intentIdOf(rawMark(KEY_V3(sess.instance, sess.uid))) !== intentId) return null
+      const migrated = { v: ACK_VERSION, i: intentId, uid: sess.uid, instance: sess.instance, reason: 'migrated', at: clock() }
+      try { storage.setItem(ackKey(sess.instance, sess.uid, intentId), JSON.stringify(migrated)) } catch { /* still valid for this pass */ }
+      return migrated
+    } catch { return null }
+  }
+
+  /** THE question every reader asks (S03): completed in this session, or on disk? */
+  const isIntentCompleted = (sess, intentId) =>
+    intentId != null && (sess.completed.has(intentId) || readCompletion(sess, intentId) != null)
+
+  /** Record that an intent is finished. Returns whether the record reached storage — the
+   *  only honest answer to "will this survive a restart"; the in-memory copy governs this
+   *  session either way, and a repeat records nothing twice (settle + acknowledge used to
+   *  write the same id twice). */
+  const recordCompletion = (sess, intentId, reason = 'left') => {
+    if (intentId == null) return false
+    const known = sess.completed.has(intentId)
     sess.completed.add(intentId)
-    try { storage.setItem(ackKey(sess.uid, intentId), JSON.stringify({ v: 1, i: intentId, at: clock() })) }
-    catch { /* the in-memory completion still governs this session; a restart re-runs the idempotent leave */ }
+    if (known && readCompletion(sess, intentId) != null) return true // nothing new to write
+    try {
+      storage.setItem(ackKey(sess.instance, sess.uid, intentId),
+        JSON.stringify({ v: ACK_VERSION, i: intentId, uid: sess.uid, instance: sess.instance, reason, at: clock() }))
+      return true
+    } catch {
+      // Storage refused: the completion lives in memory only. A restart re-runs the
+      // idempotent leave, which is safe but must never be presented as durable.
+      return false
+    }
   }
   /** Capture the marks a withdrawal outcome may act on, SCOPED to a provenance group (M02):
    *  'here' — only keys that provably belong to the current instance (the only ones an
@@ -125,14 +193,21 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     const keys = group === 'here' ? hist.here : group === 'ambiguous' ? hist.ambiguous : [...hist.here, ...hist.ambiguous]
     return keys.map(key => ({ key, raw: rawMark(key) })).filter(c => c.raw !== null)
   }
-  const acknowledgeMarks = (sess, captured) => {
+  const acknowledgeMarks = (sess, captured, reason = 'left') => {
+    let persisted = true
     for (const { key, raw } of captured) {
       const id = intentIdOf(raw)
-      if (id != null) { recordCompletion(sess, id); continue }
+      // Already completed by the caller's identity pass (settleIntents records every id it
+      // settles): do not rewrite the same ack record a second time.
+      if (id != null) {
+        if (!sess.completed.has(id) && !recordCompletion(sess, id, reason)) persisted = false
+        continue
+      }
       // An unidentifiable mark has no id to ack: the person's explicit decision over a
       // byte-for-byte unchanged mark is the only evidence there is — delete it as before.
       if (rawMark(key) === raw) clearMark(key)
     }
+    return persisted
   }
   /** Settle the outcome of a confirmed leave: acknowledge the captured marks (each only
    *  while still byte-for-byte the mark it was sent against — I05), and end the
@@ -144,7 +219,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
    *  failed lives in memory and stays pending until its own confirmation, an explicit
    *  replacement, or a later leave confirmed for this account+instance while it was
    *  still the current decision. */
-  function settleIntents(sess, captured, endableId) {
+  function settleIntents(sess, captured, endableId, reason = 'left') {
     // R04/R05: complete exactly the intents this outcome captured — by ID, never by
     // deleting a shared key a newer tab may have replaced. The memory-only decision this
     // outcome speaks for (endableId) completes with them.
@@ -154,8 +229,9 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       if (id != null) ids.add(id)
     }
     if (endableId != null) ids.add(endableId)
-    for (const id of ids) recordCompletion(sess, id)
-    acknowledgeMarks(sess, captured)
+    let persisted = true
+    for (const id of ids) { if (!recordCompletion(sess, id, reason)) persisted = false }
+    if (!acknowledgeMarks(sess, captured, reason)) persisted = false
     // Session FACTS only (O03): whether the UI shows the resolution is the projection's
     // business, under the caller's session-identity check — a late response from a
     // replaced session mutates nothing it does not own. The current slot clears only when
@@ -166,6 +242,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       sess.currentIntentCv = null
       sess.currentIntentPersisted = false
     }
+    return persisted
   }
 
   /* ---------- withdrawal marks, resolved per session (G04) ----------
@@ -206,14 +283,17 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
 
   function withdrawalState(sess) {
     const hist = historicalKeys(sess)
-    // R04/R05: a persisted mark is outstanding while its intent id has no completion record.
+    // R04/R05 + S03: a persisted mark is outstanding while its intent id has no completion
+    // record — in this session OR on disk. The disk half is what a reload, a second tab and
+    // a fresh sign-in depend on; reading it per derivation (never once at startup) is what
+    // lets an already-open tab notice another tab finishing the same intent.
     // An unidentifiable mark (no parseable id — a pre-protocol mark) always waits for the
     // person; it can never be silently completed by an id it does not have.
     const outstandingPersisted = [...hist.here, ...hist.ambiguous].filter(key => {
       const id = intentIdOf(rawMark(key))
-      return id == null || !sess.completed.has(id)
+      return id == null || !isIntentCompleted(sess, id)
     })
-    const memoryPending = sess.currentIntentId != null && !sess.completed.has(sess.currentIntentId)
+    const memoryPending = sess.currentIntentId != null && !isIntentCompleted(sess, sess.currentIntentId)
     return {
       pending: outstandingPersisted.length > 0 || memoryPending,
       // M02: ANY unproven mark demands the person — also when a provable mark sits next
@@ -224,7 +304,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       // explicit confirmation or auto-completes once the unknown side is decided.
       ambiguous: hist.ambiguous.some(key => {
         const id = intentIdOf(rawMark(key))
-        return id == null || !sess.completed.has(id)
+        return id == null || !isIntentCompleted(sess, id)
       }),
       // B04: "saved" means the pending decision's mark is REALLY persisted. A decision
       // whose storage write failed lives in memory only — the UI must never promise it
@@ -232,7 +312,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       saved: memoryPending ? sess.currentIntentPersisted === true : outstandingPersisted.length > 0,
       // R05: the conflict is alive only while at least one of its target intents is still
       // uncompleted — completing them (a confirmed out, a Keep, a replacement) ends it.
-      conflict: sess.conflictTargets != null && sess.conflictTargets.some(id => !sess.completed.has(id))
+      conflict: sess.conflictTargets != null && sess.conflictTargets.some(id => !isIntentCompleted(sess, id))
     }
   }
 
@@ -247,6 +327,33 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     status.withdrawSaved = wd.saved
     status.withdrawConflict = wd.conflict
   }
+
+  /* ---------- one shape for every leave outcome (S01/S02) ----------
+   * The button's toast and the persistent banner must speak from the same fact, and a result
+   * must describe THE session and intent it was made in — never a read of global state after
+   * the await, which is how one session's answer repainted another's feedback.
+   *   ok / serverConfirmed  what the server did (or did not) confirm
+   *   persistence           'storage' (survives a restart) | 'memory' | 'none'
+   *   saved                 persistence === 'storage' — the only durable promise made
+   *   superseded            a newer decision replaced this one: the UI stays quiet and lets
+   *                         the banner, which renders the CURRENT decision, speak instead
+   *   target                the account + instance this outcome belongs to
+   * `saved` is NEVER assumed from a 200: the success path reports whether the completion
+   * record actually reached storage, which is exactly what S03 made load-bearing. */
+  const outcome = (sess, { ok, serverConfirmed = false, persistence = 'none', superseded = false, error = null }) => ({
+    ok,
+    serverConfirmed,
+    persistence,
+    saved: persistence === 'storage',
+    superseded,
+    error,
+    target: sess ? { uid: sess.uid, instance: sess.instance } : null
+  })
+
+  /** The persistence half of a failure, derived from the SAME state the banner renders —
+   *  'storage' when the pending decision (or its marks) is durable, 'memory' when the whole
+   *  decision lives in this tab, 'none' when nothing is owed any more. */
+  const persistenceOf = wd => (wd.saved ? 'storage' : wd.pending ? 'memory' : 'none')
 
   /** P01/P02: the public-send gate, re-read at EVERY wait resumption of a publish pass. A
    *  withdrawal that began while the pass was paused — its own intent id (made before the
@@ -290,7 +397,6 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     // B04: record whether the mark really persisted — the UI separates "saved, waiting for
     // the network" from "memory only, a restart would lose it".
     sess.currentIntentPersisted = setMark(key, intentId, sess.currentIntentCv) === true
-    sess.conflictTargets = null // the fresh explicit decision resolves what the conflict was about
     const captured = [{ key, raw: rawMark(key) }].filter(c => c.raw !== null)
     status.withdrawPending = true
     status.withdrawConflict = false // a fresh explicit decision speaks for the current authorization
@@ -301,7 +407,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     emit()
     try {
       await client.leaveLeaderboard(me)
-      settleIntents(sess, captured, intentId) // its own marks, its own intent (I05/J04/L02)
+      const persisted = settleIntents(sess, captured, intentId) // its own marks, its own intent (I05/J04/L02)
       if (session === sess) {
         const wd = withdrawalState(sess)
         projectWithdrawal(sess, wd)
@@ -309,12 +415,24 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
         if (!wd.pending) ok()
         else emit()
       }
-      // R02: the caller's feedback derives from the SAME facts the banner uses — the
-      // server's confirmation and whether the decision actually persisted locally.
-      return { ok: true, serverConfirmed: true, saved: true }
+      // R02/S02: the caller's feedback derives from the SAME facts the banner uses — the
+      // server's confirmation AND whether the completion record actually reached storage.
+      return outcome(sess, { ok: true, serverConfirmed: true, persistence: persisted ? 'storage' : 'memory' })
     } catch (e) {
-      if (session === sess) fail(e)
-      return { ok: false, error: e }
+      // S02: the failure answer belongs to THIS session and THIS intent. Returning without
+      // `saved` made the page read undefined as false and announce "not saved reliably" over
+      // a decision that WAS saved. A session replaced mid-flight is superseded: it must not
+      // speak for the current one at all.
+      if (session !== sess) return outcome(null, { ok: false, superseded: true, error: e })
+      fail(e)
+      const wd = withdrawalState(sess)
+      projectWithdrawal(sess, wd)
+      return outcome(sess, {
+        ok: false, error: e,
+        persistence: persistenceOf(wd),
+        // A newer decision made while this request was on the wire carries the goal now.
+        superseded: sess.currentIntentId !== intentId
+      })
     }
   }
 
@@ -328,22 +446,27 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
    *  everything captured belongs here, so its leave may settle all of it. */
   async function resolveAmbiguousWithdraw(action, me) {
     const sess = session
-    if (!sess) return { ok: false }
+    if (!sess) return outcome(null, { ok: false, error: new Error('not signed in') })
     const captured = captureMarks(sess, action === 'discard' ? 'ambiguous' : undefined)
     if (action === 'discard') {
-      acknowledgeMarks(sess, captured)
+      const persisted = acknowledgeMarks(sess, captured, 'discarded')
       if (session === sess) {
         projectWithdrawal(sess, withdrawalState(sess))
         emit()
       }
-      return { ok: true }
+      // No server confirmation: the discard is a local attestation about marks this device
+      // could not attribute. Its durability is the completion records, nothing else.
+      return outcome(sess, { ok: true, persistence: persisted ? 'storage' : 'memory' })
     }
-    const intentAtCapture = sess.currentIntentId // the memory decision this resolution acts for (L02)
+    // S01: the memory decision this resolution acts for. The old failure path read
+    // `intentId`, which lives in requestLeave's scope — an offline history confirmation
+    // threw ReferenceError instead of answering, and the caller could not retry.
+    const intentAtCapture = sess.currentIntentId
     try {
       await client.leaveLeaderboard(me || sess.me)
       // The leave landed for the captured marks' account and instance — they are resolved
       // wherever they are still the marks this resolution captured (I05/J04).
-      settleIntents(sess, captured, intentAtCapture)
+      const persisted = settleIntents(sess, captured, intentAtCapture)
       if (session === sess) {
         const wd = withdrawalState(sess)
         projectWithdrawal(sess, wd)
@@ -353,12 +476,19 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       }
       // R02: the caller's feedback derives from the SAME facts the banner uses — the
       // server's confirmation and whether the decision actually persisted locally.
-      return { ok: true, serverConfirmed: true, saved: true }
+      return outcome(sess, { ok: true, serverConfirmed: true, persistence: persisted ? 'storage' : 'memory' })
     } catch (e) {
-      if (session === sess) fail(e)
-      // R02: an offline failure with an unpersisted decision must NOT be reported as
-      // "saved" — the button and the banner speak from this one fact.
-      return { ok: false, error: e, saved: sess.currentIntentId === intentId ? sess.currentIntentPersisted === true : false }
+      if (session !== sess) return outcome(null, { ok: false, superseded: true, error: e })
+      fail(e)
+      // R02/S01: an offline failure speaks from THIS session's derived state — never from a
+      // variable owned by another function, and never from a fresh global read.
+      const wd = withdrawalState(sess)
+      projectWithdrawal(sess, wd)
+      return outcome(sess, {
+        ok: false, error: e,
+        persistence: persistenceOf(wd),
+        superseded: intentAtCapture != null && sess.currentIntentId !== intentAtCapture
+      })
     }
   }
 
@@ -375,11 +505,12 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
    *  targets. */
   async function resolveWithdrawConflict() {
     const sess = session
-    if (!sess) return { ok: false }
+    if (!sess) return outcome(null, { ok: false, error: new Error('not signed in') })
     const targets = sess.conflictTargets
-    if (targets == null) return { ok: false, reason: 'stale-conflict' }
+    if (targets == null) return { ...outcome(sess, { ok: false }), reason: 'stale-conflict' }
+    let persisted = true
     for (const id of targets) {
-      recordCompletion(sess, id)
+      if (!recordCompletion(sess, id, 'kept-join')) persisted = false
       if (sess.currentIntentId === id) {
         sess.currentIntentId = null
         sess.currentIntentCv = null
@@ -392,7 +523,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       if (!wd.pending) ok() // the kept join is confirmed by nothing owed: publishing resumes
       else emit()
     }
-    return { ok: true }
+    return outcome(sess, { ok: true, persistence: persisted ? 'storage' : 'memory' })
   }
 
   /** R01: a member observation is usable for authorization decisions only when it is an
@@ -515,11 +646,14 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
       // N02: the person could withdraw while this pass waited for the me answer — a
       // pending withdrawal ends the pass here, before anything is sent.
       if (withdrawBlocked(sess)) return
-      sess.lastSeenReportRev = m.reportRev
       // Terminal gates are owed nothing — blocked on a person's decision, not a retry.
       // R01: an unavailable observation (feature off / malformed) is NOT "the member is
       // out" — it stops this pass without touching the withdrawal state either way.
+      // The validation comes BEFORE the first field read (round-15 §5): a 404 answers null,
+      // and reading `reportRev` off it threw a TypeError that surfaced as a publish error
+      // instead of the quiet "feature is off" this branch is supposed to be.
       if (!isMemberObservation(m)) { setPending(false); return }
+      sess.lastSeenReportRev = m.reportRev
       if (m.enabled === false || m.suspended) { setPending(false); return }
       if (m.disclosureVersion !== m.currentDisclosureVersion) { setPending(false); return }
 
@@ -681,11 +815,10 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
                                         // best-effort copy of it, never the decision itself
         currentIntentCv: null,          // the consentVersion that decision was made against (B02)
         currentIntentPersisted: false,  // whether that decision's mark actually reached storage (B04)
-        withdrawConflict: false,        // this session's own authorization conflict (B02) — a session
-                                        // fact, never a global flag: it dies with the session (O03)
         conflictTargets: null,          // R04/R05: the intent ids the displayed conflict is about; the
                                         // conflict clears only when ALL of them are completed
-        completed: new Set(),           // intent ids completed in this session (acks are the persisted copy)
+        completed: new Set(),           // intent ids completed in THIS session — the memory half;
+                                        // the durable half is read back per intent id (S03)
         lastPublished: ''
       }
       // O03: a NEW session starts with a clean conflict flag and its own facts — nothing
@@ -712,6 +845,23 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     schedule()
   }
 
+  /* ---------- another tab's completion (S03) ----------
+   * The storage event is the only signal a same-origin sibling gives, and it names the key
+   * it touched — so the reaction stays scoped to our namespace and never scans storage.
+   * A completion written elsewhere makes a mark here no longer outstanding: the projection
+   * is re-derived (the banner must stop asking), and a publish that was gated on the
+   * withdrawal may now proceed. A mark removed elsewhere re-derives the same way, so the
+   * banner never keeps a flag the facts no longer support. */
+  const onStorageEvent = e => {
+    if (!started || !active || !session) return
+    const k = e?.key
+    if (typeof k !== 'string' || !k.startsWith('lb-withdraw')) return
+    const wd = withdrawalState(session)
+    projectWithdrawal(session, wd)
+    emit()
+    if (!wd.pending) schedule() // the sibling finished it: this tab may publish again
+  }
+
   function start() {
     if (started) return
     started = true
@@ -719,6 +869,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     unsub = store.subscribe(onStoreChange)
     onStoreChange() // register the initial session before the first pass
     window.addEventListener('online', onOnline)
+    window.addEventListener('storage', onStorageEvent)
     runPublish()
   }
   let unsub = null
@@ -730,6 +881,7 @@ export function createPublisher({ store = useStore, client = { fetchMe, leaveLea
     active = false
     if (unsub) { unsub(); unsub = null }
     window.removeEventListener('online', onOnline)
+    window.removeEventListener('storage', onStorageEvent)
     clearTimeout(timer)
     session = null
     started = false
