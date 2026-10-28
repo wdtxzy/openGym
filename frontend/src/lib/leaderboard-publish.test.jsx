@@ -447,10 +447,12 @@ describe('L02 — a memory-only intent (its storage write failed) survives an ol
     h.client.leaveLeaderboard.mockResolvedValue({})
     await h.p.requestLeave({ ...ME0, consentVersion: 4 })
     expect(h.p.publishStatus().withdrawPending).toBe(false)
-    // Only the healed decision ever wrote a mark; the replaced chain was completed by id
-    // (its acks) — nothing outstanding, nothing deleted behind another tab's back.
+    // Only the healed decision ever wrote a mark, and only IT is completed (R16-T01): the
+    // three replaced intents never reached storage, so nothing on disk can describe them and
+    // nothing may claim they finished — a record for them would be a shared claim with no
+    // evidence, which is exactly what let another tab publish during a withdrawal.
     expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw:'))).toHaveLength(1)
-    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw-ack:'))).toHaveLength(2)
+    expect(Object.keys(h.storage).filter(k => k.startsWith('lb-withdraw-ack:'))).toHaveLength(1)
   })
 })
 

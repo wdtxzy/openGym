@@ -26,7 +26,7 @@ const pub = vi.hoisted(() => {
   return {
     state, subs,
     push: patch => { Object.assign(state, patch); for (const l of subs) l(state) },
-    retryNow: vi.fn(), requestLeave: vi.fn(), invalidateMe: vi.fn(),
+    retryNow: vi.fn(), requestLeave: vi.fn(), invalidateMe: vi.fn(), retryCompletions: vi.fn(),
     resolveAmbiguousWithdraw: vi.fn(), resolveWithdrawConflict: vi.fn()
   }
 })
@@ -36,6 +36,7 @@ vi.mock('../lib/leaderboard-publish.js', () => ({
   retryNow: (...a) => pub.retryNow(...a),
   requestLeave: (...a) => pub.requestLeave(...a),
   invalidateMe: (...a) => pub.invalidateMe(...a),
+  retryCompletions: (...a) => pub.retryCompletions(...a),
   resolveAmbiguousWithdraw: (...a) => pub.resolveAmbiguousWithdraw(...a),
   resolveWithdrawConflict: (...a) => pub.resolveWithdrawConflict(...a)
 }))
@@ -67,7 +68,7 @@ beforeEach(() => {
   mocks.S = { workouts: [], activities: [] }
   mocks.user = null
   mocks.config = { leaderboard: { public_read: false } }
-  Object.assign(pub.state, { pending: false, lastOkAt: null, lastError: null, withdrawPending: false, withdrawAmbiguous: false, withdrawConflict: false, withdrawSaved: false })
+  Object.assign(pub.state, { pending: false, lastOkAt: null, lastError: null, withdrawPending: false, withdrawAmbiguous: false, withdrawConflict: false, withdrawSaved: false, completionUnsaved: false })
   pub.subs.clear()
   host = document.createElement('div'); document.body.appendChild(host); root = createRoot(host)
 })
@@ -310,5 +311,64 @@ describe('Leaderboard view — the leave button after round 15', () => {
     const again = button('Leave the leaderboard')
     expect(again).toBeTruthy()
     expect(again.disabled).toBe(false) // the old handler left it disabled forever
+  })
+})
+
+// Round 16's T02: `ok` is what the server did; it does not mean this device wrote the
+// completion record down. Both surfaces — the toast and the standing card — must say so,
+// and the retry must reach the coordinator (which rewrites the SAME record, never a leave).
+describe('Leaderboard view — a completion record the device could not save (T02)', () => {
+  const ME_OUT = { ...ME_JOINED, enabled: false, publicMemberId: null }
+  const joined = async (me = ME_JOINED) => {
+    mocks.user = { id: 'u1', name: 'Ana' }
+    fetchBoard.mockResolvedValue(BOARD)
+    fetchMe.mockResolvedValue(me)
+    await mount(); await settle()
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+  }
+
+  it('a confirmed leave whose record stayed in memory is reported, not announced as plain success', async () => {
+    await joined()
+    pub.requestLeave.mockResolvedValue({ ok: true, serverConfirmed: true, persistence: 'memory', saved: false, superseded: false })
+    await act(async () => { button('Leave the leaderboard').click() })
+    await settle()
+    expect(ui.toast).toHaveBeenCalledWith('This device could not save the completion record.')
+  })
+
+  it('a confirmed leave with a durable record says nothing — nothing is owed', async () => {
+    await joined()
+    pub.requestLeave.mockResolvedValue({ ok: true, serverConfirmed: true, persistence: 'storage', saved: true, superseded: false })
+    await act(async () => { button('Leave the leaderboard').click() })
+    await settle()
+    expect(ui.toast).not.toHaveBeenCalled()
+  })
+
+  it('the standing card explains it and its retry reaches the coordinator', async () => {
+    await joined(ME_OUT)
+    act(() => pub.push({ completionUnsaved: true, withdrawPending: false }))
+    expect(textOf()).toContain('could not save the completion record')
+    expect(textOf()).toContain('Retry saving so a reload does not ask you again')
+    const retry = button('Retry saving')
+    expect(retry).toBeTruthy()
+    pub.retryCompletions.mockReturnValue({ ok: true, remaining: 0 })
+    await act(async () => { retry.click() })
+    await settle()
+    expect(pub.retryCompletions).toHaveBeenCalledTimes(1)
+    expect(ui.toast).not.toHaveBeenCalled()
+  })
+
+  it('a retry that fails again keeps the warning and tells the person', async () => {
+    await joined(ME_OUT)
+    act(() => pub.push({ completionUnsaved: true, withdrawPending: false }))
+    pub.retryCompletions.mockReturnValue({ ok: false, remaining: 1 })
+    await act(async () => { button('Retry saving').click() })
+    await settle()
+    expect(ui.toast).toHaveBeenCalledWith('The completion record could not be saved again.')
+  })
+
+  it('the card is not shown while a withdrawal is still owed — that card owns the story', async () => {
+    await joined(ME_OUT)
+    act(() => pub.push({ completionUnsaved: true, withdrawPending: true, withdrawSaved: true }))
+    expect(textOf()).not.toContain('could not save the completion record')
   })
 })

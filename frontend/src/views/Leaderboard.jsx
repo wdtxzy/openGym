@@ -22,7 +22,7 @@ import { fmtDur } from '../lib/format.js'
 import { Button } from '../components/ui.jsx'
 import Icon from '../components/Icon.jsx'
 import { fetchBoard, fetchMe, joinLeaderboard, saveProfile, setCheer } from '../lib/leaderboard-client.js'
-import { invalidateMe, onPublishStatus, publishStatus, requestLeave, resolveAmbiguousWithdraw, resolveWithdrawConflict, retryNow } from '../lib/leaderboard-publish.js'
+import { invalidateMe, onPublishStatus, publishStatus, requestLeave, resolveAmbiguousWithdraw, resolveWithdrawConflict, retryCompletions, retryNow } from '../lib/leaderboard-publish.js'
 import { publishStatus as livePublishStatus } from '../lib/leaderboard-publish.js'
 const toast = m => useUI.getState().toast(m)
 const WINDOWS = [['week', 'Week'], ['month', 'Month'], ['all', 'All']]
@@ -120,7 +120,12 @@ export default function Leaderboard() {
     setBusy(true)
     try {
       const r = await requestLeave(me)
-      if (r.ok) await reload()
+      if (r.ok) {
+        await reload()
+        // T02: the exit is real; this device just could not write it down. Say so here as
+        // well as in the banner — `ok` alone would report a failure that is not one.
+        if (r.persistence === 'memory') toast(t('This device could not save the completion record.'))
+      }
       // S02: the toast and the persistent banner read the SAME outcome — `saved` means the
       // decision is durable, never "the button was pressed" or "the server answered". A
       // superseded outcome speaks for a decision this page no longer owns: the banner shows
@@ -138,10 +143,18 @@ export default function Leaderboard() {
     }
   }
 
-  /** S01: every one-shot action button releases busy even when its request throws. */
+  /** R15-S01: every one-shot action button releases busy even when its request throws.
+   *  R16-T02: and it speaks from the OUTCOME — `ok` is what the server did, not whether this
+   *  device wrote the completion record down. A confirmed action whose record stayed in
+   *  memory is reported, never shown as a plain success; a superseded answer stays quiet
+   *  because the banner renders the decision that replaced it. */
+  const reportOutcome = r => {
+    if (r && !r.superseded && r.persistence === 'memory') toast(t('This device could not save the completion record.'))
+    return r
+  }
   const runBusy = async fn => {
     setBusy(true)
-    try { await fn() } catch { toast(t('Something went wrong')) } finally { setBusy(false) }
+    try { reportOutcome(await fn()) } catch { toast(t('Something went wrong')) } finally { setBusy(false) }
   }
 
   async function saveIdentity() {
@@ -222,6 +235,20 @@ export default function Leaderboard() {
       {/* B03=A: the withdrawal is being confirmed — only the retry exists; joining again
           opens after the server confirms the exit, never beside a pending intent. */}
       <div className="small">{t('Your leave request is still being confirmed. You can join again once it finishes.')}</div>
+    </div>}
+    {/* R16-T02: the server applied the change, this device could not write the completion
+        record down. Nothing is owed any more, so no withdrawal card is shown — but a reload
+        would ask for the same action again, and hiding that would be a plain lie. The retry
+        saves the SAME record: it never re-sends the leave, so "keep the new join" stays a
+        kept join. */}
+    {user && pub.completionUnsaved && !pub.withdrawPending && <div className="card" role="alert" style={{ borderColor: 'var(--danger, #c33)' }}>
+      <div className="small">{t('The server already applied that change, but this device could not save the completion record. Retry saving so a reload does not ask you again.')}</div>
+      <div className="row" style={{ gap: 8, marginTop: 10 }}>
+        <Button size="sm" disabled={busy} onClick={() => runBusy(async () => {
+          const r = retryCompletions()
+          if (!r.ok) toast(t('The completion record could not be saved again.'))
+        })}>{t('Retry saving')}</Button>
+      </div>
     </div>}
 
     {me?.suspended && <div className="card" style={{ borderColor: 'var(--danger, #c33)' }}>
